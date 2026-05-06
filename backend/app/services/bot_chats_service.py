@@ -1,0 +1,300 @@
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
+
+from pydantic import BaseModel, Field
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class BotChatMessage(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    role: str = "user"
+    author: str = "Player"
+    participant_id: str = ""
+    avatar_url: str = ""
+    username: str = ""
+    is_admin: bool = False
+    content: str
+    hidden: bool = False
+    swipes: list[str] = Field(default_factory=list)
+    active_swipe_index: int = 0
+    created_at: str = Field(default_factory=utc_now)
+    updated_at: str = Field(default_factory=utc_now)
+
+
+class BotChat(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    card_id: str
+    character_name: str
+    title: str = "New Chat"
+    created_at: str = Field(default_factory=utc_now)
+    updated_at: str = Field(default_factory=utc_now)
+    messages: list[BotChatMessage] = Field(default_factory=list)
+
+
+class BotChatSummary(BaseModel):
+    id: str
+    title: str
+    filename: str
+    message_count: int
+    created_at: str
+    updated_at: str
+
+
+class ChatCreate(BaseModel):
+    character_name: str = "Character"
+    title: str = "New Chat"
+
+
+class ChatUpdate(BaseModel):
+    title: str
+
+
+class ChatMessageCreate(BaseModel):
+    author: str = "Player"
+    participant_id: str = ""
+    avatar_url: str = ""
+    username: str = ""
+    is_admin: bool = False
+    role: str = "user"
+    content: str
+
+
+class ChatMessageUpdate(BaseModel):
+    content: str | None = None
+    hidden: bool | None = None
+
+
+class ChatSwipeRequest(BaseModel):
+    direction: int = 1
+
+
+class BotChatsService:
+    def __init__(self, chats_dir: Path) -> None:
+        self.chats_dir = chats_dir
+
+    def list_chats(self, card_id: str) -> list[BotChatSummary]:
+        directory = self._card_chat_dir(card_id)
+        if not directory.exists():
+            return []
+        return [self._summary(path) for path in sorted(directory.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)]
+
+    def get_chat(self, card_id: str, chat_id: str) -> BotChat:
+        path = self._chat_path(card_id, chat_id)
+        if not path.exists():
+            raise FileNotFoundError(chat_id)
+        return BotChat.model_validate(json.loads(path.read_text(encoding="utf-8")))
+
+    def current_or_create(self, card_id: str, character_name: str) -> BotChat:
+        chats = self.list_chats(card_id)
+        if chats:
+            return self.get_chat(card_id, chats[0].id)
+        return self.create_chat(card_id, ChatCreate(character_name=character_name))
+
+    def create_chat(self, card_id: str, request: ChatCreate) -> BotChat:
+        directory = self._card_chat_dir(card_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        chat = BotChat(card_id=card_id, character_name=request.character_name.strip() or "Character", title=request.title.strip() or "New Chat")
+        self._save(chat)
+        return chat
+
+    def update_chat(self, card_id: str, chat_id: str, request: ChatUpdate) -> BotChat:
+        chat = self.get_chat(card_id, chat_id)
+        chat.title = request.title.strip() or "New Chat"
+        chat.updated_at = utc_now()
+        self._save(chat)
+        return chat
+
+    def copy_chat(self, card_id: str, chat_id: str) -> BotChat:
+        source = self.get_chat(card_id, chat_id)
+        now = utc_now()
+        copied = source.model_copy(deep=True)
+        copied.id = str(uuid4())
+        copied.title = f"{source.title} copy"
+        copied.created_at = now
+        copied.updated_at = now
+        copied.messages = [message.model_copy(deep=True) for message in source.messages]
+        self._save(copied)
+        return copied
+
+    def delete_chat(self, card_id: str, chat_id: str) -> None:
+        path = self._chat_path(card_id, chat_id)
+        if not path.exists():
+            raise FileNotFoundError(chat_id)
+        path.unlink()
+
+    def delete_card_chats(self, card_id: str) -> None:
+        directory = self._card_chat_dir(card_id)
+        if not directory.exists():
+            return
+        for path in directory.glob("*.json"):
+            path.unlink()
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+    def sillytavern_export_filename(self, card_id: str, chat_id: str) -> str:
+        chat = self.get_chat(card_id, chat_id)
+        timestamp = self._st_filename_timestamp(chat.created_at)
+        safe_name = self._safe_path_part(chat.character_name or chat.card_id or "Character")
+        return f"{safe_name} - {timestamp}.jsonl"
+
+    def export_sillytavern_jsonl(self, card_id: str, chat_id: str) -> str:
+        chat = self.get_chat(card_id, chat_id)
+        metadata = {
+            "chat_metadata": {
+                "source": "DoubleTrouble",
+                "integrity": chat.id,
+                "card_id": chat.card_id,
+                "title": chat.title,
+                "created_at": chat.created_at,
+            },
+            "user_name": self._first_user_name(chat),
+            "character_name": chat.character_name or "unused",
+        }
+        rows = [metadata]
+        for message in chat.messages:
+            row: dict[str, object] = {
+                "name": message.author or ("System" if message.role == "system" else chat.character_name),
+                "is_user": message.role == "user",
+                "is_system": message.role == "system",
+                "send_date": self._st_send_date(message.created_at),
+                "mes": message.content,
+            }
+            if message.role == "assistant":
+                swipes = message.swipes or [message.content]
+                row["swipe_id"] = max(0, min(message.active_swipe_index, len(swipes) - 1))
+                row["swipes"] = swipes
+                row["swipe_info"] = [{"send_date": self._st_send_date(message.created_at)} for _ in swipes]
+            if message.hidden:
+                row["extra"] = {"doubletrouble_hidden": True}
+            rows.append(row)
+        return "\n".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) for row in rows) + "\n"
+
+    def add_message(self, card_id: str, chat_id: str, request: ChatMessageCreate) -> BotChat:
+        chat = self.get_chat(card_id, chat_id)
+        content = request.content.strip()
+        if not content:
+            raise ValueError("Message content is required")
+        role = request.role if request.role in {"user", "assistant", "system"} else "user"
+        swipes = [content] if role == "assistant" else []
+        chat.messages.append(BotChatMessage(role=role, author=request.author.strip() or "Player", participant_id=request.participant_id.strip(), avatar_url=request.avatar_url.strip(), username=request.username.strip(), is_admin=request.is_admin, content=content, swipes=swipes))
+        chat.updated_at = utc_now()
+        self._save(chat)
+        return chat
+
+    def update_message(self, card_id: str, chat_id: str, message_id: str, request: ChatMessageUpdate) -> BotChat:
+        chat = self.get_chat(card_id, chat_id)
+        for message in chat.messages:
+            if message.id == message_id:
+                if request.content is not None:
+                    content = request.content.strip()
+                    if not content:
+                        raise ValueError("Message content is required")
+                    message.content = content
+                if request.hidden is not None:
+                    message.hidden = request.hidden
+                message.updated_at = utc_now()
+                chat.updated_at = utc_now()
+                self._save(chat)
+                return chat
+        raise KeyError(message_id)
+
+    def delete_message(self, card_id: str, chat_id: str, message_id: str) -> BotChat:
+        chat = self.get_chat(card_id, chat_id)
+        messages = [message for message in chat.messages if message.id != message_id]
+        if len(messages) == len(chat.messages):
+            raise KeyError(message_id)
+        chat.messages = messages
+        chat.updated_at = utc_now()
+        self._save(chat)
+        return chat
+
+    def add_bot_message(self, card_id: str, chat_id: str, author: str, content: str, avatar_url: str = "") -> BotChat:
+        return self.add_message(card_id, chat_id, ChatMessageCreate(author=author, avatar_url=avatar_url, role="assistant", content=content))
+
+    def replace_bot_message(self, card_id: str, chat_id: str, message_id: str, author: str, content: str, avatar_url: str = "", reset_swipes: bool = False) -> BotChat:
+        chat = self.get_chat(card_id, chat_id)
+        for message in chat.messages:
+            if message.id == message_id and message.role == "assistant":
+                swipes = [content] if reset_swipes else [*(message.swipes or [message.content]), content]
+                message.swipes = swipes
+                message.active_swipe_index = len(swipes) - 1
+                message.author = author.strip() or message.author
+                message.avatar_url = avatar_url.strip() or message.avatar_url
+                message.content = content
+                message.updated_at = utc_now()
+                chat.updated_at = utc_now()
+                self._save(chat)
+                return chat
+        raise KeyError(message_id)
+
+    def swipe_bot_message(self, card_id: str, chat_id: str, message_id: str, direction: int) -> BotChat:
+        chat = self.get_chat(card_id, chat_id)
+        for message in chat.messages:
+            if message.id == message_id and message.role == "assistant":
+                swipes = message.swipes or [message.content]
+                if not swipes:
+                    raise ValueError("Message has no swipes")
+                message.swipes = swipes
+                message.active_swipe_index = (message.active_swipe_index + (1 if direction >= 0 else -1)) % len(swipes)
+                message.content = swipes[message.active_swipe_index]
+                message.updated_at = utc_now()
+                chat.updated_at = utc_now()
+                self._save(chat)
+                return chat
+        raise KeyError(message_id)
+
+    def _card_chat_dir(self, card_id: str) -> Path:
+        safe_id = self._safe_path_part(card_id)
+        return self.chats_dir / safe_id
+
+    def _chat_path(self, card_id: str, chat_id: str) -> Path:
+        safe_id = self._safe_path_part(chat_id) or chat_id
+        return self._card_chat_dir(card_id) / f"{safe_id}.json"
+
+    def _safe_path_part(self, value: str) -> str:
+        return re.sub(r"[^\w\-. ]+", "_", value, flags=re.UNICODE).strip(" .") or "Character"
+
+    def _first_user_name(self, chat: BotChat) -> str:
+        return next((message.author for message in chat.messages if message.role == "user" and message.author), "unused")
+
+    def _st_send_date(self, value: str) -> str:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = datetime.now(timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+    def _st_filename_timestamp(self, value: str) -> str:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = datetime.now(timezone.utc)
+        utc_value = parsed.astimezone(timezone.utc)
+        return utc_value.strftime("%Y-%m-%d@%Hh%Mm%Ss") + f"{utc_value.microsecond // 1000:03d}ms"
+
+    def _save(self, chat: BotChat) -> None:
+        directory = self._card_chat_dir(chat.card_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{chat.id}.json"
+        path.write_text(json.dumps(chat.model_dump(mode="json"), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _summary(self, path: Path) -> BotChatSummary:
+        chat = BotChat.model_validate(json.loads(path.read_text(encoding="utf-8")))
+        return BotChatSummary(
+            id=chat.id,
+            title=chat.title,
+            filename=path.name,
+            message_count=len(chat.messages),
+            created_at=chat.created_at,
+            updated_at=chat.updated_at,
+        )

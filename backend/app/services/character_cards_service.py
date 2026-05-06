@@ -1,0 +1,294 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import re
+import zlib
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+FALLBACK_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
+
+
+class CharacterCardSummary(BaseModel):
+    id: str
+    filename: str
+    name: str
+    description: str = ""
+    personality: str = ""
+    scenario: str = ""
+    first_message: str = ""
+    message_example: str = ""
+    creator: str = ""
+    tags: list[str] = Field(default_factory=list)
+    spec: str = ""
+    spec_version: str = ""
+    image_url: str
+
+
+class CharacterCardCreate(BaseModel):
+    name: str
+    description: str = ""
+    personality: str = ""
+    scenario: str = ""
+    first_message: str = ""
+    message_example: str = ""
+    creator: str = ""
+    tags: list[str] = Field(default_factory=list)
+
+
+class CharacterCardUpdate(CharacterCardCreate):
+    pass
+
+
+class CharacterCardsService:
+    def __init__(self, characters_dir: Path) -> None:
+        self.characters_dir = characters_dir
+
+    def list_cards(self) -> list[CharacterCardSummary]:
+        self.characters_dir.mkdir(parents=True, exist_ok=True)
+        cards: list[CharacterCardSummary] = []
+        for path in sorted(self.characters_dir.glob("*.png"), key=lambda item: item.stat().st_mtime, reverse=True):
+            try:
+                cards.append(self._summary_from_file(path))
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+        return cards
+
+    def import_card(self, filename: str, content: bytes) -> CharacterCardSummary:
+        metadata = self.read_card_metadata(content)
+        data = self._card_data(metadata)
+        name = str(data.get("name") or metadata.get("name") or Path(filename).stem or "Character")
+        target = self._unique_path(self._safe_filename(name), ".png")
+        target.write_bytes(content)
+        return self._summary_from_metadata(target, metadata)
+
+    def create_card(self, request: CharacterCardCreate, avatar_content: bytes | None = None) -> CharacterCardSummary:
+        name = request.name.strip() or "Character"
+        metadata = self._create_v2_metadata(request, name)
+        source_png = avatar_content or FALLBACK_PNG
+        if not source_png.startswith(PNG_SIGNATURE):
+            raise ValueError("Avatar must be a PNG file")
+
+        target = self._unique_path(self._safe_filename(name), ".png")
+        target.write_bytes(self._write_card_metadata(source_png, metadata))
+        return self._summary_from_metadata(target, metadata)
+
+    def update_card(self, card_id: str, request: CharacterCardUpdate) -> CharacterCardSummary:
+        path = self._path_from_card_id(card_id)
+        if path is None:
+            raise FileNotFoundError(card_id)
+        content = path.read_bytes()
+        metadata = self.read_card_metadata(content)
+        data = self._card_data(metadata)
+        data.update(
+            {
+                "name": request.name.strip() or "Character",
+                "description": request.description,
+                "personality": request.personality,
+                "scenario": request.scenario,
+                "first_mes": request.first_message,
+                "mes_example": request.message_example,
+                "creator": request.creator,
+                "tags": request.tags,
+            }
+        )
+        if isinstance(metadata.get("data"), dict):
+            metadata["data"] = data
+        else:
+            metadata.update(data)
+        path.write_bytes(self._write_card_metadata(content, metadata))
+        return self._summary_from_metadata(path, metadata)
+
+    def update_card_avatar(self, card_id: str, avatar_content: bytes) -> CharacterCardSummary:
+        path = self._path_from_card_id(card_id)
+        if path is None:
+            raise FileNotFoundError(card_id)
+        if not avatar_content.startswith(PNG_SIGNATURE):
+            raise ValueError("Avatar must be a PNG file")
+        metadata = self.read_card_metadata(path.read_bytes())
+        path.write_bytes(self._write_card_metadata(avatar_content, metadata))
+        return self._summary_from_metadata(path, metadata)
+
+    def delete_card(self, card_id: str) -> CharacterCardSummary:
+        path = self._path_from_card_id(card_id)
+        if path is None:
+            raise FileNotFoundError(card_id)
+        summary = self._summary_from_file(path)
+        path.unlink()
+        return summary
+
+    def image_path(self, card_id: str) -> Path:
+        path = self._path_from_card_id(card_id)
+        if path is None:
+            raise FileNotFoundError(card_id)
+        return path
+
+    def card_data(self, card_id: str) -> dict[str, Any]:
+        path = self._path_from_card_id(card_id)
+        if path is None:
+            raise FileNotFoundError(card_id)
+        return self._card_data(self.read_card_metadata(path.read_bytes()))
+
+    def read_card_metadata(self, content: bytes) -> dict[str, Any]:
+        text_chunks = self._read_png_text_chunks(content)
+        encoded = text_chunks.get("ccv3") or text_chunks.get("chara")
+        if not encoded:
+            raise ValueError("PNG card has no chara/ccv3 metadata")
+        decoded = base64.b64decode(encoded).decode("utf-8")
+        return json.loads(decoded)
+
+    def _summary_from_file(self, path: Path) -> CharacterCardSummary:
+        metadata = self.read_card_metadata(path.read_bytes())
+        return self._summary_from_metadata(path, metadata)
+
+    def _summary_from_metadata(self, path: Path, metadata: dict[str, Any]) -> CharacterCardSummary:
+        data = self._card_data(metadata)
+        tags = data.get("tags") or metadata.get("tags") or []
+        return CharacterCardSummary(
+            id=self._card_id(path),
+            filename=path.name,
+            name=str(data.get("name") or metadata.get("name") or path.stem),
+            description=str(data.get("description") or metadata.get("description") or ""),
+            personality=str(data.get("personality") or metadata.get("personality") or ""),
+            scenario=str(data.get("scenario") or metadata.get("scenario") or ""),
+            first_message=str(data.get("first_mes") or metadata.get("first_mes") or ""),
+            message_example=str(data.get("mes_example") or metadata.get("mes_example") or ""),
+            creator=str(data.get("creator") or metadata.get("creator") or ""),
+            tags=[str(tag) for tag in tags] if isinstance(tags, list) else [],
+            spec=str(metadata.get("spec") or ""),
+            spec_version=str(metadata.get("spec_version") or ""),
+            image_url=f"/api/cards/{self._card_id(path)}/image?v={int(path.stat().st_mtime)}",
+        )
+
+    def _card_data(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        data = metadata.get("data")
+        return data if isinstance(data, dict) else metadata
+
+    def _read_png_text_chunks(self, content: bytes) -> dict[str, str]:
+        if not content.startswith(PNG_SIGNATURE):
+            raise ValueError("Not a PNG file")
+
+        chunks: dict[str, str] = {}
+        offset = len(PNG_SIGNATURE)
+        while offset + 8 <= len(content):
+            length = int.from_bytes(content[offset:offset + 4], "big")
+            chunk_type = content[offset + 4:offset + 8].decode("ascii", errors="replace")
+            data_start = offset + 8
+            data_end = data_start + length
+            if data_end + 4 > len(content):
+                break
+
+            chunk_data = content[data_start:data_end]
+            if chunk_type == "tEXt" and b"\x00" in chunk_data:
+                keyword, text = chunk_data.split(b"\x00", 1)
+                chunks[keyword.decode("latin-1").lower()] = text.decode("latin-1")
+            if chunk_type == "IEND":
+                break
+            offset = data_end + 4
+        return chunks
+
+    def _write_card_metadata(self, content: bytes, metadata: dict[str, Any]) -> bytes:
+        chunks = self._split_png_chunks(content)
+        metadata_json = json.dumps(metadata, ensure_ascii=False)
+        ccv3 = dict(metadata)
+        ccv3["spec"] = "chara_card_v3"
+        ccv3["spec_version"] = "3.0"
+
+        text_chunks = [
+            self._make_text_chunk("chara", base64.b64encode(metadata_json.encode("utf-8")).decode("ascii")),
+            self._make_text_chunk("ccv3", base64.b64encode(json.dumps(ccv3, ensure_ascii=False).encode("utf-8")).decode("ascii")),
+        ]
+
+        output = bytearray(PNG_SIGNATURE)
+        inserted = False
+        for chunk_type, chunk_data in chunks:
+            if chunk_type == "tEXt":
+                keyword = chunk_data.split(b"\x00", 1)[0].decode("latin-1", errors="ignore").lower()
+                if keyword in {"chara", "ccv3"}:
+                    continue
+            if chunk_type == "IEND" and not inserted:
+                for text_chunk_type, text_chunk_data in text_chunks:
+                    output.extend(self._encode_chunk(text_chunk_type, text_chunk_data))
+                inserted = True
+            output.extend(self._encode_chunk(chunk_type, chunk_data))
+        return bytes(output)
+
+    def _split_png_chunks(self, content: bytes) -> list[tuple[str, bytes]]:
+        if not content.startswith(PNG_SIGNATURE):
+            raise ValueError("Not a PNG file")
+        chunks: list[tuple[str, bytes]] = []
+        offset = len(PNG_SIGNATURE)
+        while offset + 8 <= len(content):
+            length = int.from_bytes(content[offset:offset + 4], "big")
+            chunk_type = content[offset + 4:offset + 8].decode("ascii", errors="replace")
+            data_start = offset + 8
+            data_end = data_start + length
+            if data_end + 4 > len(content):
+                break
+            chunks.append((chunk_type, content[data_start:data_end]))
+            offset = data_end + 4
+            if chunk_type == "IEND":
+                break
+        return chunks
+
+    def _make_text_chunk(self, keyword: str, text: str) -> tuple[str, bytes]:
+        return "tEXt", keyword.encode("latin-1") + b"\x00" + text.encode("latin-1")
+
+    def _encode_chunk(self, chunk_type: str, chunk_data: bytes) -> bytes:
+        chunk_type_bytes = chunk_type.encode("ascii")
+        crc = zlib.crc32(chunk_type_bytes + chunk_data) & 0xFFFFFFFF
+        return len(chunk_data).to_bytes(4, "big") + chunk_type_bytes + chunk_data + crc.to_bytes(4, "big")
+
+    def _create_v2_metadata(self, request: CharacterCardCreate, name: str) -> dict[str, Any]:
+        return {
+            "spec": "chara_card_v2",
+            "spec_version": "2.0",
+            "data": {
+                "name": name,
+                "description": request.description,
+                "personality": request.personality,
+                "scenario": request.scenario,
+                "first_mes": request.first_message,
+                "mes_example": request.message_example,
+                "creator_notes": "Created in DoubleTrouble",
+                "system_prompt": "",
+                "post_history_instructions": "",
+                "alternate_greetings": [],
+                "tags": request.tags,
+                "creator": request.creator,
+                "character_version": "1.0",
+                "extensions": {},
+            },
+        }
+
+    def _safe_filename(self, name: str) -> str:
+        safe = re.sub(r"[^\w\-. ]+", "_", name, flags=re.UNICODE).strip(" .")
+        return safe or "Character"
+
+    def _card_id(self, path: Path) -> str:
+        digest = hashlib.sha1(path.name.encode("utf-8")).hexdigest()[:16]
+        return f"card_{digest}"
+
+    def _path_from_card_id(self, card_id: str) -> Path | None:
+        self.characters_dir.mkdir(parents=True, exist_ok=True)
+        for path in self.characters_dir.glob("*.png"):
+            if self._card_id(path) == card_id or path.name == card_id:
+                return path
+        return None
+
+    def _unique_path(self, stem: str, suffix: str) -> Path:
+        self.characters_dir.mkdir(parents=True, exist_ok=True)
+        path = self.characters_dir / f"{stem}{suffix}"
+        counter = 2
+        while path.exists():
+            path = self.characters_dir / f"{stem}_{counter}{suffix}"
+            counter += 1
+        return path
