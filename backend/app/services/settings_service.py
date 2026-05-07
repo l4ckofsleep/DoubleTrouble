@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import secrets
 from pathlib import Path
 from pydantic import BaseModel, Field
 import yaml
@@ -58,12 +61,22 @@ class SecurityPermissions(BaseModel):
     generate: PermissionRule = Field(default_factory=PermissionRule)
     manage_presets: PermissionRule = Field(default_factory=PermissionRule)
     manage_lorebooks: PermissionRule = Field(default_factory=PermissionRule)
+    manage_extensions: PermissionRule = Field(default_factory=PermissionRule)
     manage_security: PermissionRule = Field(default_factory=lambda: PermissionRule(mode="admins"))
 
 
 class SecuritySettingsPayload(BaseModel):
     auth_required: bool = False
+    access_password_required: bool = False
+    access_password: str = ""
+    access_password_configured: bool = False
     permissions: SecurityPermissions = Field(default_factory=SecurityPermissions)
+
+
+class DeleteLocks(BaseModel):
+    cards: list[str] = Field(default_factory=list)
+    personas: list[str] = Field(default_factory=list)
+    chats: list[str] = Field(default_factory=list)
 
 
 class UserSettings(BaseModel):
@@ -72,7 +85,12 @@ class UserSettings(BaseModel):
     active_generation_preset: str = ""
     active_presets: dict[str, str] = Field(default_factory=dict)
     auth_required: bool = False
+    access_password_required: bool = False
+    access_password_salt: str = ""
+    access_password_hash: str = ""
+    access_token: str = ""
     security_permissions: SecurityPermissions = Field(default_factory=SecurityPermissions)
+    delete_locks: DeleteLocks = Field(default_factory=DeleteLocks)
 
 
 class SettingsService:
@@ -173,11 +191,88 @@ class SettingsService:
     def auth_required(self) -> bool:
         return self.settings.auth_required
 
+    def access_password_required(self) -> bool:
+        return self.settings.access_password_required and bool(self.settings.access_password_hash)
+
+    def access_password_configured(self) -> bool:
+        return bool(self.settings.access_password_hash)
+
+    def verify_access_password(self, password: str) -> str:
+        if not self.access_password_required():
+            return ""
+        if not self.settings.access_password_salt or not self.settings.access_password_hash:
+            raise ValueError("Access password is not configured")
+        password_hash = self._hash_access_password(password, self.settings.access_password_salt)
+        if not hmac.compare_digest(password_hash, self.settings.access_password_hash):
+            raise ValueError("Invalid access password")
+        if not self.settings.access_token:
+            self.settings.access_token = secrets.token_urlsafe(32)
+            self._save_settings()
+        return self.settings.access_token
+
+    def verify_access_token(self, token: str) -> bool:
+        if not self.access_password_required():
+            return True
+        return bool(token) and bool(self.settings.access_token) and hmac.compare_digest(token, self.settings.access_token)
+
     def update_security_settings(self, payload: SecuritySettingsPayload) -> SecuritySettingsPayload:
         self.settings.auth_required = payload.auth_required
+        next_password = payload.access_password.strip()
+        if next_password:
+            if len(next_password) < 4:
+                raise ValueError("Access password must be at least 4 characters")
+            self.settings.access_password_salt = secrets.token_hex(16)
+            self.settings.access_password_hash = self._hash_access_password(next_password, self.settings.access_password_salt)
+            self.settings.access_token = secrets.token_urlsafe(32)
+        if payload.access_password_required and not self.settings.access_password_hash:
+            raise ValueError("Set an access password before enabling the access lock")
+        self.settings.access_password_required = payload.access_password_required
         self.settings.security_permissions = payload.permissions
         self._save_settings()
-        return SecuritySettingsPayload(auth_required=self.settings.auth_required, permissions=self.settings.security_permissions)
+        return SecuritySettingsPayload(
+            auth_required=self.settings.auth_required,
+            access_password_required=self.settings.access_password_required,
+            access_password_configured=self.access_password_configured(),
+            permissions=self.settings.security_permissions,
+        )
+
+    def security_settings_payload(self) -> SecuritySettingsPayload:
+        return SecuritySettingsPayload(
+            auth_required=self.settings.auth_required,
+            access_password_required=self.settings.access_password_required,
+            access_password_configured=self.access_password_configured(),
+            permissions=self.settings.security_permissions,
+        )
+
+    def delete_locks(self) -> DeleteLocks:
+        return self.settings.delete_locks
+
+    def set_delete_lock(self, category: str, item_id: str, locked: bool) -> DeleteLocks:
+        locks = self.settings.delete_locks
+        if category not in {"cards", "personas", "chats"}:
+            raise ValueError("Unsupported delete lock category")
+        current = set(getattr(locks, category))
+        if locked:
+            current.add(item_id)
+        else:
+            current.discard(item_id)
+        setattr(locks, category, sorted(current))
+        self._save_settings()
+        return locks
+
+    def is_delete_locked(self, category: str, item_id: str) -> bool:
+        if category not in {"cards", "personas", "chats"}:
+            return False
+        return item_id in set(getattr(self.settings.delete_locks, category))
+
+    def clear_delete_lock(self, category: str, item_id: str) -> DeleteLocks:
+        return self.set_delete_lock(category, item_id, False)
+
+    def clear_chat_locks_for_card(self, card_id: str) -> DeleteLocks:
+        prefix = f"{card_id}:"
+        self.settings.delete_locks.chats = [item for item in self.settings.delete_locks.chats if not item.startswith(prefix)]
+        self._save_settings()
+        return self.settings.delete_locks
 
     def update_generation_settings(self, request: GenerationSettingsUpdate) -> GenerationConfig:
         current = self.settings.generation
@@ -215,3 +310,7 @@ class SettingsService:
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
         with self.settings_path.open("w", encoding="utf-8") as settings_file:
             yaml.safe_dump(self.settings.model_dump(mode="json"), settings_file, sort_keys=False, allow_unicode=True)
+
+    @staticmethod
+    def _hash_access_password(password: str, salt: str) -> str:
+        return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("ascii"), 120_000).hex()

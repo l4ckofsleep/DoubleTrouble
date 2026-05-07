@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from backend.app.models import Message, Participant, ParticipantRole, SendMessageRequest, Session
+from backend.app.models import Message, Participant, ParticipantRole, SendMessageRequest, Session, utc_now
 from backend.app.storage.file_storage import FileStorage
 
 
@@ -37,6 +37,8 @@ class SessionService:
 
         if participant_id and participant_id in session.participants:
             participant = session.participants[participant_id]
+            if not participant.connected:
+                participant.connected_at = utc_now()
             participant.name = normalized_name
             participant.connected = True
             participant.persona_id = persona_id.strip()

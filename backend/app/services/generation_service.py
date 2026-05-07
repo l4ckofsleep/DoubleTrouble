@@ -231,8 +231,11 @@ class GenerationService:
         collection: list[dict[str, Any]] = []
 
         if order:
+            ordered_ids: set[str] = set()
             for entry in order:
                 identifier = str(entry.get("identifier") or "")
+                if identifier:
+                    ordered_ids.add(identifier)
                 prompt = dict(prompt_by_id.get(identifier) or {})
                 if not prompt:
                     continue
@@ -240,6 +243,10 @@ class GenerationService:
                     collection.append(prompt)
                 elif identifier == "main":
                     prompt["content"] = ""
+                    collection.append(prompt)
+            for prompt in raw_prompts:
+                identifier = str(prompt.get("identifier") or "")
+                if identifier and identifier not in ordered_ids and prompt.get("enabled") is not False and self._should_trigger(prompt):
                     collection.append(prompt)
         else:
             collection = [prompt for prompt in raw_prompts if prompt.get("enabled") is not False and self._should_trigger(prompt)]

@@ -2,6 +2,13 @@
 data/default-user/**
 !data/default-user/**/
 !data/default-user/**/.gitkeep
+data/default-user/extensions/**
+data/default-user/User Avatars/**
+data/default-user/characters/**
+data/default-user/chats/**
+data/default-user/worlds/**
+data/default-user/images/**
+data/default-user/files/**
 data/**/*.yaml
 data/**/*.json
 data/**/*.jsonl
@@ -20,6 +27,18 @@ secrets.yaml
 users.yaml
 settings.yaml
 lorebook_bindings.yaml
+credentials*.json
+*token*.txt
+*.pem
+*.key
+*.crt
+
+# Local databases and runtime stores
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
 
 # Python
 __pycache__/
@@ -46,6 +65,13 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# Local browser/test artifacts
+tmp-*.cjs
+tmp-*.js
+playwright-report/
+test-results/
+.nyc_output/
+
 # Logs and temporary files
 *.log
 logs/
@@ -65,6 +91,8 @@ desktop.ini
 *.swo
 
 # Local archives and exports
+tavern_helper_script*.json
+SillyTavern*.json
 *.zip
 *.7z
 *.rar

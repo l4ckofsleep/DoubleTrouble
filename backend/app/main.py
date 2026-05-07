@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
 import json
 import asyncio
+import re
+import subprocess
 
 import httpx
 from pathlib import Path
@@ -22,6 +25,7 @@ from backend.app.realtime.connection_manager import ConnectionManager
 from backend.app.secrets import SecretStore
 from backend.app.services.generation_service import GenerationService
 from backend.app.services.lorebooks_service import LorebookBindingPayload, LorebookPayload, LorebooksService
+from backend.app.services.extensions_service import ExtensionInstallRequest, ExtensionsService
 from backend.app.llm.openai_compatible import OpenAICompatibleProvider
 from backend.app.services.personas_service import PersonaCreate, PersonasService, PersonaUpdate
 from backend.app.services.auth_service import AuthService, AuthUser
@@ -43,8 +47,10 @@ bot_chats_service = BotChatsService(storage.user_root / "chats")
 personas_service = PersonasService(storage.user_root / "personas.yaml", storage.user_root / "User Avatars")
 presets_service = PresetsService(storage.user_root)
 lorebooks_service = LorebooksService(storage.user_root / "worlds", storage.user_root / "lorebook_bindings.yaml")
+extensions_service = ExtensionsService(storage.user_root / "extensions", storage.user_root / "extensions" / "extensions.yaml")
 connection_manager = ConnectionManager()
 generation_tasks: dict[str, asyncio.Task[str]] = {}
+active_preset_overrides: dict[str, dict[str, object]] = {}
 
 
 class BotReplyRequest(BaseModel):
@@ -62,6 +68,28 @@ class AuthRequest(BaseModel):
 
 class AdminClaimRequest(BaseModel):
     code: str
+
+
+class AccessPasswordRequest(BaseModel):
+    password: str
+
+
+class DeleteLockUpdate(BaseModel):
+    category: str
+    item_id: str
+    locked: bool
+
+
+class ExtensionImageUpload(BaseModel):
+    image: str
+    format: str = "png"
+    ch_name: str = "generated"
+    filename: str = "image"
+
+
+class ExtensionFileUpload(BaseModel):
+    name: str
+    data: str
 
 
 async def _broadcast_chat(card_id: str, chat_id: str) -> None:
@@ -117,7 +145,17 @@ def _auth_user_from_request(request: Request) -> AuthUser | None:
     return auth_service.user_by_token(_token_from_request(request))
 
 
+def _access_token_from_request(request: Request) -> str:
+    return request.headers.get("x-doubletrouble-access", "").strip() or str(request.cookies.get("doubletrouble_access") or "").strip()
+
+
+def _require_access_password(request: Request) -> None:
+    if settings_service.access_password_required() and not settings_service.verify_access_token(_access_token_from_request(request)):
+        raise HTTPException(status_code=403, detail="Access password required")
+
+
 def _require_permission(request: Request, action: str) -> None:
+    _require_access_password(request)
     user = _auth_user_from_request(request)
     if settings_service.auth_required() and not user:
         raise HTTPException(status_code=401, detail="Authentication required")
@@ -142,6 +180,28 @@ def _notification_text(message: str, actor: str = "") -> str:
 
 async def _broadcast_notification(message: str, session_id: str = DEFAULT_SESSION_ID, actor: str = "") -> None:
     await connection_manager.broadcast(session_id, {"type": "notification", "message": _notification_text(message, actor)})
+
+
+async def _broadcast_delete_locks() -> None:
+    await connection_manager.broadcast(
+        DEFAULT_SESSION_ID,
+        {"type": "delete_locks.updated", "delete_locks": settings_service.delete_locks().model_dump(mode="json")},
+    )
+
+
+def _chat_lock_key(card_id: str, chat_id: str) -> str:
+    return f"{card_id}:{chat_id}"
+
+
+def _require_delete_unlocked(category: str, item_id: str) -> None:
+    if settings_service.is_delete_locked(category, item_id):
+        raise HTTPException(status_code=423, detail="Deletion is locked")
+
+
+def _require_card_chats_unlocked(card_id: str) -> None:
+    prefix = f"{card_id}:"
+    if any(item.startswith(prefix) for item in settings_service.delete_locks().chats):
+        raise HTTPException(status_code=423, detail="A chat in this card is locked")
 
 
 def _apply_generation_preset(preset_type: str, preset: dict[str, object]) -> object | None:
@@ -172,6 +232,9 @@ def _apply_generation_preset(preset_type: str, preset: dict[str, object]) -> obj
 
 
 def _active_openai_preset() -> dict[str, object] | None:
+    override = active_preset_overrides.get("openai")
+    if override is not None:
+        return override
     name = settings_service.active_preset_settings().get("openai")
     if not name:
         return None
@@ -189,6 +252,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _safe_media_part(value: str, fallback: str = "generated") -> str:
+    safe = re.sub(r"[^\w\-. ]+", "_", value, flags=re.UNICODE).strip(" .")
+    return safe or fallback
+
+
+def _decode_base64_payload(value: str) -> bytes:
+    payload = value.split(",", 1)[1] if value.startswith("data:") and "," in value else value
+    try:
+        return base64.b64decode(payload, validate=True)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="Invalid base64 payload") from error
+
 
 @app.on_event("startup")
 async def on_startup() -> None:
@@ -201,6 +276,399 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/version")
+async def sillytavern_version() -> dict[str, str]:
+    return {"agent": "DoubleTrouble", "pkgVersion": "1.12.13"}
+
+
+@app.post("/api/settings/get")
+async def sillytavern_settings_get(request: Request) -> dict[str, object]:
+    _require_permission(request, "view_presets")
+    return {
+        "world_names": [book.name for book in lorebooks_service.list_lorebooks()],
+        "settings": settings_service.generation_settings(),
+    }
+
+
+@app.get("/api/extensions/discover")
+async def discover_extensions() -> list[dict[str, str]]:
+    return extensions_service.discover_enabled()
+
+
+@app.get("/api/extensions")
+async def list_extensions(request: Request) -> dict[str, object]:
+    _require_permission(request, "manage_extensions")
+    return {"extensions": [extension.model_dump(mode="json") for extension in extensions_service.list_extensions()]}
+
+
+@app.post("/api/extensions/install")
+async def install_extension(payload: ExtensionInstallRequest, request: Request) -> dict[str, object]:
+    _require_permission(request, "manage_extensions")
+    try:
+        extension = extensions_service.install(payload)
+    except FileExistsError as error:
+        raise HTTPException(status_code=409, detail="Extension already exists") from error
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Extension source not found") from error
+    except (ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_notification(f"установил расширение: {extension.name}", actor=_actor_from_request(request))
+    return {"extension": extension.model_dump(mode="json")}
+
+
+@app.put("/api/extensions/{name}/enabled")
+async def set_extension_enabled(name: str, payload: dict[str, bool], request: Request) -> dict[str, object]:
+    _require_permission(request, "manage_extensions")
+    try:
+        extension = extensions_service.set_enabled(name, bool(payload.get("enabled")))
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Extension not found") from error
+    await _broadcast_notification(f"{'включил' if extension.enabled else 'выключил'} расширение: {extension.name}", actor=_actor_from_request(request))
+    return {"extension": extension.model_dump(mode="json")}
+
+
+@app.delete("/api/extensions/{name}")
+async def delete_extension(name: str, request: Request) -> dict[str, object]:
+    _require_permission(request, "manage_extensions")
+    try:
+        extensions_service.delete(name)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Extension not found") from error
+    await _broadcast_notification(f"удалил расширение: {name}", actor=_actor_from_request(request))
+    return {"ok": True}
+
+
+@app.get("/scripts/extensions/{extension_path:path}")
+@app.head("/scripts/extensions/{extension_path:path}")
+async def extension_asset(extension_path: str) -> Response:
+    if extension_path == "extensions.js":
+        return await extension_compat_module()
+    if extension_path == "regex/engine.js":
+        return _compat_javascript("""
+export const regex_placement = { RAW: 0, USER_INPUT: 1, AI_OUTPUT: 2, SLASH_COMMAND: 3 };
+export const getRegexedString = (value) => String(value ?? '');
+""")
+    try:
+        path = extensions_service.file_path(extension_path)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Extension asset not found") from error
+    return FileResponse(path)
+
+
+@app.get("/scripts/extensions.js")
+@app.get("/scripts/extensions/extensions.js")
+async def extension_compat_module() -> Response:
+    content = """
+const ctx = () => globalThis.SillyTavern?.getContext?.() || {};
+export const extension_settings = ctx().extensionSettings || {};
+export const modules = [];
+export const extensionTypes = { SYSTEM: 'system', LOCAL: 'local', GLOBAL: 'global', THIRD_PARTY: 'third-party' };
+export const getContext = () => ctx();
+export const getApiUrl = () => extension_settings.apiUrl || '';
+export const ModuleWorkerWrapper = class {};
+export const renderExtensionTemplateAsync = async (extensionName, templateId) => {
+  const response = await fetch(`/scripts/extensions/${extensionName}/${templateId}.html`);
+  return response.ok ? await response.text() : '';
+};
+export const renderExtensionTemplate = () => '';
+export const saveMetadataDebounced = () => {};
+export const writeExtensionField = async () => {};
+export const doExtrasFetch = (endpoint, args = {}) => fetch(endpoint, args);
+""".strip()
+    return Response(content=content, media_type="text/javascript; charset=utf-8")
+
+
+def _compat_javascript(content: str) -> Response:
+    return Response(content=content.strip(), media_type="text/javascript; charset=utf-8")
+
+
+@app.get("/script.js")
+async def script_compat_module() -> Response:
+    content = """
+const ctx = () => globalThis.SillyTavern?.getContext?.() || {};
+export const eventSource = ctx().eventSource;
+export const event_types = ctx().event_types || ctx().eventTypes || {};
+export const saveSettingsDebounced = ctx().saveSettingsDebounced || (() => {});
+export const saveSettings = saveSettingsDebounced;
+export const getRequestHeaders = ctx().getRequestHeaders || (() => ({}));
+export const messageFormatting = ctx().messageFormatting || ((text) => text);
+export const saveChatConditional = ctx().saveChat || (async () => {});
+export const chat = [];
+export const characters = [];
+export const chat_metadata = {};
+export const extension_prompts = {};
+const sync = () => {
+  chat.splice(0, chat.length, ...(ctx().chat || []));
+  characters.splice(0, characters.length, ...(ctx().characters || []));
+};
+sync();
+globalThis.setInterval?.(sync, 250);
+export const name1 = ctx().name1 || 'User';
+export const name2 = ctx().name2 || 'Char';
+export const this_chid = ctx().characterId ?? 0;
+export const user_avatar = 'default.png';
+export const system_avatar = 'system.png';
+export const default_avatar = 'default.png';
+export const is_send_press = false;
+export const main_api = 'openai';
+export const online_status = 'connected';
+export const MAX_INJECTION_DEPTH = 1000;
+export const system_message_types = { NARRATOR: 'narrator', COMMENT: 'comment' };
+export const extension_prompt_roles = { SYSTEM: 0, USER: 1, ASSISTANT: 2 };
+export const extension_prompt_types = { IN_CHAT: 0, BEFORE_PROMPT: 1, IN_PROMPT: 2, AFTER_PROMPT: 3 };
+export const getCurrentChatId = () => 'default';
+export const getThumbnailUrl = (_type, file) => file?.startsWith?.('/') ? file : `/api/personas/avatars/${encodeURIComponent(file || 'default.png')}`;
+export const reloadMarkdownProcessor = () => ({ makeHtml: (text) => String(text ?? '') });
+export const clearChat = async () => {};
+export const printMessages = async () => {};
+export const addOneMessage = async () => {};
+export const getPastCharacterChats = async () => [];
+export const showSwipeButtons = () => {};
+export const substituteParams = (text) => String(text ?? '').replaceAll('{{user}}', ctx().name1 || 'User').replaceAll('{{char}}', ctx().name2 || 'Char');
+export const substituteParamsExtended = substituteParams;
+export const saveMetadata = async () => {};
+export const saveCharacterDebounced = () => {};
+export const getOneCharacter = (id) => characters[Number(id)] || characters[0] || null;
+export const selectCharacterById = async () => {};
+export const printCharacters = async () => {};
+export const unshallowCharacter = async (character) => character;
+export const deleteCharacter = async () => {};
+export const getCharacters = async () => characters;
+export const scrollChatToBottom = () => globalThis.scrollTo?.({ top: document.body.scrollHeight, behavior: 'smooth' });
+export const reloadCurrentChat = async () => {};
+export const activateSendButtons = () => {};
+export const deactivateSendButtons = () => {};
+export const setGenerationProgress = () => {};
+export const setExtensionPrompt = (name, value) => { extension_prompts[name] = value; };
+export const baseChatReplace = (text) => text;
+export const getCharacterCardFields = () => ({});
+export const getBiasStrings = () => [];
+export const getExtensionPromptRoleByName = (role) => extension_prompt_roles[String(role).toUpperCase()] ?? extension_prompt_roles.SYSTEM;
+export const getMaxContextSize = () => 8192;
+export const getExtensionPromptByName = (name) => extension_prompts[name] || '';
+export const cleanUpMessage = (text) => String(text ?? '');
+export const isOdd = (value) => Number(value) % 2 !== 0;
+export const countOccurrences = (text, value) => String(text ?? '').split(String(value ?? '')).length - 1;
+export const stopGeneration = async () => {};
+export const Generate = async () => '';
+export default {};
+""".strip()
+    return Response(content=content, media_type="text/javascript; charset=utf-8")
+
+
+@app.get("/scripts/{module_path:path}")
+async def scripts_compat_module(module_path: str) -> Response:
+    modules = {
+        "utils.js": """
+export const uuidv4 = () => crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+export const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+export const isDataURL = (value) => /^data:/i.test(String(value ?? ''));
+export const getBase64Async = async (file) => new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = reject; reader.readAsDataURL(file); });
+export const getImageSizeFromDataURL = async (dataUrl) => new Promise((resolve, reject) => { const image = new Image(); image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight }); image.onerror = reject; image.src = dataUrl; });
+export const getStringHash = (value) => { let hash = 0; for (const char of String(value ?? '')) hash = ((hash << 5) - hash + char.charCodeAt(0)) | 0; return String(hash); };
+export const getCharaFilename = (name) => String(name ?? '').replace(/[^\\w.-]+/g, '_');
+export const ensureImageFormatSupported = async (file) => file;
+export class Stopwatch { constructor() { this.start = performance.now(); } get elapsed() { return performance.now() - this.start; } }
+export const download = (content, filename = 'download.txt', type = 'text/plain') => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([content], { type })); a.download = filename; a.click(); URL.revokeObjectURL(a.href); };
+export const showFontAwesomePicker = async () => '';
+export const getSanitizedFilename = (value) => String(value ?? 'file').replace(/[^\\w.-]+/g, '_');
+""",
+        "i18n.js": """
+export const t = (strings, ...values) => Array.isArray(strings) && 'raw' in strings ? String.raw(strings, ...values) : String(strings ?? '');
+export const getCurrentLocale = () => navigator.language || 'en-US';
+""",
+        "world-info.js": """
+export const world_names = [];
+export const selected_world_info = [];
+export const world_info = {};
+export const DEFAULT_WEIGHT = 100;
+export const DEFAULT_DEPTH = 4;
+export const world_info_logic = { AND_ANY: 0, NOT_ALL: 1, NOT_ANY: 2, AND_ALL: 3 };
+export const world_info_position = { before: 0, after: 1, ANTop: 2, ANBottom: 3, atDepth: 4 };
+export const wi_anchor_position = world_info_position;
+export const METADATA_KEY = 'world_info';
+export const world_info_include_names = false;
+export const newWorldInfoEntryTemplate = { uid: 0, key: [], keysecondary: [], comment: '', content: '', constant: false, selective: false, order: 100, position: world_info_position.after, disable: false };
+export const saveWorldInfo = async () => {};
+export const loadWorldInfo = async () => ({ entries: {} });
+export const parseRegexFromString = (value) => new RegExp(String(value ?? ''));
+export const createNewWorldInfo = async () => ({});
+export const deleteWorldInfo = async () => {};
+export const setWorldInfoButtonClass = () => {};
+export const getWorldInfoSettings = () => ({});
+export const getWorldInfoPrompt = async () => ({ worldInfoString: '', worldInfoBefore: '', worldInfoAfter: '' });
+export const convertCharacterBook = (book) => book;
+""",
+        "preset-manager.js": """
+const presets = [];
+const preset_names = [];
+export const getPresetManager = () => ({
+  select: document.createElement('select'),
+  getPresetList: () => ({ presets, preset_names }),
+  getSelectedPreset: () => '0',
+  getSelectedPresetName: () => 'in_use',
+  getAllPresets: () => [...preset_names],
+  findPreset: (name) => preset_names.includes(name) ? name : null,
+  selectPreset: async () => {},
+  savePreset: async (name, preset = {}) => { if (!preset_names.includes(name)) { preset_names.push(name); presets.push(preset); } },
+  loadPreset: async () => ({}),
+  deletePreset: async (name) => { const index = preset_names.indexOf(name); if (index >= 0) { preset_names.splice(index, 1); presets.splice(index, 1); return true; } return false; },
+});
+""",
+        "openai.js": """
+export const oai_settings = {};
+export const proxies = [];
+export class Message { constructor(role = 'user', content = '') { this.role = role; this.content = content; } }
+export class MessageCollection extends Array {}
+export class ChatCompletion {}
+export const promptManager = {};
+export const setOpenAIMessageExamples = () => {};
+export const setOpenAIMessages = () => {};
+export const prepareOpenAIMessages = () => [];
+export const isImageInliningSupported = () => false;
+export const setupChatCompletionPromptManager = () => {};
+export const sendOpenAIRequest = async () => ({ choices: [] });
+export const tryParseStreamingError = () => null;
+export const getStreamingReply = async () => '';
+export const getChatCompletionModel = () => '';
+""",
+        "macros.js": """
+export const getLastMessageId = () => Math.max(0, (globalThis.SillyTavern?.getContext?.().chat?.length || 1) - 1);
+const registeredMacros = new Map();
+export class MacrosParser {
+  static registerMacro(name, value) { registeredMacros.set(String(name), value); }
+  static unregisterMacro(name) { registeredMacros.delete(String(name)); }
+  registerMacro(name, value) { MacrosParser.registerMacro(name, value); }
+  unregisterMacro(name) { MacrosParser.unregisterMacro(name); }
+  parse(value) {
+    return String(value ?? '').replace(/{{([^}]+)}}/g, (match, name) => {
+      const macro = registeredMacros.get(String(name).trim());
+      if (typeof macro === 'function') return String(macro());
+      if (macro !== undefined) return String(macro);
+      return match;
+    });
+  }
+}
+""",
+        "RossAscends-mods.js": """
+export const favsToHotswap = [];
+export const isMobile = () => matchMedia('(max-width: 720px)').matches;
+""",
+        "power-user.js": """
+export const power_user = {};
+export const persona_description_positions = { IN_PROMPT: 0, AFTER_CHAR: 1 };
+export const flushEphemeralStoppingStrings = () => {};
+""",
+        "user.js": "export const isAdmin = () => true;",
+        "authors-note.js": """
+export const NOTE_MODULE_NAME = 'authors_note';
+export const metadata_keys = { prompt: 'note_prompt' };
+export const shouldWIAddPrompt = () => false;
+""",
+        "PromptManager.js": """
+export class Prompt { constructor(data = {}) { Object.assign(this, data); } }
+export class PromptCollection extends Array {}
+""",
+        "sse-stream.js": "export const getEventSourceStream = async () => null;",
+        "slash-commands.js": """
+export const slashCommandRegistry = new Map();
+export const executeSlashCommandsWithOptions = async (text) => String(text ?? '');
+""",
+        "slash-commands/SlashCommand.js": """
+export class SlashCommand { constructor(data = {}) { Object.assign(this, data); } static fromProps(data = {}) { return new SlashCommand(data); } }
+""",
+        "slash-commands/SlashCommandArgument.js": """
+export const ARGUMENT_TYPE = { STRING: 'string', NUMBER: 'number', BOOLEAN: 'boolean', VARIABLE_NAME: 'variable_name' };
+export class SlashCommandArgument { constructor(data = {}) { Object.assign(this, data); } static fromProps(data = {}) { return new SlashCommandArgument(data); } }
+export class SlashCommandNamedArgument extends SlashCommandArgument {}
+""",
+        "slash-commands/SlashCommandCommonEnumsProvider.js": """
+import { SlashCommandEnumValue, enumTypes } from './SlashCommandEnumValue.js';
+export const enumIcons = { file: 'file', boolean: 'toggle-on', variable: 'at', character: 'user', world: 'book' };
+export const commonEnumProviders = {
+  boolean: () => () => [new SlashCommandEnumValue('true', 'true', enumTypes.enum, enumIcons.boolean), new SlashCommandEnumValue('false', 'false', enumTypes.enum, enumIcons.boolean)],
+  variables: () => () => [],
+  characters: () => () => [],
+  worlds: () => () => [],
+};
+""",
+        "slash-commands/SlashCommandEnumValue.js": """
+export const enumTypes = { enum: 'enum' };
+export class SlashCommandEnumValue { constructor(value, description = '', type = enumTypes.enum, icon = '') { this.value = value; this.description = description || ''; this.type = type; this.icon = icon || ''; } }
+""",
+        "slash-commands/SlashCommandParser.js": """
+export class SlashCommandParser { static addCommandObject(command) { globalThis.__dtSlashCommands ??= new Map(); globalThis.__dtSlashCommands.set(command?.name || command?.command || String(globalThis.__dtSlashCommands.size), command); } static parse(text) { return { command: String(text ?? ''), args: [] }; } }
+""",
+        "popup.js": """
+export const POPUP_TYPE = { TEXT: 0, CONFIRM: 1, INPUT: 2, DISPLAY: 3 };
+export const callGenericPopup = async (content, _type, _input, options = {}) => { if (options?.okButton) return true; return content; };
+""",
+        "tokenizers.js": "export const getTokenCountAsync = async (text) => Math.ceil(String(text ?? '').length / 4);",
+    }
+    if module_path in modules:
+        return _compat_javascript(modules[module_path])
+    raise HTTPException(status_code=404, detail="Compatibility script not found")
+
+
+@app.post("/api/images/upload")
+async def upload_extension_image(payload: ExtensionImageUpload, request: Request) -> dict[str, str]:
+    _require_permission(request, "edit_messages")
+    image_format = payload.format.lower().strip().lstrip(".") or "png"
+    if image_format not in {"png", "jpg", "jpeg", "webp", "gif"}:
+        raise HTTPException(status_code=400, detail="Unsupported image format")
+    directory_name = _safe_media_part(payload.ch_name)
+    filename = f"{_safe_media_part(payload.filename, 'image')}.{image_format}"
+    directory = storage.user_root / "user" / "images" / directory_name
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / filename).write_bytes(_decode_base64_payload(payload.image))
+    return {"path": f"/user/images/{quote(directory_name)}/{quote(filename)}"}
+
+
+@app.post("/api/files/upload")
+async def upload_extension_file(payload: ExtensionFileUpload, request: Request) -> dict[str, str]:
+    _require_permission(request, "edit_messages")
+    filename = _safe_media_part(Path(payload.name).name, "file.bin")
+    directory = storage.user_root / "user" / "files"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / filename).write_bytes(_decode_base64_payload(payload.data))
+    return {"path": f"/user/files/{quote(filename)}"}
+
+
+@app.get("/user/images/{folder}/{filename}")
+@app.head("/user/images/{folder}/{filename}")
+async def extension_image(folder: str, filename: str, request: Request) -> FileResponse:
+    path = storage.user_root / "user" / "images" / Path(folder).name / Path(filename).name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(path)
+
+
+@app.get("/user/files/{filename}")
+@app.head("/user/files/{filename}")
+async def extension_file(filename: str, request: Request) -> FileResponse:
+    path = storage.user_root / "user" / "files" / Path(filename).name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path)
+
+
+@app.post("/api/avatars/get")
+async def extension_avatars(request: Request) -> list[str]:
+    _require_permission(request, "view_personas")
+    if not personas_service.avatars_dir.exists():
+        return []
+    return [path.name for path in sorted(personas_service.avatars_dir.iterdir()) if path.is_file()]
+
+
+@app.get("/User Avatars/{filename}")
+async def extension_user_avatar(filename: str, request: Request) -> FileResponse:
+    try:
+        path = personas_service.avatar_path(filename)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Persona avatar not found") from error
+    return FileResponse(path)
+
+
 @app.get("/api/config/public")
 async def public_config() -> dict[str, object]:
     return {
@@ -210,12 +678,14 @@ async def public_config() -> dict[str, object]:
             "public_url": config.server.public_url,
         },
         "auth": {"mode": config.auth.mode, "required": settings_service.auth_required()},
+        "access_password_required": settings_service.access_password_required(),
         "default_session_id": DEFAULT_SESSION_ID,
     }
 
 
 @app.post("/api/auth/register")
-async def auth_register(payload: AuthRequest) -> dict[str, object]:
+async def auth_register(payload: AuthRequest, request: Request) -> dict[str, object]:
+    _require_access_password(request)
     try:
         user, token = auth_service.register(payload.username, payload.password)
     except ValueError as error:
@@ -224,7 +694,8 @@ async def auth_register(payload: AuthRequest) -> dict[str, object]:
 
 
 @app.post("/api/auth/login")
-async def auth_login(payload: AuthRequest) -> dict[str, object]:
+async def auth_login(payload: AuthRequest, request: Request) -> dict[str, object]:
+    _require_access_password(request)
     try:
         user, token = auth_service.login(payload.username, payload.password)
     except ValueError as error:
@@ -234,17 +705,20 @@ async def auth_login(payload: AuthRequest) -> dict[str, object]:
 
 @app.get("/api/auth/me")
 async def auth_me(request: Request) -> dict[str, object]:
+    _require_access_password(request)
     return {"user": auth_service.public_user(_auth_user_from_request(request))}
 
 
 @app.post("/api/auth/logout")
 async def auth_logout(request: Request) -> dict[str, object]:
+    _require_access_password(request)
     auth_service.logout(_token_from_request(request))
     return {"ok": True}
 
 
 @app.post("/api/auth/claim-admin")
 async def claim_admin(payload: AdminClaimRequest, request: Request) -> dict[str, object]:
+    _require_access_password(request)
     try:
         user = auth_service.claim_admin(_token_from_request(request), payload.code, config.auth.admin_code)
     except PermissionError as error:
@@ -256,22 +730,77 @@ async def claim_admin(payload: AdminClaimRequest, request: Request) -> dict[str,
 
 @app.get("/api/security/permissions")
 async def get_security_permissions() -> dict[str, object]:
-    return {"auth_required": settings_service.auth_required(), "permissions": settings_service.security_permissions().model_dump(mode="json")}
+    settings = settings_service.security_settings_payload()
+    return {
+        "auth_required": settings.auth_required,
+        "access_password_required": settings.access_password_required,
+        "access_password_configured": settings.access_password_configured,
+        "permissions": settings.permissions.model_dump(mode="json"),
+    }
+
+
+@app.get("/api/security/access")
+async def get_access_password_status(request: Request) -> dict[str, object]:
+    required = settings_service.access_password_required()
+    return {"required": required, "unlocked": not required or settings_service.verify_access_token(_access_token_from_request(request))}
+
+
+@app.post("/api/security/access")
+async def unlock_access_password(payload: AccessPasswordRequest) -> dict[str, object]:
+    try:
+        token = settings_service.verify_access_password(payload.password)
+    except ValueError as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+    return {"ok": True, "required": settings_service.access_password_required(), "token": token}
 
 
 @app.put("/api/security/permissions")
 async def update_security_permissions(payload: SecuritySettingsPayload, request: Request) -> dict[str, object]:
     _require_permission(request, "manage_security")
-    settings = settings_service.update_security_settings(payload)
+    try:
+        settings = settings_service.update_security_settings(payload)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     await connection_manager.broadcast(
         DEFAULT_SESSION_ID,
         {
             "type": "security.updated",
             "auth_required": settings.auth_required,
+            "access_password_required": settings.access_password_required,
+            "access_password_configured": settings.access_password_configured,
             "permissions": settings.permissions.model_dump(mode="json"),
         },
     )
-    return {"auth_required": settings.auth_required, "permissions": settings.permissions.model_dump(mode="json")}
+    return {
+        "auth_required": settings.auth_required,
+        "access_password_required": settings.access_password_required,
+        "access_password_configured": settings.access_password_configured,
+        "permissions": settings.permissions.model_dump(mode="json"),
+    }
+
+
+@app.get("/api/delete-locks")
+async def get_delete_locks(request: Request) -> dict[str, object]:
+    _require_permission(request, "view_chats")
+    return {"delete_locks": settings_service.delete_locks().model_dump(mode="json")}
+
+
+@app.put("/api/delete-locks")
+async def update_delete_lock(payload: DeleteLockUpdate, request: Request) -> dict[str, object]:
+    _require_permission(request, "manage_security")
+    item_id = payload.item_id.strip()
+    if not item_id:
+        raise HTTPException(status_code=400, detail="Delete lock item id is required")
+    try:
+        locks = settings_service.set_delete_lock(payload.category, item_id, payload.locked)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_delete_locks()
+    await _broadcast_notification(
+        f"{'заблокировал' if payload.locked else 'разблокировал'} удаление: {payload.category}/{item_id}",
+        actor=_actor_from_request(request),
+    )
+    return {"delete_locks": locks.model_dump(mode="json")}
 
 
 @app.get("/api/sessions/{session_id}")
@@ -460,10 +989,24 @@ async def apply_preset(preset_type: str, name: str, request: Request) -> dict[st
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Preset not found") from error
     active = settings_service.set_active_preset(preset_type, name)
+    active_preset_overrides[preset_type] = preset
     generation = _apply_generation_preset(preset_type, preset)
     if generation:
         generation_service.update_config(generation)
     await _broadcast_notification(f"изменил активный пресет: {name}", actor=_actor_from_request(request))
+    return {"active": active, "settings": settings_service.generation_settings()}
+
+
+@app.put("/api/presets/{preset_type}/active-draft")
+async def update_active_preset_draft(preset_type: str, payload: PresetPayload, request: Request) -> dict[str, object]:
+    _require_permission(request, "manage_presets")
+    if preset_type not in presets_service.TYPES:
+        raise HTTPException(status_code=404, detail="Preset type not found")
+    active_preset_overrides[preset_type] = payload.preset
+    active = settings_service.set_active_preset(preset_type, payload.name.strip() or "unsaved")
+    generation = _apply_generation_preset(preset_type, payload.preset)
+    if generation:
+        generation_service.update_config(generation)
     return {"active": active, "settings": settings_service.generation_settings()}
 
 
@@ -631,12 +1174,17 @@ async def update_character_card_avatar(card_id: str, request: Request, file: Upl
 @app.delete("/api/cards/{card_id}")
 async def delete_character_card(card_id: str, request: Request) -> dict[str, object]:
     _require_permission(request, "delete_cards")
+    _require_delete_unlocked("cards", card_id)
+    _require_card_chats_unlocked(card_id)
     try:
         card = character_cards_service.delete_card(card_id)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Card not found") from error
     bot_chats_service.delete_card_chats(card_id)
+    settings_service.clear_delete_lock("cards", card_id)
+    settings_service.clear_chat_locks_for_card(card_id)
     await connection_manager.broadcast(DEFAULT_SESSION_ID, {"type": "card.deleted", "card_id": card_id})
+    await _broadcast_delete_locks()
     await _broadcast_notification(f"удалил карточку: {card.name}", actor=_actor_from_request(request))
     return {"ok": True, "card": card.model_dump(mode="json")}
 
@@ -699,11 +1247,14 @@ async def copy_bot_chat(card_id: str, chat_id: str, request: Request) -> dict[st
 @app.delete("/api/cards/{card_id}/chats/{chat_id}")
 async def delete_bot_chat(card_id: str, chat_id: str, request: Request) -> dict[str, object]:
     _require_permission(request, "manage_chats")
+    _require_delete_unlocked("chats", _chat_lock_key(card_id, chat_id))
     try:
         bot_chats_service.delete_chat(card_id, chat_id)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Chat not found") from error
+    settings_service.clear_delete_lock("chats", _chat_lock_key(card_id, chat_id))
     await connection_manager.broadcast(DEFAULT_SESSION_ID, {"type": "chat.deleted", "card_id": card_id, "chat_id": chat_id})
+    await _broadcast_delete_locks()
     return {"ok": True}
 
 
@@ -890,10 +1441,13 @@ async def update_persona(persona_id: str, payload: PersonaUpdate, request: Reque
 @app.delete("/api/personas/{persona_id}")
 async def delete_persona(persona_id: str, request: Request) -> dict[str, object]:
     _require_permission(request, "delete_personas")
+    _require_delete_unlocked("personas", persona_id)
     try:
         persona = personas_service.delete_persona(persona_id)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Persona not found") from error
+    settings_service.clear_delete_lock("personas", persona_id)
+    await _broadcast_delete_locks()
     await _broadcast_notification(f"удалил персону: {persona.name}", actor=_actor_from_request(request))
     return {"ok": True, "persona": persona.model_dump(mode="json")}
 
@@ -925,6 +1479,7 @@ async def upload_persona_avatar(persona_id: str, request: Request, file: UploadF
 
 
 @app.get("/api/personas/avatars/{filename}")
+@app.head("/api/personas/avatars/{filename}")
 async def persona_avatar(filename: str, request: Request) -> FileResponse:
     _require_permission(request, "view_personas")
     try:

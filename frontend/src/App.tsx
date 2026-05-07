@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react';
+import { emitSillyTavernChatChanged, emitSillyTavernMessageRendered, emitSillyTavernMessageSwiped, formatExtensionMessageHtml, initSillyTavernExtensions, updateSillyTavernRuntime } from './sillyTavernExtensions';
 
-type MenuSection = 'presets' | 'connection' | 'visual' | 'personas' | 'security' | 'lorebooks' | 'cards';
+type MenuSection = 'presets' | 'connection' | 'visual' | 'personas' | 'security' | 'lorebooks' | 'cards' | 'extensions';
 type IconName = 'sliders' | 'plug' | 'palette' | 'user' | 'card' | 'book' | 'bot' | 'lock' | 'menu' | 'send' | 'edit' | 'trash' | 'eye' | 'eyeOff' | 'check' | 'x';
 type ThemeId = 'midnight' | 'parchment' | 'abyss' | 'forest' | 'ocean' | 'plum' | 'ember';
 type VisualSettings = {
@@ -113,6 +114,23 @@ type PresetSummary = {
   updated_at: number;
 };
 
+type ExtensionSummary = {
+  name: string;
+  external_name: string;
+  type: string;
+  enabled: boolean;
+  source: string;
+  manifest: {
+    display_name?: string;
+    author?: string;
+    version?: string;
+    loading_order?: number | string;
+    homePage?: string;
+  };
+  installed_at: string;
+  updated_at: string;
+};
+
 type LorebookBinding = { book: string; target_type: 'global' | 'card' | 'chat' | 'persona'; target_id: string };
 type LorebookSummary = { name: string; filename: string; entry_count: number; updated_at: number; bindings: LorebookBinding[] };
 
@@ -121,6 +139,7 @@ type Participant = {
   name: string;
   role: string;
   connected: boolean;
+  connected_at?: string;
   persona_id: string;
   persona_name: string;
   avatar_url: string;
@@ -137,6 +156,7 @@ type PermissionMode = 'everyone' | 'admins' | 'users';
 type PermissionRule = { mode: PermissionMode; users: string[] };
 type SecurityPermissions = Record<string, PermissionRule>;
 type AccessDeniedState = { cards: boolean; personas: boolean; chats: boolean; presets: boolean; lorebooks: boolean };
+type DeletionLocks = { cards: string[]; personas: string[]; chats: string[] };
 
 type ToastMessage = {
   id: string;
@@ -152,7 +172,10 @@ type RealtimePayload = {
   message?: string;
   replace_message_id?: string | null;
   auth_required?: boolean;
+  access_password_required?: boolean;
+  access_password_configured?: boolean;
   permissions?: SecurityPermissions;
+  delete_locks?: DeletionLocks;
 };
 
 type RawPreset = Record<string, unknown>;
@@ -187,6 +210,10 @@ type ReasoningDisplaySettings = {
   separator: string;
 };
 
+type NoricoreScene = { location: string; weather: string; date: string; time: string };
+type NoricoreCharacter = { name: string; status: string; outfit: string; health: string; mood: string; feelings: string; thoughts: string };
+type NoricoreData = { scene: NoricoreScene | null; characters: NoricoreCharacter[] };
+
 const menuItems: Array<{ id: MenuSection; label: string; icon: IconName; description: string }> = [
   { id: 'presets', label: 'Пресеты', icon: 'sliders', description: 'Prompt, sampler, параметры генерации' },
   { id: 'connection', label: 'Подключение', icon: 'plug', description: 'Provider, endpoint, model, API key' },
@@ -194,6 +221,7 @@ const menuItems: Array<{ id: MenuSection; label: string; icon: IconName; descrip
   { id: 'cards', label: 'Карточки', icon: 'card', description: 'Character cards, боты и чаты карточек' },
   { id: 'personas', label: 'Персоны', icon: 'user', description: 'Профили игроков и persona prompt' },
   { id: 'lorebooks', label: 'Лорбуки', icon: 'book', description: 'World Info ST, ключи и привязки' },
+  { id: 'extensions', label: 'Расширения', icon: 'plug', description: 'SillyTavern extensions и настройки' },
   { id: 'security', label: 'Безопасность', icon: 'lock', description: 'Пароль фронта, локальная сеть, key checking' },
 ];
 
@@ -203,6 +231,7 @@ const PARTICIPANT_STORAGE_KEY = 'doubletrouble.participantId';
 const LAST_CARD_STORAGE_KEY = 'doubletrouble.lastCardId';
 const LAST_CHAT_BY_CARD_STORAGE_KEY = 'doubletrouble.lastChatByCard';
 const AUTH_TOKEN_STORAGE_KEY = 'doubletrouble.authToken';
+const ACCESS_TOKEN_STORAGE_KEY = 'doubletrouble.accessToken';
 const OPENAI_PROMPT_ORDER_CHARACTER_ID = 100001;
 
 const permissionLabels: Record<string, string> = {
@@ -221,11 +250,13 @@ const permissionLabels: Record<string, string> = {
   generate: 'Генерация, swipes и reroll',
   manage_presets: 'Пресеты и подключения',
   manage_lorebooks: 'Лорбуки и привязки',
+  manage_extensions: 'Установка и управление расширениями',
   manage_security: 'Настройки безопасности',
 };
 
 const defaultSecurityPermissions: SecurityPermissions = Object.fromEntries(Object.keys(permissionLabels).map((key) => [key, { mode: key === 'manage_security' ? 'admins' : 'everyone', users: [] }])) as SecurityPermissions;
 const accessDeniedText = 'Доступ запрещен. Войдите или попросите администратора выдать права.';
+const defaultDeletionLocks: DeletionLocks = { cards: [], personas: [], chats: [] };
 
 const emptyCardDraft: CardDraft = { name: '', description: '', personality: '', scenario: '', firstMessage: '', messageExample: '', creator: '', tags: '' };
 
@@ -359,6 +390,10 @@ export default function App() {
   const [chatInput, setChatInput] = useState('');
   const [composerMenuOpen, setComposerMenuOpen] = useState(false);
   const [chatPickerOpen, setChatPickerOpen] = useState(false);
+  const [playersMenuOpen, setPlayersMenuOpen] = useState(false);
+  const [extensionSettingsOpen, setExtensionSettingsOpen] = useState(false);
+  const [extensionSettingsTarget, setExtensionSettingsTarget] = useState('');
+  const [mobileTopbarCollapsed, setMobileTopbarCollapsed] = useState(false);
   const [selectedPersonaId, setSelectedPersonaId] = useState(() => window.localStorage.getItem(SELECTED_PERSONA_STORAGE_KEY) || '');
   const [generationSettings, setGenerationSettings] = useState<GenerationSettings>(defaultGenerationSettings);
   const [models, setModels] = useState<string[]>([]);
@@ -398,12 +433,23 @@ export default function App() {
   const [authDraft, setAuthDraft] = useState({ username: '', password: '', adminCode: '' });
   const [authMessage, setAuthMessage] = useState('');
   const [authRequired, setAuthRequired] = useState(false);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [accessToken, setAccessToken] = useState(() => window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || '');
+  const [accessPasswordRequired, setAccessPasswordRequired] = useState(false);
+  const [accessPasswordConfigured, setAccessPasswordConfigured] = useState(false);
+  const [accessUnlocked, setAccessUnlocked] = useState(false);
+  const [accessPasswordDraft, setAccessPasswordDraft] = useState('');
+  const [accessPasswordMessage, setAccessPasswordMessage] = useState('');
+  const [securityAccessPasswordDraft, setSecurityAccessPasswordDraft] = useState('');
   const [securityPermissions, setSecurityPermissions] = useState<SecurityPermissions>(defaultSecurityPermissions);
   const [accessDenied, setAccessDenied] = useState<AccessDeniedState>({ cards: false, personas: false, chats: false, presets: false, lorebooks: false });
+  const [deletionLocks, setDeletionLocks] = useState<DeletionLocks>(defaultDeletionLocks);
+  const [pendingDeleteKey, setPendingDeleteKey] = useState('');
   const activeMessages = activeChat?.messages ?? [];
   const reasoningDisplay = reasoningSettingsFromPreset(parsePresetDraft(presetJsonDraft));
   const selectedPersona = personas.find((persona) => persona.id === selectedPersonaId) ?? personas[0] ?? null;
   const connectedPlayers = participants.filter((participant) => participant.connected && participant.role === 'player');
+  const connectedCount = participants.filter((participant) => participant.connected).length;
   const websocketRef = useRef<WebSocket | null>(null);
   const participantIdRef = useRef(participantId());
   const authTokenRef = useRef(authToken);
@@ -412,6 +458,16 @@ export default function App() {
   const activeChatRef = useRef<BotChat | null>(null);
   const swipeTouchStartRef = useRef<Record<string, number>>({});
   const restoredSelectionRef = useRef(false);
+  const activePresetDraftSignatureRef = useRef('');
+  const renderedExtensionMessageIdsRef = useRef<Set<string>>(new Set());
+  const activeGenerationRef = useRef(false);
+  const extensionLeaderId = connectedPlayers.length
+    ? [...connectedPlayers].sort((left, right) => {
+        if (left.is_admin !== right.is_admin) return left.is_admin ? -1 : 1;
+        return String(left.connected_at || '').localeCompare(String(right.connected_at || '')) || left.id.localeCompare(right.id);
+      })[0]?.id || participantIdRef.current
+    : participantIdRef.current;
+  const extensionLeader = extensionLeaderId === participantIdRef.current;
 
   useEffect(() => {
     activeCardRef.current = activeCard;
@@ -443,17 +499,31 @@ export default function App() {
     void loadPresetTypes();
     void loadLorebooks();
     void loadSecurityPermissions();
+    void loadDeleteLocks();
   }, []);
 
   useEffect(() => {
     if (authToken) {
       window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, authToken);
       void loadCurrentUser(authToken);
+      void loadDeleteLocks(authToken);
     } else {
       window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
       setAuthUser(null);
     }
   }, [authToken]);
+
+  useEffect(() => {
+    if (accessToken) {
+      window.localStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, accessToken);
+      document.cookie = `doubletrouble_access=${encodeURIComponent(accessToken)}; path=/; SameSite=Lax`;
+      void verifyAccessPasswordToken(accessToken);
+    } else {
+      window.localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
+      document.cookie = 'doubletrouble_access=; path=/; max-age=0; SameSite=Lax';
+      setAccessUnlocked(!accessPasswordRequired);
+    }
+  }, [accessToken, accessPasswordRequired]);
 
   useEffect(() => {
     let lastY = window.scrollY;
@@ -479,8 +549,77 @@ export default function App() {
   }, [selectedPersonaId]);
 
   useEffect(() => {
+    const openExtensionSettings = (event: Event) => {
+      const target = (event as CustomEvent<{ name?: string }>).detail?.name || '';
+      setExtensionSettingsTarget(target);
+      setExtensionSettingsOpen(Boolean(target));
+    };
+    window.addEventListener('doubletrouble:extension-settings-open', openExtensionSettings);
+    return () => window.removeEventListener('doubletrouble:extension-settings-open', openExtensionSettings);
+  }, []);
+
+  useEffect(() => {
+    if (!menuOpen || activeSection !== 'extensions') {
+      setExtensionSettingsOpen(false);
+      setExtensionSettingsTarget('');
+    }
+  }, [menuOpen, activeSection]);
+
+  useEffect(() => {
+    const settingsHost = document.getElementById('extensions_settings');
+    if (!settingsHost) {
+      return;
+    }
+    Array.from(settingsHost.children).forEach((child) => {
+      if (!(child instanceof HTMLElement)) {
+        return;
+      }
+      child.hidden = !extensionSettingsOpen || child.dataset.dtExtensionOwner !== extensionSettingsTarget;
+    });
+  }, [extensionSettingsOpen, extensionSettingsTarget]);
+
+  useEffect(() => {
     sendPresence(selectedPersona);
   }, [selectedPersona?.id, selectedPersona?.name, selectedPersona?.avatar_url, authUser?.username, authUser?.is_admin]);
+
+  useEffect(() => {
+    updateSillyTavernRuntime({
+      messages: activeMessages,
+      characters: activeCard ? [{ id: activeCard.id, name: activeCard.name, avatar: activeCard.image_url, image_url: imageSrc(activeCard.image_url) }] : [],
+      characterId: activeCard ? 0 : undefined,
+      name1: selectedPersona?.name || authUser?.username || 'Player',
+      name2: activeCard?.name || generationSettings.bot_name || 'Bot',
+      getRequestHeaders: actorHeaders,
+      saveMessageByIndex: saveExtensionMessageByIndex,
+      toast: addToast,
+      extensionLeader,
+    });
+  }, [activeMessages, activeCard?.id, activeCard?.name, activeCard?.image_url, selectedPersona?.name, authUser?.username, generationSettings.bot_name, authToken, accessToken, extensionLeader]);
+
+  useEffect(() => {
+    if (authChecked && (!authRequired || authUser)) {
+      void initSillyTavernExtensions();
+    }
+  }, [authChecked, authRequired, authUser]);
+
+  useEffect(() => {
+    renderedExtensionMessageIdsRef.current = new Set();
+    const timer = window.setTimeout(() => { void emitSillyTavernChatChanged(); }, 80);
+    return () => window.clearTimeout(timer);
+  }, [activeCard?.id, activeChat?.id]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      activeMessages.forEach((message, index) => {
+        if (!renderedExtensionMessageIdsRef.current.has(message.id)) {
+          renderedExtensionMessageIdsRef.current.add(message.id);
+          void emitSillyTavernMessageRendered(index, message.role);
+        }
+      });
+      void emitSillyTavernChatChanged();
+    }, 120);
+    return () => window.clearTimeout(timer);
+  }, [activeMessages]);
 
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -515,10 +654,12 @@ export default function App() {
         addToast(payload.message);
       }
       if (payload.type === 'generation.started' && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
+        activeGenerationRef.current = true;
         setIsGenerating(true);
         setGenerationStatus(payload.replace_message_id ? 'Бот перегенерирует ответ...' : 'Бот думает...');
       }
       if ((payload.type === 'generation.finished' || payload.type === 'generation.cancelled' || payload.type === 'generation.failed') && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
+        activeGenerationRef.current = false;
         setIsGenerating(false);
         setGenerationStatus('');
         if (payload.type === 'generation.failed' && payload.message) {
@@ -527,10 +668,19 @@ export default function App() {
       }
       if (payload.type === 'security.updated') {
         setAuthRequired(Boolean(payload.auth_required));
+        setAccessPasswordRequired(Boolean(payload.access_password_required));
+        setAccessPasswordConfigured(Boolean(payload.access_password_configured));
+        if (!payload.access_password_required) {
+          setAccessUnlocked(true);
+        }
         if (payload.permissions) {
           setSecurityPermissions({ ...defaultSecurityPermissions, ...payload.permissions });
         }
         void refreshAccessControlledData();
+      }
+      if (payload.type === 'delete_locks.updated' && payload.delete_locks) {
+        setDeletionLocks({ ...defaultDeletionLocks, ...payload.delete_locks });
+        setPendingDeleteKey('');
       }
     };
     return () => socket.close();
@@ -552,6 +702,7 @@ export default function App() {
 
   const actorHeaders = (token = authToken) => ({
     'X-DoubleTrouble-Actor': authUserRef.current?.username || selectedPersona?.name || 'Player',
+    ...(accessToken ? { 'X-DoubleTrouble-Access': accessToken } : {}),
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
   });
 
@@ -574,11 +725,87 @@ export default function App() {
   const deniedResponse = (response: Response) => response.status === 401 || response.status === 403;
   const markAccessDenied = (section: keyof AccessDeniedState, denied: boolean) => setAccessDenied((current) => ({ ...current, [section]: denied }));
 
+  const syncActivePresetDraft = async (draft = presetJsonDraft, token = authToken) => {
+    if (!selectedPresetType || accessDenied.presets) {
+      return;
+    }
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(draft) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    const name = presetNameDraft.trim() || selectedPresetName || 'unsaved';
+    const signature = `${selectedPresetType}:${name}:${draft}`;
+    if (activePresetDraftSignatureRef.current === signature) {
+      return;
+    }
+    activePresetDraftSignatureRef.current = signature;
+    const response = await fetch(`/api/presets/${encodeURIComponent(selectedPresetType)}/active-draft`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', ...actorHeaders(token) },
+      body: JSON.stringify({ name, preset: parsed }),
+    });
+    if (!response.ok) {
+      setPresetMessage('Не удалось активировать изменения пресета');
+      activePresetDraftSignatureRef.current = '';
+      return;
+    }
+    const data = await response.json() as { active: Record<string, string>; settings: Partial<GenerationSettings> };
+    setActivePresets(data.active);
+    setGenerationSettings((current) => ({ ...current, ...data.settings, api_key: '', clear_api_key: false }));
+  };
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void syncActivePresetDraft(); }, 450);
+    return () => window.clearTimeout(timer);
+  }, [presetJsonDraft, presetNameDraft, selectedPresetName, selectedPresetType, authToken, accessDenied.presets]);
+
+  const saveExtensionMessageByIndex = async (index: number, content: string) => {
+    const chat = activeChatRef.current;
+    const card = activeCardRef.current;
+    const message = chat?.messages[index];
+    if (!chat || !card || !message || message.content === content) {
+      return;
+    }
+    const response = await fetch(`/api/cards/${card.id}/chats/${chat.id}/messages/${message.id}`, {
+      method: 'PUT',
+      headers: authJsonHeaders(),
+      body: JSON.stringify({ content }),
+    });
+    if (!response.ok) {
+      addToast('Расширение не смогло сохранить сообщение');
+      return;
+    }
+    const data = await response.json() as { chat: BotChat };
+    setActiveChat(data.chat);
+    if (!activeGenerationRef.current) {
+      setIsGenerating(false);
+      setGenerationStatus('');
+    }
+    const nextIndex = data.chat.messages.findIndex((item) => item.id === message.id);
+    if (nextIndex >= 0) {
+      void emitSillyTavernMessageSwiped(nextIndex);
+    }
+  };
+
+  const chatDeleteLockId = (cardId: string, chatId: string) => `${cardId}:${chatId}`;
+  const isDeleteLocked = (category: keyof DeletionLocks, itemId: string) => deletionLocks[category].includes(itemId);
+
+  const loadDeleteLocks = async (token = authToken) => {
+    const response = await fetch('/api/delete-locks', { headers: actorHeaders(token) });
+    if (!response.ok) {
+      return;
+    }
+    const data = await response.json() as { delete_locks: DeletionLocks };
+    setDeletionLocks({ ...defaultDeletionLocks, ...data.delete_locks });
+  };
+
   const loadCurrentUser = async (token = authToken) => {
     if (!token) {
       return;
     }
-    const response = await fetch('/api/auth/me', { headers: { Authorization: `Bearer ${token}` } });
+    const response = await fetch('/api/auth/me', { headers: actorHeaders(token) });
     if (!response.ok) {
       setAuthToken('');
       return;
@@ -590,7 +817,7 @@ export default function App() {
   const submitAuth = async (mode: 'login' | 'register') => {
     const response = await fetch(`/api/auth/${mode}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authJsonHeaders(''),
       body: JSON.stringify({ username: authDraft.username, password: authDraft.password }),
     });
     const data = await response.json().catch(() => null) as { token?: string; user?: AuthUser; detail?: string } | null;
@@ -608,7 +835,7 @@ export default function App() {
 
   const logout = async () => {
     if (authToken) {
-      await fetch('/api/auth/logout', { method: 'POST', headers: { Authorization: `Bearer ${authToken}` } });
+      await fetch('/api/auth/logout', { method: 'POST', headers: actorHeaders(authToken) });
     }
     setAuthToken('');
     setAuthUser(null);
@@ -635,28 +862,79 @@ export default function App() {
   };
 
   const loadSecurityPermissions = async () => {
-    const response = await fetch('/api/security/permissions');
-    if (!response.ok) {
+    try {
+      const response = await fetch('/api/security/permissions');
+      if (!response.ok) {
+        return;
+      }
+      const data = await response.json() as { auth_required?: boolean; access_password_required?: boolean; access_password_configured?: boolean; permissions: SecurityPermissions };
+      setAuthRequired(Boolean(data.auth_required));
+      setAccessPasswordRequired(Boolean(data.access_password_required));
+      setAccessPasswordConfigured(Boolean(data.access_password_configured));
+      if (!data.access_password_required) {
+        setAccessUnlocked(true);
+      } else if (accessToken) {
+        await verifyAccessPasswordToken(accessToken);
+      }
+      setSecurityPermissions({ ...defaultSecurityPermissions, ...data.permissions });
+    } finally {
+      setAuthChecked(true);
+    }
+  };
+
+  const verifyAccessPasswordToken = async (token = accessToken) => {
+    const response = await fetch('/api/security/access', { headers: token ? { 'X-DoubleTrouble-Access': token } : {} });
+    const data = await response.json().catch(() => null) as { required?: boolean; unlocked?: boolean } | null;
+    const required = Boolean(data?.required);
+    setAccessPasswordRequired(required);
+    setAccessUnlocked(!required || Boolean(data?.unlocked));
+    if (required && !data?.unlocked && token) {
+      setAccessToken('');
+    }
+  };
+
+  const unlockAccessPassword = async () => {
+    const response = await fetch('/api/security/access', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: accessPasswordDraft }),
+    });
+    const data = await response.json().catch(() => null) as { token?: string; detail?: string } | null;
+    if (!response.ok || !data?.token) {
+      setAccessPasswordMessage(data?.detail || 'Неверный пароль доступа');
       return;
     }
-    const data = await response.json() as { auth_required?: boolean; permissions: SecurityPermissions };
-    setAuthRequired(Boolean(data.auth_required));
-    setSecurityPermissions({ ...defaultSecurityPermissions, ...data.permissions });
+    setAccessToken(data.token);
+    setAccessUnlocked(true);
+    setAccessPasswordDraft('');
+    setAccessPasswordMessage('Доступ открыт');
+    await Promise.all([refreshLibrary(), loadGenerationSettings(), loadConnectionPresets(), loadPresetTypes(), loadLorebooks(), loadDeleteLocks(), loadCurrentUser()]);
   };
 
   const saveSecurityPermissions = async () => {
     const response = await fetch('/api/security/permissions', {
       method: 'PUT',
       headers: authJsonHeaders(),
-      body: JSON.stringify({ auth_required: authRequired, permissions: securityPermissions }),
+      body: JSON.stringify({
+        auth_required: authRequired,
+        access_password_required: accessPasswordRequired,
+        access_password: securityAccessPasswordDraft,
+        permissions: securityPermissions,
+      }),
     });
-    const data = await response.json().catch(() => null) as { auth_required?: boolean; permissions?: SecurityPermissions; detail?: string } | null;
+    const data = await response.json().catch(() => null) as { auth_required?: boolean; access_password_required?: boolean; access_password_configured?: boolean; permissions?: SecurityPermissions; detail?: string } | null;
     if (!response.ok || !data?.permissions) {
       setAuthMessage(data?.detail || 'Не удалось сохранить права');
       return;
     }
     setAuthRequired(Boolean(data.auth_required));
+    setAccessPasswordRequired(Boolean(data.access_password_required));
+    setAccessPasswordConfigured(Boolean(data.access_password_configured));
+    if (!data.access_password_required) {
+      setAccessUnlocked(true);
+    }
     setSecurityPermissions({ ...defaultSecurityPermissions, ...data.permissions });
+    setSecurityAccessPasswordDraft('');
     setAuthMessage('Права сохранены');
   };
 
@@ -825,6 +1103,7 @@ export default function App() {
       return;
     }
     setPresetMessage('Пресет сохранен');
+    await syncActivePresetDraft(JSON.stringify(parsed, null, 2));
     await loadPresets(selectedPresetType, name);
   };
 
@@ -1271,7 +1550,8 @@ export default function App() {
   };
 
   const deleteCard = async (card: CharacterCard) => {
-    if (!window.confirm(`Удалить карточку "${card.name}" и ее чаты?`)) {
+    if (isDeleteLocked('cards', card.id)) {
+      setLibraryMessage('Удаление карточек заблокировано админом');
       return;
     }
     const response = await fetch(`/api/cards/${encodeURIComponent(card.id)}`, { method: 'DELETE', headers: actorHeaders() });
@@ -1404,6 +1684,32 @@ export default function App() {
     setLibraryMessage('Экспорт SillyTavern .jsonl готов');
   };
 
+  const toggleDeletionLock = async (category: keyof DeletionLocks, itemId: string) => {
+    if (!authUserRef.current?.is_admin) {
+      return;
+    }
+    const response = await fetch('/api/delete-locks', {
+      method: 'PUT',
+      headers: authJsonHeaders(),
+      body: JSON.stringify({ category, item_id: itemId, locked: !isDeleteLocked(category, itemId) }),
+    });
+    if (!response.ok) {
+      setLibraryMessage('Не удалось изменить блокировку удаления');
+      return;
+    }
+    const data = await response.json() as { delete_locks: DeletionLocks };
+    setDeletionLocks({ ...defaultDeletionLocks, ...data.delete_locks });
+    setPendingDeleteKey('');
+  };
+
+  const toggleMobileTopbar = (event: MouseEvent<HTMLElement>) => {
+    const target = event.target as HTMLElement;
+    if (target.closest('button, input, textarea, select, a, .players-popover')) {
+      return;
+    }
+    setMobileTopbarCollapsed((collapsed) => !collapsed);
+  };
+
   const renameChat = async (chat: BotChatSummary) => {
     if (!activeCard) {
       return;
@@ -1431,6 +1737,10 @@ export default function App() {
 
   const deleteChat = async (chatId: string) => {
     if (!activeCard) {
+      return;
+    }
+    if (isDeleteLocked('chats', chatDeleteLockId(activeCard.id, chatId))) {
+      setLibraryMessage('Удаление чатов заблокировано админом');
       return;
     }
     const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(chatId)}`, { method: 'DELETE', headers: actorHeaders() });
@@ -1676,6 +1986,7 @@ export default function App() {
       setLibraryMessage('Сначала выбери карточку и чат');
       return;
     }
+    activeGenerationRef.current = true;
     setIsGenerating(true);
     setGenerationStatus(replaceMessageId ? 'Бот перегенерирует ответ...' : 'Бот думает...');
     setLibraryMessage(replaceMessageId ? 'Реролл ответа...' : 'Бот отвечает...');
@@ -1700,6 +2011,7 @@ export default function App() {
       setActiveChat(data.chat);
       setLibraryMessage(replaceMessageId ? 'Реролл добавлен в swipes' : 'Ответ бота добавлен');
     } finally {
+      activeGenerationRef.current = false;
       setIsGenerating(false);
       setGenerationStatus('');
     }
@@ -1782,7 +2094,8 @@ export default function App() {
   };
 
   const deletePersona = async (persona: Persona) => {
-    if (!window.confirm(`Удалить персону "${persona.name}"?`)) {
+    if (isDeleteLocked('personas', persona.id)) {
+      setLibraryMessage('Удаление персон заблокировано админом');
       return;
     }
     const response = await fetch(`/api/personas/${persona.id}`, { method: 'DELETE', headers: actorHeaders() });
@@ -1813,6 +2126,17 @@ export default function App() {
     await refreshLibrary();
   };
 
+  if (accessPasswordRequired && !accessUnlocked) {
+    return (
+      <AccessPasswordGate
+        password={accessPasswordDraft}
+        setPassword={setAccessPasswordDraft}
+        message={accessPasswordMessage}
+        unlock={unlockAccessPassword}
+      />
+    );
+  }
+
   if (authRequired && !authUser) {
     return (
       <AuthGate
@@ -1832,11 +2156,39 @@ export default function App() {
       data-show-avatars={String(visualSettings.showAvatars)}
       data-sticky-composer={String(visualSettings.stickyComposer)}
     >
-      <header className={topbarVisible ? 'topbar topbar-visible' : 'topbar topbar-hidden'}>
+      <header className={`${topbarVisible ? 'topbar topbar-visible' : 'topbar topbar-hidden'}${mobileTopbarCollapsed ? ' topbar-collapsed' : ''}`} onClick={toggleMobileTopbar}>
         <button className="menu-trigger" type="button" onClick={() => setMenuOpen(true)}>
           <Icon name="menu" />
           Меню
         </button>
+        <div className="turn-strip app-status-strip">
+          <div>
+            <span>Персона</span>
+            <strong>{selectedPersona?.name || 'не выбрана'}</strong>
+          </div>
+          <div>
+            <span>Активный чат</span>
+            <strong>{activeCard?.name || 'карточка не выбрана'} · {activeChat?.title || 'чат не выбран'}</strong>
+          </div>
+          <div>
+            <span>Подключения</span>
+            <div className="connections-status">
+              <strong>{connectedCount}</strong>
+              <button className="ghost-button" type="button" onClick={() => setPlayersMenuOpen((open) => !open)}>Игроки</button>
+              {playersMenuOpen ? (
+                <div className="players-popover">
+                  {connectedPlayers.length ? connectedPlayers.map((player) => (
+                    <span className="player-pill" key={player.id} title={player.persona_name || player.name}>
+                      {player.avatar_url ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(player.avatar_url), title: player.persona_name || player.name })}><img src={imageSrc(player.avatar_url)} alt="" loading="lazy" /></button> : <i>{(player.persona_name || player.name).slice(0, 1) || '?'}</i>}
+                      <strong className="identity-name">{player.is_admin ? <span className="admin-crown">♛</span> : null}<span>{player.persona_name || player.name}</span></strong>
+                      {player.username ? <small className="hover-username">({player.username})</small> : null}
+                    </span>
+                  )) : <strong>нет подключенных игроков</strong>}
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </div>
         <div className="brand-block">
           <div>
             <strong>DoubleTrouble</strong>
@@ -1846,41 +2198,19 @@ export default function App() {
         </div>
       </header>
 
-      <div className="turn-strip app-status-strip">
-        <div>
-          <span>Персона</span>
-          <strong>{selectedPersona?.name || 'не выбрана'}</strong>
-        </div>
-        <div>
-          <span>Активный чат</span>
-          <strong>{activeCard?.name || 'карточка не выбрана'} · {activeChat?.title || 'чат не выбран'}</strong>
-        </div>
-        <div>
-          <span>Игроки</span>
-          <div className="players-strip">
-            {connectedPlayers.length ? connectedPlayers.map((player) => (
-              <span className="player-pill" key={player.id} title={player.persona_name || player.name}>
-                {player.avatar_url ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(player.avatar_url), title: player.persona_name || player.name })}><img src={imageSrc(player.avatar_url)} alt="" loading="lazy" /></button> : <i>{(player.persona_name || player.name).slice(0, 1) || '?'}</i>}
-                <strong className="identity-name">{player.is_admin ? <span className="admin-crown">♛</span> : null}<span>{player.persona_name || player.name}</span></strong>
-                {player.username ? <small className="hover-username">({player.username})</small> : null}
-              </span>
-            )) : <strong>нет подключенных</strong>}
-          </div>
-        </div>
-      </div>
-
       <section className="hybrid-layout">
         <section className="chat-stage">
-          <div className="chat-scroll">
+          <div className="chat-scroll" id="chat">
             {accessDenied.chats ? <AccessDeniedNotice /> : activeMessages.length ? activeMessages.map((message, messageIndex) => {
               const isOwnMessage = message.role === 'user' && (message.participant_id ? message.participant_id === participantIdRef.current : message.author === selectedPersona?.name);
-              const messageClass = `${message.role === 'assistant' ? 'message bot-message' : 'message'}${message.hidden ? ' hidden-message' : ''}${isOwnMessage ? ' own-message' : ''}`;
+              const messageClass = `mes ${message.role === 'assistant' ? 'message bot-message' : 'message'}${message.hidden ? ' hidden-message' : ''}${isOwnMessage ? ' own-message' : ''}`;
               const swipeCount = message.swipes?.length ?? 0;
               const canSwipe = message.role === 'assistant' && swipeCount > 1;
               return (
-              <article
-                className={messageClass}
-                key={message.id}
+               <article
+                 className={messageClass}
+                 {...{ mesid: String(messageIndex) }}
+                 key={message.id}
                 tabIndex={canSwipe ? 0 : undefined}
                 onKeyDown={(event) => {
                   if (!canSwipe || (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight')) {
@@ -1906,46 +2236,56 @@ export default function App() {
                   }
                 }}
               >
-                <div className="message-actions" aria-label="Действия сообщения">
-                  {canSwipe ? <button type="button" title="Предыдущий swipe" onClick={() => void swipeBotMessage(message, -1)}>‹</button> : null}
-                  {canSwipe ? <button type="button" title="Следующий swipe" onClick={() => void swipeBotMessage(message, 1)}>›</button> : null}
-                  {message.role === 'assistant' ? <button type="button" title="Новый swipe" onClick={() => void requestBotReply(message.id)}>↻</button> : null}
-                  <button type="button" title="Редактировать" onClick={() => startEditMessage(message)}><Icon name="edit" /></button>
-                  <button type="button" title={message.hidden ? 'Показать' : 'Скрыть'} onClick={() => void toggleMessageHidden(message)}><Icon name={message.hidden ? 'eye' : 'eyeOff'} /></button>
-                  <button type="button" title="Удалить" onClick={() => void deleteChatMessage(message)}><Icon name="trash" /></button>
+                <div className="message-avatar-rail">
+                  {message.avatar_url ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(message.avatar_url), title: message.author })}><img src={imageSrc(message.avatar_url)} alt="" loading="lazy" /></button> : <i>{message.author.slice(0, 1) || '?'}</i>}
+                  <small className="message-index">#{messageIndex}</small>
                 </div>
-                <header>
-                  <span className="message-author">
-                    {message.avatar_url ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(message.avatar_url), title: message.author })}><img src={imageSrc(message.avatar_url)} alt="" loading="lazy" /></button> : <i>{message.author.slice(0, 1) || '?'}</i>}
+                <div className="message-actions extraMesButtons" aria-label="Действия сообщения">
+                  {canSwipe ? <button className="mes_button" type="button" title="Предыдущий swipe" onClick={() => void swipeBotMessage(message, -1)}>‹</button> : null}
+                  {canSwipe ? <button className="mes_button" type="button" title="Следующий swipe" onClick={() => void swipeBotMessage(message, 1)}>›</button> : null}
+                  {message.role === 'assistant' ? <button className="mes_button" type="button" title="Новый swipe" onClick={() => void requestBotReply(message.id)}>↻</button> : null}
+                  <button className="mes_button" type="button" title="Редактировать" onClick={() => startEditMessage(message)}><Icon name="edit" /></button>
+                  <button className="mes_button" type="button" title={message.hidden ? 'Показать' : 'Скрыть'} onClick={() => void toggleMessageHidden(message)}><Icon name={message.hidden ? 'eye' : 'eyeOff'} /></button>
+                  <button className="mes_button" type="button" title="Удалить" onClick={() => void deleteChatMessage(message)}><Icon name="trash" /></button>
+                </div>
+                <div className="message-main">
+                  <header>
                     <span className="message-name-block">
                       <strong className="identity-name">{message.is_admin ? <span className="admin-crown">♛</span> : null}<span>{message.author}</span></strong>
+                      <small className="message-time">{formatChatMessageTime(message.created_at)}</small>
                       {message.username ? <small className="hover-username">({message.username})</small> : null}
                     </span>
-                    <small className="message-index">#{messageIndex}</small>
-                  </span>
-                </header>
-                {editingMessageId === message.id ? (
-                  <div className="message-editor">
-                    <textarea value={editingMessageText} onChange={(event) => setEditingMessageText(event.target.value)} />
-                    <div>
-                      <button type="button" title="Сохранить" onClick={() => void editChatMessage(message)}><Icon name="check" /></button>
-                      <button type="button" title="Отмена" onClick={() => { setEditingMessageId(''); setEditingMessageText(''); }}><Icon name="x" /></button>
+                  </header>
+                  {editingMessageId === message.id ? (
+                    <div className="message-editor">
+                      <textarea value={editingMessageText} onChange={(event) => setEditingMessageText(event.target.value)} />
+                      <div>
+                        <button type="button" title="Сохранить" onClick={() => void editChatMessage(message)}><Icon name="check" /></button>
+                        <button type="button" title="Отмена" onClick={() => { setEditingMessageId(''); setEditingMessageText(''); }}><Icon name="x" /></button>
+                      </div>
                     </div>
-                  </div>
-                ) : <MessageContent content={message.content} reasoning={reasoningDisplay} />}
-                {canSwipe ? <small className="swipe-counter">Swipe {(message.active_swipe_index ?? 0) + 1}/{swipeCount}</small> : null}
+                  ) : <MessageContent content={message.content} reasoning={reasoningDisplay} />}
+                  {canSwipe ? <small className="swipe-counter">Swipe {(message.active_swipe_index ?? 0) + 1}/{swipeCount}</small> : null}
+                </div>
               </article>
               );
             }) : <p className="empty-library">Выбери карточку и чат в меню у поля ввода или во вкладке Карточки.</p>}
             {isGenerating ? (
               <article className="message bot-message thinking-message">
-                <header><span className="message-author">{activeCard?.image_url ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(activeCard.image_url), title: activeCard.name })}><img src={imageSrc(activeCard.image_url)} alt="" loading="lazy" /></button> : <i>{activeCard?.name.slice(0, 1) || '?'}</i>}<strong>{activeCard?.name || 'Бот'}</strong></span></header>
-                <p><span className="thinking-dots"><i /> <i /> <i /></span>{generationStatus || 'Бот думает...'}</p>
+                <div className="message-avatar-rail">
+                  {activeCard?.image_url ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(activeCard.image_url), title: activeCard.name })}><img src={imageSrc(activeCard.image_url)} alt="" loading="lazy" /></button> : <i>{activeCard?.name.slice(0, 1) || '?'}</i>}
+                </div>
+                <div className="message-main">
+                  <header>
+                    <span className="message-name-block"><strong className="identity-name"><span>{activeCard?.name || 'Бот'}</span></strong></span>
+                  </header>
+                  <div className="message-content"><p><span className="thinking-dots"><i /> <i /> <i /></span>{generationStatus || 'Бот думает...'}</p></div>
+                </div>
               </article>
             ) : null}
           </div>
 
-          <form className="composer" onSubmit={(event) => { event.preventDefault(); void sendChatMessage(); }}>
+          <form id="send_form" className="composer" onSubmit={(event) => { event.preventDefault(); void sendChatMessage(); }}>
             <button className="composer-menu-button" type="button" aria-label="Дополнительные действия" onClick={() => setComposerMenuOpen(!composerMenuOpen)}>+</button>
             {composerMenuOpen ? (
               <ComposerActionMenu
@@ -1964,6 +2304,12 @@ export default function App() {
                 exportChat={exportChat}
                 deleteChat={deleteChat}
                 renameChat={renameChat}
+                activeCardId={activeCard?.id || ''}
+                deleteLocks={deletionLocks}
+                admin={Boolean(authUser?.is_admin)}
+                pendingDeleteKey={pendingDeleteKey}
+                setPendingDeleteKey={setPendingDeleteKey}
+                toggleDeleteLock={(itemId) => void toggleDeletionLock('chats', itemId)}
                 chatRenameDrafts={chatRenameDrafts}
                 setChatRenameDrafts={setChatRenameDrafts}
                 selectChat={selectChat}
@@ -2011,6 +2357,13 @@ export default function App() {
           <strong>{imagePreview.title}</strong>
         </div>
       ) : null}
+
+      <section
+        id="extensions_settings"
+        className={`extension-settings-host ${menuOpen && activeSection === 'extensions' && extensionSettingsOpen ? 'extension-settings-host-visible' : ''}`}
+        aria-hidden={menuOpen && activeSection === 'extensions' && extensionSettingsOpen ? 'false' : 'true'}
+        data-active-extension={extensionSettingsTarget}
+      />
 
       {menuOpen ? (
         <MenuOverlay
@@ -2060,12 +2413,21 @@ export default function App() {
           activePresets={activePresets}
           accessDenied={accessDenied}
           authUser={authUser}
+          deletionLocks={deletionLocks}
+          pendingDeleteKey={pendingDeleteKey}
+          setPendingDeleteKey={setPendingDeleteKey}
+          toggleDeletionLock={toggleDeletionLock}
           authDraft={authDraft}
           setAuthDraft={setAuthDraft}
           authMessage={authMessage}
           securityPermissions={securityPermissions}
           authRequired={authRequired}
+          accessPasswordRequired={accessPasswordRequired}
+          accessPasswordConfigured={accessPasswordConfigured}
+          securityAccessPasswordDraft={securityAccessPasswordDraft}
           setAuthRequired={setAuthRequired}
+          setAccessPasswordRequired={setAccessPasswordRequired}
+          setSecurityAccessPasswordDraft={setSecurityAccessPasswordDraft}
           setSecurityPermissions={setSecurityPermissions}
           openImagePreview={(src, title) => setImagePreview({ src: imageSrc(src), title })}
           imageSrc={imageSrc}
@@ -2172,12 +2534,21 @@ function MenuOverlay({
   activePresets,
   accessDenied,
   authUser,
+  deletionLocks,
+  pendingDeleteKey,
+  setPendingDeleteKey,
+  toggleDeletionLock,
   authDraft,
   setAuthDraft,
   authMessage,
   securityPermissions,
   authRequired,
+  accessPasswordRequired,
+  accessPasswordConfigured,
+  securityAccessPasswordDraft,
   setAuthRequired,
+  setAccessPasswordRequired,
+  setSecurityAccessPasswordDraft,
   setSecurityPermissions,
   openImagePreview,
   imageSrc,
@@ -2278,12 +2649,21 @@ function MenuOverlay({
   activePresets: Record<string, string>;
   accessDenied: AccessDeniedState;
   authUser: AuthUser | null;
+  deletionLocks: DeletionLocks;
+  pendingDeleteKey: string;
+  setPendingDeleteKey: (key: string) => void;
+  toggleDeletionLock: (category: keyof DeletionLocks, itemId: string) => Promise<void>;
   authDraft: { username: string; password: string; adminCode: string };
   setAuthDraft: (draft: { username: string; password: string; adminCode: string }) => void;
   authMessage: string;
   securityPermissions: SecurityPermissions;
   authRequired: boolean;
+  accessPasswordRequired: boolean;
+  accessPasswordConfigured: boolean;
+  securityAccessPasswordDraft: string;
   setAuthRequired: (required: boolean) => void;
+  setAccessPasswordRequired: (required: boolean) => void;
+  setSecurityAccessPasswordDraft: (password: string) => void;
   setSecurityPermissions: (permissions: SecurityPermissions) => void;
   openImagePreview: (src: string, title: string) => void;
   imageSrc: (src: string) => string;
@@ -2417,12 +2797,21 @@ function MenuOverlay({
               activePresets={activePresets}
               accessDenied={accessDenied}
               authUser={authUser}
+              deletionLocks={deletionLocks}
+              pendingDeleteKey={pendingDeleteKey}
+              setPendingDeleteKey={setPendingDeleteKey}
+              toggleDeletionLock={toggleDeletionLock}
               authDraft={authDraft}
               setAuthDraft={setAuthDraft}
               authMessage={authMessage}
               securityPermissions={securityPermissions}
               authRequired={authRequired}
+              accessPasswordRequired={accessPasswordRequired}
+              accessPasswordConfigured={accessPasswordConfigured}
+              securityAccessPasswordDraft={securityAccessPasswordDraft}
               setAuthRequired={setAuthRequired}
+              setAccessPasswordRequired={setAccessPasswordRequired}
+              setSecurityAccessPasswordDraft={setSecurityAccessPasswordDraft}
               setSecurityPermissions={setSecurityPermissions}
               openImagePreview={openImagePreview}
               imageSrc={imageSrc}
@@ -2506,6 +2895,164 @@ function AuthGate({ authDraft, setAuthDraft, authMessage, login, register }: { a
   );
 }
 
+function AccessPasswordGate({ password, setPassword, message, unlock }: { password: string; setPassword: (password: string) => void; message: string; unlock: () => Promise<void> }) {
+  return (
+    <main className="auth-gate-shell">
+      <section className="auth-gate-card">
+        <div>
+          <span className="eyebrow">DoubleTrouble</span>
+          <h1>Доступ закрыт</h1>
+          <p>Администратор включил дополнительный пароль доступа. Его нужно ввести до входа в аккаунт.</p>
+        </div>
+        <form className="form-stack" onSubmit={(event) => { event.preventDefault(); void unlock(); }}>
+          <EditableField label="Пароль доступа" type="password" value={password} onChange={setPassword} />
+          <div className="preset-actions">
+            <button type="submit">Открыть доступ</button>
+          </div>
+          {message ? <p className="library-message">{message}</p> : null}
+        </form>
+      </section>
+    </main>
+  );
+}
+
+function ExtensionsManager() {
+  const [extensions, setExtensions] = useState<ExtensionSummary[]>([]);
+  const [source, setSource] = useState('');
+  const [name, setName] = useState('');
+  const [overwrite, setOverwrite] = useState(false);
+  const [message, setMessage] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const headers = (json = false) => {
+    const token = window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '';
+    return {
+      ...(json ? { 'Content-Type': 'application/json' } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+  };
+
+  const reloadClient = () => window.setTimeout(() => window.location.reload(), 700);
+  const openExtensionSettingsPanel = (extension: ExtensionSummary) => window.dispatchEvent(new CustomEvent('doubletrouble:extension-settings-open', { detail: { name: extension.external_name } }));
+
+  const loadExtensions = async () => {
+    setLoading(true);
+    try {
+      const response = await fetch('/api/extensions', { headers: headers() });
+      if (!response.ok) {
+        setMessage(response.status === 401 || response.status === 403 ? 'Нет прав на управление расширениями' : 'Не удалось загрузить расширения');
+        return;
+      }
+      const data = await response.json() as { extensions: ExtensionSummary[] };
+      setExtensions(data.extensions);
+      setMessage('');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadExtensions();
+  }, []);
+
+  const installExtension = async () => {
+    if (!source.trim()) {
+      setMessage('Укажи Git URL или локальный путь к папке расширения');
+      return;
+    }
+    setLoading(true);
+    try {
+      const response = await fetch('/api/extensions/install', {
+        method: 'POST',
+        headers: headers(true),
+        body: JSON.stringify({ source, name, enabled: true, overwrite }),
+      });
+      const data = await response.json().catch(() => null) as { detail?: string } | null;
+      if (!response.ok) {
+        setMessage(data?.detail || 'Не удалось установить расширение');
+        return;
+      }
+      setMessage('Расширение установлено. Перезагрузка страницы...');
+      reloadClient();
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const setEnabled = async (extension: ExtensionSummary, enabled: boolean) => {
+    setLoading(true);
+    try {
+      const response = await fetch(`/api/extensions/${encodeURIComponent(extension.name)}/enabled`, {
+        method: 'PUT',
+        headers: headers(true),
+        body: JSON.stringify({ enabled }),
+      });
+      if (!response.ok) {
+        setMessage('Не удалось изменить состояние расширения');
+        return;
+      }
+      setMessage(`${enabled ? 'Включено' : 'Выключено'}. Перезагрузка страницы...`);
+      reloadClient();
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deleteExtension = async (extension: ExtensionSummary) => {
+    setLoading(true);
+    try {
+      const response = await fetch(`/api/extensions/${encodeURIComponent(extension.name)}`, { method: 'DELETE', headers: headers() });
+      if (!response.ok) {
+        setMessage('Не удалось удалить расширение');
+        return;
+      }
+      setMessage('Расширение удалено. Перезагрузка страницы...');
+      reloadClient();
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <section className="extensions-manager">
+      <div className="extension-install-card">
+        <EditableField label="Git URL или локальный путь" value={source} onChange={setSource} />
+        <TwoColumns
+          left={<EditableField label="Имя папки (опционально)" value={name} onChange={setName} />}
+          right={<ToggleRow label="Перезаписать, если уже установлено" checked={overwrite} onChange={setOverwrite} />}
+        />
+        <div className="preset-actions">
+          <button type="button" disabled={loading} onClick={() => void installExtension()}>Установить</button>
+          <button className="ghost-button" type="button" disabled={loading} onClick={() => void loadExtensions()}>Обновить список</button>
+        </div>
+      </div>
+
+      {message ? <p className="library-message">{message}</p> : null}
+
+      <div className="extension-list">
+        {extensions.length ? extensions.map((extension) => {
+          const manifest = extension.manifest || {};
+          return (
+            <article className={extension.enabled ? 'extension-row enabled' : 'extension-row'} key={extension.name}>
+              <div className="extension-row-main">
+                <strong>{manifest.display_name || extension.name}</strong>
+                <small>{extension.external_name} · {manifest.version || 'no version'} · {manifest.author || 'unknown author'}</small>
+                <small>{extension.source || 'local install'}</small>
+              </div>
+              <div className="extension-row-actions">
+                <span className={extension.enabled ? 'extension-status enabled' : 'extension-status'}>{extension.enabled ? 'Включено' : 'Выключено'}</span>
+                <button className="ghost-button" type="button" disabled={loading || !extension.enabled} onClick={() => openExtensionSettingsPanel(extension)}>Настройки</button>
+                <button type="button" disabled={loading} onClick={() => void setEnabled(extension, !extension.enabled)}>{extension.enabled ? 'Выключить' : 'Включить'}</button>
+                <button className="ghost-button danger-button" type="button" disabled={loading} onClick={() => void deleteExtension(extension)}>Удалить</button>
+              </div>
+            </article>
+          );
+        }) : <EmptyLibrary text="Расширений пока нет. Установи папку с manifest.json или Git URL." />}
+      </div>
+    </section>
+  );
+}
+
 function SettingsSection({
   section,
   visualSettings,
@@ -2552,12 +3099,21 @@ function SettingsSection({
   activePresets,
   accessDenied,
   authUser,
+  deletionLocks,
+  pendingDeleteKey,
+  setPendingDeleteKey,
+  toggleDeletionLock,
   authDraft,
   setAuthDraft,
   authMessage,
   securityPermissions,
   authRequired,
+  accessPasswordRequired,
+  accessPasswordConfigured,
+  securityAccessPasswordDraft,
   setAuthRequired,
+  setAccessPasswordRequired,
+  setSecurityAccessPasswordDraft,
   setSecurityPermissions,
   openImagePreview,
   imageSrc,
@@ -2656,12 +3212,21 @@ function SettingsSection({
   activePresets: Record<string, string>;
   accessDenied: AccessDeniedState;
   authUser: AuthUser | null;
+  deletionLocks: DeletionLocks;
+  pendingDeleteKey: string;
+  setPendingDeleteKey: (key: string) => void;
+  toggleDeletionLock: (category: keyof DeletionLocks, itemId: string) => Promise<void>;
   authDraft: { username: string; password: string; adminCode: string };
   setAuthDraft: (draft: { username: string; password: string; adminCode: string }) => void;
   authMessage: string;
   securityPermissions: SecurityPermissions;
   authRequired: boolean;
+  accessPasswordRequired: boolean;
+  accessPasswordConfigured: boolean;
+  securityAccessPasswordDraft: string;
   setAuthRequired: (required: boolean) => void;
+  setAccessPasswordRequired: (required: boolean) => void;
+  setSecurityAccessPasswordDraft: (password: string) => void;
   setSecurityPermissions: (permissions: SecurityPermissions) => void;
   openImagePreview: (src: string, title: string) => void;
   imageSrc: (src: string) => string;
@@ -2905,6 +3470,24 @@ function SettingsSection({
     }
   };
 
+  if (section === 'extensions') {
+    return (
+      <div className="form-stack preset-editor">
+        <div className="preset-title-row">
+          <div>
+            <span className="eyebrow">SillyTavern compatible</span>
+            <h3>Менеджер расширений</h3>
+          </div>
+        </div>
+        <ExtensionsManager />
+        <div className="extension-settings-note">
+          <strong>Настройки включенных расширений</strong>
+          <small>Они открываются отдельной кнопкой “Настройки” в строке расширения. После включения/выключения страница перезагружается, чтобы module scripts загрузились как в Tavern.</small>
+        </div>
+      </div>
+    );
+  }
+
   if (section === 'presets') {
     if (accessDenied.presets) {
       return (
@@ -2930,13 +3513,20 @@ function SettingsSection({
         </div>
         <TwoColumns
           left={(
-            <label className="field-preview">
-              <span>Пресет</span>
-              <select value={selectedPresetName} onChange={(event) => void selectPreset(event.target.value)}>
-                <option value="">Выбрать пресет</option>
-                {presets.map((preset) => <option value={preset.name} key={preset.filename}>{preset.name}{activePresets[preset.type] === preset.name ? ' · active' : ''}</option>)}
-              </select>
-            </label>
+            <div className="preset-select-save-row">
+              <label className="field-preview">
+                <span>Пресет</span>
+                <select value={selectedPresetName} onChange={(event) => void selectPreset(event.target.value)}>
+                  <option value="">Выбрать пресет</option>
+                  {presets.map((preset) => <option value={preset.name} key={preset.filename}>{preset.name}{activePresets[preset.type] === preset.name ? ' · active' : ''}</option>)}
+                </select>
+              </label>
+              <button className="preset-save-icon-button" type="button" title="Сохранить текущий пресет" onClick={() => void savePreset()} aria-label="Сохранить текущий пресет">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 3h13.2L20 5.8V21H4V3Zm2 2v14h12V6.7L16.3 5H16v5H8V5H6Zm4 0v3h4V5h-4Zm-1 9h6v2H9v-2Z" />
+                </svg>
+              </button>
+            </div>
           )}
           right={<EditableField label="Имя для сохранения" value={presetNameDraft} onChange={setPresetNameDraft} />}
         />
@@ -3049,8 +3639,6 @@ function SettingsSection({
         </details>
         {presetMessage ? <p className="library-message">{presetMessage}</p> : null}
         <div className="preset-actions">
-          <button type="button" onClick={() => void savePreset()}>Сохранить пресет</button>
-          <button type="button" onClick={() => void applyPreset()}>Применить</button>
           <button type="button" onClick={() => void exportPreset()}>Экспорт ST JSON</button>
           <button type="button" onClick={() => void deletePreset()}>Удалить</button>
         </div>
@@ -3342,13 +3930,13 @@ function SettingsSection({
             </div>
             <div className="prompt-list">
               {lorebookBindings.length ? lorebookBindings.map((binding, index) => (
-                <article className="prompt-row enabled" key={`${binding.book}:${binding.target_type}:${binding.target_id}:${index}`}>
+                <article className="prompt-row lore-binding-row enabled" key={`${binding.book}:${binding.target_type}:${binding.target_id}:${index}`}>
                   <span className="prompt-kind">◆</span>
                   <div className="prompt-main">
                     <strong>{binding.book}</strong>
                     <small>{binding.target_type}{binding.target_id ? ` · ${binding.target_id}` : ''}</small>
                   </div>
-                  <button className="prompt-icon danger" type="button" onClick={() => void removeLorebookBinding(index)}><Icon name="trash" /></button>
+                  <button className="prompt-icon danger" type="button" title="Удалить привязку" onClick={() => void removeLorebookBinding(index)}><Icon name="trash" /></button>
                 </article>
               )) : <p className="empty-library">Привязок пока нет.</p>}
             </div>
@@ -3416,7 +4004,7 @@ function SettingsSection({
 
           <div className="compact-card-list">
             {cards.length ? cards.map((card) => (
-              <CharacterCardView active={activeCard?.id === card.id} editing={editingCardId === card.id} card={card} key={card.filename} onSelect={selectBotCard} onEdit={startEditCard} onDelete={deleteCard} openImagePreview={openImagePreview} imageSrc={imageSrc} />
+              <CharacterCardView active={activeCard?.id === card.id} editing={editingCardId === card.id} card={card} key={card.filename} onSelect={selectBotCard} onEdit={startEditCard} onDelete={deleteCard} openImagePreview={openImagePreview} imageSrc={imageSrc} deleteLocked={deletionLocks.cards.includes(card.id)} admin={Boolean(authUser?.is_admin)} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleDeleteLock={() => void toggleDeletionLock('cards', card.id)} />
             )) : <EmptyLibrary text="Карточек пока нет. Создай PNG карточку или импортируй character card из SillyTavern." />}
           </div>
           </>}
@@ -3484,7 +4072,7 @@ function SettingsSection({
                 <button type="button" onClick={() => void copyChat(chat.id)}>Копия</button>
                 <button type="button" onClick={() => void exportChat(chat.id)}>ST .jsonl</button>
                 <button type="button" onClick={() => void renameChat(chat)}>Имя</button>
-                <button type="button" onClick={() => void deleteChat(chat.id)}>Удалить</button>
+                <DeleteConfirmButton itemKey={`chat:${chat.id}`} locked={Boolean(activeCard && deletionLocks.chats.includes(`${activeCard.id}:${chat.id}`))} admin={Boolean(authUser?.is_admin)} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={() => activeCard ? void toggleDeletionLock('chats', `${activeCard.id}:${chat.id}`) : undefined} onConfirm={() => void deleteChat(chat.id)} />
               </div>
             </article>
           )) : <EmptyLibrary text="Выбери карточку, чтобы увидеть или создать ее чаты." />}
@@ -3531,7 +4119,7 @@ function SettingsSection({
                 <div className="card-row-actions">
                   <button type="button" onClick={() => selectLocalPersona(persona.id)}>{selectedPersonaId === persona.id ? 'Выбрана' : 'Выбрать'}</button>
                   <button className="ghost-button" type="button" onClick={() => setEditingPersonaId(persona.id)}>Править</button>
-                  <button className="ghost-button danger-button" type="button" onClick={() => void deletePersona(persona)}>Удалить</button>
+                  <DeleteConfirmButton itemKey={`persona:${persona.id}`} locked={deletionLocks.personas.includes(persona.id)} admin={Boolean(authUser?.is_admin)} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={() => void toggleDeletionLock('personas', persona.id)} onConfirm={() => void deletePersona(persona)} />
                 </div>
               </article>
             )) : <EmptyLibrary text="Персон пока нет. Создай профиль игрока для prompt-а." />}
@@ -3554,7 +4142,7 @@ function SettingsSection({
               <div className="persona-actions">
                 <button type="button" onClick={() => void updatePersona(editingPersona)}>Сохранить</button>
                 <button className="ghost-button" type="button" onClick={() => selectLocalPersona(editingPersona.id)}>{selectedPersonaId === editingPersona.id ? 'Выбрана' : 'Выбрать'}</button>
-                <button className="ghost-button danger-button" type="button" onClick={() => void deletePersona(editingPersona)}>Удалить</button>
+                <DeleteConfirmButton itemKey={`persona:${editingPersona.id}:edit`} locked={deletionLocks.personas.includes(editingPersona.id)} admin={Boolean(authUser?.is_admin)} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={() => void toggleDeletionLock('personas', editingPersona.id)} onConfirm={() => void deletePersona(editingPersona)} />
                 <label className="avatar-upload">
                   <span>Аватарка</span>
                   <input type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => void uploadPersonaAvatar(editingPersona.id, event.target.files?.[0] ?? null)} />
@@ -3612,6 +4200,11 @@ function SettingsSection({
         </div>
         <ToggleRow label="Требовать вход для просмотра контента" checked={authRequired} onChange={setAuthRequired} />
         <p className="helper-text">Если включено, карточки, персоны, чаты, аватарки и пресеты не отдаются гостям. Для тонкой настройки используй права просмотра ниже.</p>
+        <ToggleRow label="Требовать отдельный пароль доступа к DoubleTrouble" checked={accessPasswordRequired} onChange={setAccessPasswordRequired} />
+        <TwoColumns
+          left={<EditableField label={accessPasswordConfigured ? 'Новый пароль доступа (оставь пустым, чтобы не менять)' : 'Пароль доступа'} type="password" value={securityAccessPasswordDraft} onChange={setSecurityAccessPasswordDraft} />}
+          right={<p className="helper-text">Этот пароль вводится до регистрации/логина и действует поверх аккаунтов. Смена пароля сбрасывает старые access-сессии.</p>}
+        />
         <div className="permission-grid">
           {Object.entries(permissionLabels).map(([key, label]) => {
             const rule = securityPermissions[key] || defaultSecurityPermissions[key];
@@ -3641,6 +4234,12 @@ function ChatPicker({
   exportChat,
   deleteChat,
   renameChat,
+  activeCardId,
+  deleteLocks,
+  admin,
+  pendingDeleteKey,
+  setPendingDeleteKey,
+  toggleDeleteLock,
   chatRenameDrafts,
   setChatRenameDrafts,
   selectChat,
@@ -3653,6 +4252,12 @@ function ChatPicker({
   exportChat: (chatId: string) => Promise<void>;
   deleteChat: (chatId: string) => Promise<void>;
   renameChat: (chat: BotChatSummary) => Promise<void>;
+  activeCardId: string;
+  deleteLocks: DeletionLocks;
+  admin: boolean;
+  pendingDeleteKey: string;
+  setPendingDeleteKey: (key: string) => void;
+  toggleDeleteLock: (itemId: string) => void;
   chatRenameDrafts: Record<string, string>;
   setChatRenameDrafts: (drafts: Record<string, string>) => void;
   selectChat: (chatId: string) => Promise<void>;
@@ -3678,7 +4283,7 @@ function ChatPicker({
             <button type="button" onClick={() => void copyChat(chat.id)}>Копия</button>
             <button type="button" onClick={() => void exportChat(chat.id)}>ST .jsonl</button>
             <button type="button" onClick={() => void renameChat(chat)}>Имя</button>
-            <button type="button" onClick={() => void deleteChat(chat.id)}>Удалить</button>
+            <DeleteConfirmButton itemKey={`composer-chat:${chat.id}`} locked={deleteLocks.chats.includes(`${activeCardId}:${chat.id}`)} admin={admin} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={() => toggleDeleteLock(`${activeCardId}:${chat.id}`)} onConfirm={() => void deleteChat(chat.id)} />
           </div>
         </article>
       )) : <p className="empty-library">У выбранной карточки пока нет чатов.</p>}
@@ -3739,7 +4344,7 @@ function ReasoningPresetPanel({ settings, assistantPrefill, update, updateAssist
 function MessageContent({ content, reasoning }: { content: string; reasoning: ReasoningDisplaySettings }) {
   const parsed = reasoning.autoParse ? splitReasoning(content, reasoning) : { reasoning: '', visible: content };
   return (
-    <div className="message-content">
+    <div className="message-content mes_text">
       {parsed.reasoning && !reasoning.showHidden ? (
         <details className="reasoning-block" open={reasoning.autoExpand}>
           <summary>Какое-то время заняли размышления</summary>
@@ -3750,6 +4355,14 @@ function MessageContent({ content, reasoning }: { content: string; reasoning: Re
       {formatMessageText(parsed.visible)}
     </div>
   );
+}
+
+function formatChatMessageTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+  return date.toLocaleString('ru-RU', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
 function reasoningSettingsFromPreset(preset: RawPreset | null): ReasoningDisplaySettings {
@@ -3797,6 +4410,157 @@ function splitReasoning(content: string, settings: ReasoningDisplaySettings): { 
 }
 
 function formatMessageText(content: string): ReactNode {
+  if (/◈NORICORE◈/i.test(content)) {
+    return formatNoricoreMessageText(content);
+  }
+  if (/<(?:div|img|video|span|label|input|details|summary)\b|data-iig-instruction=/i.test(content)) {
+    return <div className="extension-html-block" dangerouslySetInnerHTML={{ __html: formatExtensionMessageHtml(content) }} />;
+  }
+  const mediaPattern = /<img\b[^>]*>|<video\b[\s\S]*?<\/video>|<video\b[^>]*>/gi;
+  const nodes: ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = mediaPattern.exec(content)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(<p key={`text-${lastIndex}`}>{formatInlineMessageText(content.slice(lastIndex, match.index))}</p>);
+    }
+    nodes.push(<span className="extension-media-html" dangerouslySetInnerHTML={{ __html: formatExtensionMessageHtml(match[0]) }} key={`media-${match.index}`} />);
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < content.length || nodes.length === 0) {
+    nodes.push(<p key={`text-${lastIndex}`}>{formatInlineMessageText(content.slice(lastIndex))}</p>);
+  }
+  return <>{nodes}</>;
+}
+
+function formatNoricoreMessageText(content: string): ReactNode {
+  const nodes: ReactNode[] = [];
+  const pattern = /◈NORICORE◈([\s\S]*?)◈\/NORICORE◈/gi;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(content)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(<p key={`noricore-text-${lastIndex}`}>{formatInlineMessageText(content.slice(lastIndex, match.index).trim())}</p>);
+    }
+    const data = parseNoricoreBlock(match[1]);
+    nodes.push(data.scene && data.characters.length ? <NoricoreBlock data={data} key={`noricore-${match.index}`} /> : <p className="message-tag" key={`noricore-raw-${match.index}`}>{match[0]}</p>);
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < content.length) {
+    nodes.push(<p key={`noricore-text-${lastIndex}`}>{formatInlineMessageText(content.slice(lastIndex).trim())}</p>);
+  }
+  return <>{nodes.filter(Boolean)}</>;
+}
+
+function parseNoricoreBlock(raw: string): NoricoreData {
+  const data: NoricoreData = { scene: null, characters: [] };
+  const sceneMatch = raw.match(/⟪СЦЕНА⟫([^⟫]+)⟫/i);
+  if (sceneMatch) {
+    const parts = sceneMatch[1].split('|').map((item) => item.trim());
+    data.scene = { location: parts[0] || '—', weather: parts[1] || '—', date: parts[2] || '—', time: parts[3] || '—' };
+  }
+  const characterPattern = /⟪ПЕРСОНАЖ⟫([^⟫]+)⟫/gi;
+  let match: RegExpExecArray | null;
+  while ((match = characterPattern.exec(raw)) !== null) {
+    const parts = match[1].split('|').map((item) => item.trim());
+    if (!parts[0]) continue;
+    data.characters.push({
+      name: parts[0],
+      status: parts[1] || 'Присутствует',
+      outfit: parts[2] || '—',
+      health: parts[3] || 'Здоров',
+      mood: parts[4] || '—',
+      feelings: parts[5] || '—',
+      thoughts: stripOuterQuotes(parts[6] || ''),
+    });
+  }
+  return data;
+}
+
+function stripOuterQuotes(value: string) {
+  const trimmed = value.trim();
+  return trimmed.length >= 2 && ((trimmed.startsWith("'") && trimmed.endsWith("'")) || (trimmed.startsWith('"') && trimmed.endsWith('"'))) ? trimmed.slice(1, -1) : trimmed;
+}
+
+function NoricoreBlock({ data }: { data: NoricoreData }) {
+  const scene = data.scene;
+  if (!scene) return null;
+  return (
+    <section className="noricore-block">
+      <header className="noricore-header">
+        <strong><span>📍</span>{scene.location}</strong>
+        <div className="noricore-meta">
+          <span>🌤️ {scene.weather}</span>
+          <span>📅 {scene.date}</span>
+          <span>🕘 {scene.time}</span>
+        </div>
+      </header>
+      <details className="noricore-section" open>
+        <summary><span>👥 ПЕРСОНАЖИ ({data.characters.length})</span></summary>
+        <div className="noricore-character-list">
+          {data.characters.map((character, index) => <NoricoreCharacterCard character={character} key={`${character.name}-${index}`} />)}
+        </div>
+      </details>
+    </section>
+  );
+}
+
+function NoricoreCharacterCard({ character }: { character: NoricoreCharacter }) {
+  const status = character.status.toLowerCase();
+  const away = status.includes('отсутств') || status.includes('away');
+  const nearby = status.includes('рядом') || status.includes('nearby');
+  return (
+    <article className={`noricore-character${away ? ' away' : nearby ? ' nearby' : ''}`}>
+      <header>
+        <strong><span>{noricoreStatusIcon(character.status)}</span>{character.name}</strong>
+        <small>{character.status}</small>
+      </header>
+      <div className="noricore-grid">
+        <NoricoreField label="Одежда" icon="👗" value={character.outfit} />
+        <NoricoreField label="Здоровье" icon={noricoreHealthIcon(character.health)} value={character.health} tone={noricoreHealthTone(character.health)} />
+        <NoricoreField label="Настроение" icon="🎭" value={character.mood} />
+        <NoricoreField label="Чувства" icon="💜" value={character.feelings} wide italic />
+      </div>
+      {character.thoughts && character.thoughts !== '—' ? (
+        <blockquote className="noricore-thought"><span>💭 Мысли</span>{character.thoughts}</blockquote>
+      ) : null}
+    </article>
+  );
+}
+
+function NoricoreField({ label, icon, value, tone, wide, italic }: { label: string; icon: string; value: string; tone?: string; wide?: boolean; italic?: boolean }) {
+  return (
+    <div className={wide ? 'noricore-field wide' : 'noricore-field'}>
+      <span>{icon} {label}</span>
+      <p className={italic ? 'italic' : ''} style={tone ? { color: tone } : undefined}>{value}</p>
+    </div>
+  );
+}
+
+function noricoreStatusIcon(status: string) {
+  const value = status.toLowerCase();
+  if (value.includes('отсутств') || value.includes('away')) return '⚫';
+  if (value.includes('рядом') || value.includes('nearby')) return '🟡';
+  return '🟢';
+}
+
+function noricoreHealthIcon(health: string) {
+  const value = health.toLowerCase();
+  if (value.includes('крит') || value.includes('critical')) return '🔴';
+  if (value.includes('серь') || value.includes('serious')) return '🟠';
+  if (value.includes('умерен') || value.includes('moderate')) return '🟡';
+  return '💚';
+}
+
+function noricoreHealthTone(health: string) {
+  const value = health.toLowerCase();
+  if (value.includes('крит') || value.includes('critical')) return '#ff8c8c';
+  if (value.includes('серь') || value.includes('serious')) return '#f0b36e';
+  if (value.includes('умерен') || value.includes('moderate')) return '#e3d26b';
+  return '#8fe0a5';
+}
+
+function formatInlineMessageText(content: string): ReactNode[] {
   const nodes: ReactNode[] = [];
   const pattern = /("[^"\n]+"|\*'[^']+'\*|'[^'\n]+'|<\/?[a-zA-Z_][^>\n]{0,80}>|◈[^\n]+◈|⟪[^\n]+⟫)/g;
   let lastIndex = 0;
@@ -3813,7 +4577,7 @@ function formatMessageText(content: string): ReactNode {
   if (lastIndex < content.length) {
     nodes.push(<span key={`t-${lastIndex}`}>{content.slice(lastIndex)}</span>);
   }
-  return <p>{nodes}</p>;
+  return nodes;
 }
 
 function extractModelNames(rawModels: unknown): string[] {
@@ -4306,6 +5070,40 @@ function TwoColumns({ left, right }: { left: ReactNode; right: ReactNode }) {
   return <div className="two-columns">{left}{right}</div>;
 }
 
+function DeleteConfirmButton({
+  itemKey,
+  label = 'Удалить',
+  locked,
+  admin,
+  pendingDeleteKey,
+  setPendingDeleteKey,
+  toggleLock,
+  onConfirm,
+}: {
+  itemKey: string;
+  label?: string;
+  locked: boolean;
+  admin: boolean;
+  pendingDeleteKey: string;
+  setPendingDeleteKey: (key: string) => void;
+  toggleLock?: () => void;
+  onConfirm: () => void;
+}) {
+  const pending = pendingDeleteKey === itemKey;
+  return (
+    <span className="delete-confirm-group">
+      {admin && toggleLock ? <button className={locked ? 'ghost-button lock-button locked' : 'ghost-button lock-button'} type="button" title={locked ? 'Разблокировать удаление' : 'Заблокировать удаление'} onClick={toggleLock}>{locked ? '🔒' : '🔓'}</button> : null}
+      {pending ? (
+        <>
+          <span className="delete-confirm-label">Точно?</span>
+          <button className="danger-button" type="button" onClick={() => { setPendingDeleteKey(''); onConfirm(); }}>Да</button>
+          <button className="ghost-button" type="button" onClick={() => setPendingDeleteKey('')}>Нет</button>
+        </>
+      ) : <button className="ghost-button danger-button" type="button" disabled={locked} title={locked ? 'Удаление заблокировано админом' : label} onClick={() => setPendingDeleteKey(itemKey)}>{label}</button>}
+    </span>
+  );
+}
+
 function Option({ title, text, active = false }: { title: string; text: string; active?: boolean }) {
   return (
     <article className={active ? 'option-card active' : 'option-card'}>
@@ -4315,7 +5113,7 @@ function Option({ title, text, active = false }: { title: string; text: string; 
   );
 }
 
-function CharacterCardView({ active = false, editing = false, card, onSelect, onEdit, onDelete, openImagePreview, imageSrc = (src) => src }: { active?: boolean; editing?: boolean; card: CharacterCard; onSelect?: (card: CharacterCard) => Promise<void>; onEdit?: (card: CharacterCard) => void; onDelete?: (card: CharacterCard) => Promise<void>; openImagePreview?: (src: string, title: string) => void; imageSrc?: (src: string) => string }) {
+function CharacterCardView({ active = false, editing = false, card, onSelect, onEdit, onDelete, openImagePreview, imageSrc = (src) => src, deleteLocked = false, admin = false, pendingDeleteKey = '', setPendingDeleteKey = () => undefined, toggleDeleteLock }: { active?: boolean; editing?: boolean; card: CharacterCard; onSelect?: (card: CharacterCard) => Promise<void>; onEdit?: (card: CharacterCard) => void; onDelete?: (card: CharacterCard) => Promise<void>; openImagePreview?: (src: string, title: string) => void; imageSrc?: (src: string) => string; deleteLocked?: boolean; admin?: boolean; pendingDeleteKey?: string; setPendingDeleteKey?: (key: string) => void; toggleDeleteLock?: () => void }) {
   return (
     <article className={`${active ? 'character-card-view active' : 'character-card-view'}${editing ? ' editing' : ''}`}>
       <button className="avatar-preview-button card-image-button" type="button" onClick={() => openImagePreview?.(card.image_url, card.name)}><img src={imageSrc(card.image_url)} alt="" loading="lazy" /></button>
@@ -4327,7 +5125,7 @@ function CharacterCardView({ active = false, editing = false, card, onSelect, on
         <div className="card-row-actions">
           {onSelect ? <button type="button" onClick={() => void onSelect(card)}>{active ? 'Открыта' : 'Открыть'}</button> : null}
           {onEdit ? <button className="ghost-button" type="button" onClick={() => onEdit(card)}>{editing ? 'Правится' : 'Править'}</button> : null}
-          {onDelete ? <button className="ghost-button danger-button" type="button" onClick={() => void onDelete(card)}>Удалить</button> : null}
+          {onDelete ? <DeleteConfirmButton itemKey={`card:${card.id}`} locked={deleteLocked} admin={admin} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={toggleDeleteLock} onConfirm={() => void onDelete(card)} /> : null}
         </div>
       </div>
     </article>

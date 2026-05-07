@@ -21,6 +21,7 @@ class Participant(BaseModel):
     name: str
     role: ParticipantRole = ParticipantRole.PLAYER
     connected: bool = True
+    connected_at: datetime = Field(default_factory=utc_now)
     persona_id: str = ""
     persona_name: str = ""
     avatar_url: str = ""
