@@ -1138,7 +1138,7 @@ textarea {
 
   .app-shell[data-sticky-composer="false"] .chat-stage {
     position: static;
-    grid-template-rows: auto auto;
+    grid-template-rows: 1fr auto;
     height: auto;
     min-height: calc(100vh - 6.8rem);
   }
@@ -4454,7 +4454,7 @@ textarea {
 
   .app-shell[data-sticky-composer="false"] .chat-stage {
     position: static;
-    grid-template-rows: auto auto;
+    grid-template-rows: 1fr auto;
     height: auto;
     min-height: calc(100dvh - 4.95rem);
   }
