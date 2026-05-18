@@ -65,6 +65,10 @@ class SendMessageRequest(BaseModel):
 class ClientEvent(BaseModel):
     type: str
     participant_id: str | None = None
+    source_participant_id: str | None = None
+    card_id: str | None = None
+    chat_id: str | None = None
+    message_id: str | None = None
     name: str | None = None
     content: str | None = None
     persona_id: str | None = None

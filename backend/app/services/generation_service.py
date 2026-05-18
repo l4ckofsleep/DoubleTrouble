@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import yaml
@@ -47,13 +48,13 @@ class GenerationService:
         reply = await self._provider().generate(request)
         return self.session_service.add_bot_message(session_id, self.config.bot_name, reply)
 
-    async def generate_chat_reply(self, character_name: str, history: list[BotChatMessage], openai_preset: dict[str, Any] | None = None, character_data: dict[str, Any] | None = None, persona_name: str | None = None, persona_description: str | None = None, world_info: dict[str, Any] | None = None) -> str:
+    async def generate_chat_reply(self, character_name: str, history: list[BotChatMessage], openai_preset: dict[str, Any] | None = None, character_data: dict[str, Any] | None = None, persona_name: str | None = None, persona_description: str | None = None, world_info: dict[str, Any] | None = None, multi_user_mode: bool = False) -> str:
         if not self.is_enabled():
             raise RuntimeError("Generation provider is disabled. Configure it in the frontend settings first.")
 
         request = GenerationRequest(
             model=self._preset_model(openai_preset) or self.config.model,
-            messages=self._with_assistant_prefill(self._build_bot_chat_messages(character_name, history, openai_preset, character_data, persona_name, persona_description, world_info), openai_preset),
+            messages=self._with_assistant_prefill(self._build_bot_chat_messages(character_name, history, openai_preset, character_data, persona_name, persona_description, world_info, multi_user_mode), openai_preset),
             temperature=self._number_from_preset(openai_preset, "temperature", self.config.temperature),
             max_tokens=self._int_from_preset(openai_preset, "openai_max_tokens", self._int_from_preset(openai_preset, "max_tokens", self.config.max_tokens)),
             parameters={**self.config.parameters, **self._parameters_from_openai_preset(openai_preset)},
@@ -62,6 +63,33 @@ class GenerationService:
         prefill = self._assistant_prefill(openai_preset)
         if prefill and not reply.startswith(prefill):
             return f"{prefill}{reply}"
+        return reply
+
+    def should_stream_chat_reply(self, openai_preset: dict[str, Any] | None = None) -> bool:
+        return self._bool_from_preset(openai_preset, "stream_openai", False)
+
+    async def generate_chat_reply_stream(self, character_name: str, history: list[BotChatMessage], openai_preset: dict[str, Any] | None, character_data: dict[str, Any] | None, persona_name: str | None, persona_description: str | None, world_info: dict[str, Any] | None, multi_user_mode: bool, on_update: Callable[[str], Awaitable[None]]) -> str:
+        if not self.is_enabled():
+            raise RuntimeError("Generation provider is disabled. Configure it in the frontend settings first.")
+
+        request = GenerationRequest(
+            model=self._preset_model(openai_preset) or self.config.model,
+            messages=self._with_assistant_prefill(self._build_bot_chat_messages(character_name, history, openai_preset, character_data, persona_name, persona_description, world_info, multi_user_mode), openai_preset),
+            temperature=self._number_from_preset(openai_preset, "temperature", self.config.temperature),
+            max_tokens=self._int_from_preset(openai_preset, "openai_max_tokens", self._int_from_preset(openai_preset, "max_tokens", self.config.max_tokens)),
+            parameters={**self.config.parameters, **self._parameters_from_openai_preset(openai_preset)},
+        )
+        chunks: list[str] = []
+        async for token in self._provider().generate_stream(request):
+            chunks.append(token)
+            await on_update("".join(chunks))
+        reply = "".join(chunks).strip()
+        if not reply:
+            raise RuntimeError("LLM provider returned an empty response")
+        prefill = self._assistant_prefill(openai_preset)
+        if prefill and not reply.startswith(prefill):
+            reply = f"{prefill}{reply}"
+            await on_update(reply)
         return reply
 
     def _provider(self) -> OpenAICompatibleProvider:
@@ -94,6 +122,16 @@ class GenerationService:
             return int(preset[key])
         except (TypeError, ValueError):
             return fallback
+
+    def _bool_from_preset(self, preset: dict[str, Any] | None, key: str, fallback: bool) -> bool:
+        if not isinstance(preset, dict) or preset.get(key) in (None, ""):
+            return fallback
+        value = preset[key]
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
 
     def _parameters_from_openai_preset(self, preset: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(preset, dict):
@@ -161,10 +199,10 @@ class GenerationService:
             messages.append(ChatMessage(role="user", content="Begin the scene."))
         return messages
 
-    def _build_bot_chat_messages(self, character_name: str, history: list[BotChatMessage], openai_preset: dict[str, Any] | None = None, character_data: dict[str, Any] | None = None, persona_name: str | None = None, persona_description: str | None = None, world_info: dict[str, Any] | None = None) -> list[ChatMessage]:
+    def _build_bot_chat_messages(self, character_name: str, history: list[BotChatMessage], openai_preset: dict[str, Any] | None = None, character_data: dict[str, Any] | None = None, persona_name: str | None = None, persona_description: str | None = None, world_info: dict[str, Any] | None = None, multi_user_mode: bool = False) -> list[ChatMessage]:
         visible_history = [message for message in history if not message.hidden]
         persona_name = persona_name or next((message.author for message in reversed(visible_history) if message.role == "user" and message.author), "User")
-        history_messages = self._history_messages(visible_history, openai_preset)
+        history_messages = self._history_messages(visible_history, openai_preset, multi_user_mode)
         messages = self._tavern_openai_messages(openai_preset, character_name, persona_name, persona_description or "", character_data or {}, history_messages, world_info or {})
         if not messages:
             system_prompt = self.config.system_prompt or f"You are {character_name}. Continue the roleplay naturally."
@@ -176,14 +214,14 @@ class GenerationService:
             messages = self._squash_system_messages(messages)
         return self._pack_tavern_messages(messages)
 
-    def _history_messages(self, history: list[BotChatMessage], preset: dict[str, Any] | None = None) -> list[ChatMessage]:
+    def _history_messages(self, history: list[BotChatMessage], preset: dict[str, Any] | None = None, force_user_names: bool = False) -> list[ChatMessage]:
         messages: list[ChatMessage] = []
         names_behavior = self._int_from_preset(preset, "names_behavior", 0)
         for message in history[-40:]:
             role = "assistant" if message.role == "assistant" else "user"
             content = message.content
             name = None
-            if names_behavior == 2 and message.author:
+            if (force_user_names or names_behavior == 2) and role == "user" and message.author:
                 content = f"{message.author}: {content}"
             elif names_behavior == 1 and message.author:
                 name = self._sanitize_openai_name(message.author)

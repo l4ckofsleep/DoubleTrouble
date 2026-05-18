@@ -4,7 +4,6 @@ import base64
 import json
 import asyncio
 import re
-import subprocess
 
 import httpx
 from pathlib import Path
@@ -17,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.app.config import PROJECT_ROOT, load_config
 from backend.app.models import ClientEvent, JoinSessionRequest, SendMessageRequest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend.app.services.bot_chats_service import BotChatsService, ChatCreate, ChatMessageCreate, ChatMessageUpdate, ChatSwipeRequest, ChatUpdate
 from backend.app.services.character_cards_service import CharacterCardCreate, CharacterCardsService, CharacterCardUpdate
@@ -47,18 +46,33 @@ bot_chats_service = BotChatsService(storage.user_root / "chats")
 personas_service = PersonasService(storage.user_root / "personas.yaml", storage.user_root / "User Avatars")
 presets_service = PresetsService(storage.user_root)
 lorebooks_service = LorebooksService(storage.user_root / "worlds", storage.user_root / "lorebook_bindings.yaml")
-extensions_service = ExtensionsService(storage.user_root / "extensions", storage.user_root / "extensions" / "extensions.yaml")
+extensions_service = ExtensionsService(storage.user_root / "extensions", storage.user_root / "extensions" / "extensions.yaml", PROJECT_ROOT / "builtin-extensions")
 connection_manager = ConnectionManager()
 generation_tasks: dict[str, asyncio.Task[str]] = {}
 active_preset_overrides: dict[str, dict[str, object]] = {}
+PROVIDER_KEY_REGISTRY_SECRET = "provider_api_key_registry"
+PROVIDER_KEY_ACTIVE_SECRET = "provider_api_key_active"
+managed_secret_keys = {
+    "provider_api_key": {"label": "Provider API key", "env_name": settings_service.generation_config().api_key_env},
+}
+
+
+class GenerationParticipantRequest(BaseModel):
+    persona_id: str = ""
+    persona_name: str = ""
+    persona_description: str = ""
+    participant_id: str = ""
+    username: str = ""
 
 
 class BotReplyRequest(BaseModel):
     replace_message_id: str | None = None
     reset_swipes: bool = False
+    openai_preset: dict[str, object] | None = None
     persona_id: str | None = None
     persona_name: str | None = None
     persona_description: str | None = None
+    participants: list[GenerationParticipantRequest] = Field(default_factory=list)
 
 
 class AuthRequest(BaseModel):
@@ -72,6 +86,18 @@ class AdminClaimRequest(BaseModel):
 
 class AccessPasswordRequest(BaseModel):
     password: str
+
+
+class KeyUpdateRequest(BaseModel):
+    name: str = ""
+    value: str = ""
+
+
+class ImageModelsRequest(BaseModel):
+    api_type: str = "openai"
+    endpoint: str = ""
+    api_key: str = ""
+    timeout_seconds: float = 30.0
 
 
 class DeleteLockUpdate(BaseModel):
@@ -102,20 +128,30 @@ async def _broadcast_chat(card_id: str, chat_id: str) -> None:
 
 def _ensure_card_first_message(card_id: str, chat_id: str) -> object:
     chat = bot_chats_service.get_chat(card_id, chat_id)
-    if chat.messages:
-        return chat
     character_data = character_cards_service.card_data(card_id)
     first_message = str(character_data.get("first_mes") or character_data.get("first_message") or "").strip()
     if not first_message:
         return chat
+    raw_alternates = character_data.get("alternate_greetings", [])
+    if isinstance(raw_alternates, list):
+        alternate_greetings = [str(item).strip() for item in raw_alternates if str(item).strip()]
+    elif isinstance(raw_alternates, str) and raw_alternates.strip():
+        alternate_greetings = [raw_alternates.strip()]
+    else:
+        alternate_greetings = []
+    greeting_swipes = [first_message, *alternate_greetings]
+    if chat.messages:
+        return bot_chats_service.sync_first_assistant_swipes(card_id, chat_id, greeting_swipes)
     avatar_url = next((card.image_url for card in character_cards_service.list_cards() if card.id == card_id), "")
-    return bot_chats_service.add_bot_message(card_id, chat_id, chat.character_name, first_message, avatar_url)
+    return bot_chats_service.add_bot_message(card_id, chat_id, chat.character_name, first_message, avatar_url, greeting_swipes)
 
 
-async def _broadcast_generation_state(card_id: str, chat_id: str, event_type: str, message: str = "", replace_message_id: str | None = None) -> None:
+async def _broadcast_generation_state(card_id: str, chat_id: str, event_type: str, message: str = "", replace_message_id: str | None = None, streaming: bool | None = None) -> None:
     event: dict[str, object] = {"type": event_type, "card_id": card_id, "chat_id": chat_id, "replace_message_id": replace_message_id}
     if message:
         event["message"] = message
+    if streaming is not None:
+        event["streaming"] = streaming
     await connection_manager.broadcast(DEFAULT_SESSION_ID, event)
 
 
@@ -189,6 +225,10 @@ async def _broadcast_delete_locks() -> None:
     )
 
 
+async def _broadcast_shared_settings(section: str) -> None:
+    await connection_manager.broadcast(DEFAULT_SESSION_ID, {"type": "settings.updated", "section": section})
+
+
 def _chat_lock_key(card_id: str, chat_id: str) -> str:
     return f"{card_id}:{chat_id}"
 
@@ -242,6 +282,110 @@ def _active_openai_preset() -> dict[str, object] | None:
         return presets_service.get_preset("openai", name)
     except (KeyError, FileNotFoundError, json.JSONDecodeError):
         return None
+
+
+def _generation_persona_context(request: BotReplyRequest | None) -> tuple[str | None, str | None, bool, str]:
+    if request is None:
+        return None, None, False, ""
+    known_personas = {persona.id: persona for persona in personas_service.list_personas()}
+    participants: list[GenerationParticipantRequest] = list(request.participants or [])
+    if request.persona_id or request.persona_name or request.persona_description:
+        participants.append(
+            GenerationParticipantRequest(
+                persona_id=request.persona_id or "",
+                persona_name=request.persona_name or "",
+                persona_description=request.persona_description or "",
+            )
+        )
+
+    by_key: dict[str, tuple[str, str]] = {}
+    primary_name = (request.persona_name or "").strip() or None
+    primary_id = (request.persona_id or "").strip()
+    for participant in participants:
+        stored = known_personas.get(participant.persona_id)
+        name = (participant.persona_name or stored.name if stored else participant.persona_name).strip()
+        description = (participant.persona_description or stored.description if stored else participant.persona_description).strip()
+        if not name:
+            continue
+        key = participant.persona_id.strip() or participant.participant_id.strip() or name.lower()
+        by_key[key] = (name, description)
+        if primary_id and participant.persona_id == primary_id:
+            primary_name = name
+
+    personas = list(by_key.values())
+    if not personas:
+        return primary_name, (request.persona_description or "").strip() or None, False, primary_id
+    if len(personas) == 1:
+        return primary_name or personas[0][0], personas[0][1], False, primary_id
+    combined = "Active player personas in this DoubleTrouble chat:\n" + "\n".join(
+        f"- {name}: {description or 'No persona description provided.'}" for name, description in personas
+    )
+    return primary_name or " and ".join(name for name, _ in personas), combined, True, primary_id
+
+
+def _managed_key_payload(key_id: str, meta: dict[str, str]) -> dict[str, object]:
+    env_name = meta.get("env_name") or ""
+    return {
+        "id": key_id,
+        "name": meta.get("name") or meta.get("label") or key_id,
+        "label": meta.get("label") or meta.get("name") or key_id,
+        "configured": secret_store.exists(key_id),
+        "masked": _masked_secret(secret_store.read(key_id)),
+        "active": key_id == _active_provider_key_id(),
+        "env_name": env_name,
+        "env_configured": bool(env_name and secret_store.exists("", env_name)),
+    }
+
+
+def _masked_secret(value: str) -> str:
+    return f"********{value[-4:]}" if value else ""
+
+
+def _provider_key_registry() -> list[dict[str, str]]:
+    raw = secret_store.read(PROVIDER_KEY_REGISTRY_SECRET)
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = []
+        if isinstance(parsed, list):
+            return [
+                {"id": str(item.get("id") or ""), "name": str(item.get("name") or "")}
+                for item in parsed
+                if isinstance(item, dict) and str(item.get("id") or "").strip()
+            ]
+    if secret_store.exists("provider_api_key"):
+        return [{"id": "provider_api_key", "name": "Provider API key"}]
+    return []
+
+
+def _save_provider_key_registry(entries: list[dict[str, str]]) -> None:
+    secret_store.write(PROVIDER_KEY_REGISTRY_SECRET, json.dumps(entries, ensure_ascii=False))
+
+
+def _active_provider_key_id() -> str:
+    active_id = secret_store.read(PROVIDER_KEY_ACTIVE_SECRET).strip()
+    entries = _provider_key_registry()
+    if active_id and any(entry["id"] == active_id for entry in entries):
+        return active_id
+    return entries[0]["id"] if entries else ""
+
+
+def _set_active_provider_key(key_id: str) -> None:
+    value = secret_store.read(key_id)
+    if not value:
+        raise ValueError("Key value is empty")
+    secret_store.write(PROVIDER_KEY_ACTIVE_SECRET, key_id)
+    if key_id != "provider_api_key":
+        secret_store.write("provider_api_key", value)
+
+
+def _provider_key_payloads() -> list[dict[str, object]]:
+    env_name = settings_service.generation_config().api_key_env
+    return [
+        _managed_key_payload(entry["id"], {"name": entry["name"], "label": entry["name"], "env_name": env_name})
+        for entry in _provider_key_registry()
+    ]
 
 app = FastAPI(title="DoubleTrouble", version="0.1.0")
 app.add_middleware(
@@ -302,18 +446,9 @@ async def list_extensions(request: Request) -> dict[str, object]:
 
 
 @app.post("/api/extensions/install")
-async def install_extension(payload: ExtensionInstallRequest, request: Request) -> dict[str, object]:
+async def install_extension(_payload: ExtensionInstallRequest, request: Request) -> dict[str, object]:
     _require_permission(request, "manage_extensions")
-    try:
-        extension = extensions_service.install(payload)
-    except FileExistsError as error:
-        raise HTTPException(status_code=409, detail="Extension already exists") from error
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=404, detail="Extension source not found") from error
-    except (ValueError, RuntimeError, subprocess.SubprocessError) as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    await _broadcast_notification(f"установил расширение: {extension.name}", actor=_actor_from_request(request))
-    return {"extension": extension.model_dump(mode="json")}
+    raise HTTPException(status_code=403, detail="Extension installation is temporarily disabled")
 
 
 @app.put("/api/extensions/{name}/enabled")
@@ -323,6 +458,7 @@ async def set_extension_enabled(name: str, payload: dict[str, bool], request: Re
         extension = extensions_service.set_enabled(name, bool(payload.get("enabled")))
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Extension not found") from error
+    await _broadcast_shared_settings("extensions")
     await _broadcast_notification(f"{'включил' if extension.enabled else 'выключил'} расширение: {extension.name}", actor=_actor_from_request(request))
     return {"extension": extension.model_dump(mode="json")}
 
@@ -334,6 +470,7 @@ async def delete_extension(name: str, request: Request) -> dict[str, object]:
         extensions_service.delete(name)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Extension not found") from error
+    await _broadcast_shared_settings("extensions")
     await _broadcast_notification(f"удалил расширение: {name}", actor=_actor_from_request(request))
     return {"ok": True}
 
@@ -382,6 +519,10 @@ def _compat_javascript(content: str) -> Response:
     return Response(content=content.strip(), media_type="text/javascript; charset=utf-8")
 
 
+def _transparent_png() -> bytes:
+    return base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=")
+
+
 @app.get("/script.js")
 async def script_compat_module() -> Response:
     content = """
@@ -395,18 +536,20 @@ export const messageFormatting = ctx().messageFormatting || ((text) => text);
 export const saveChatConditional = ctx().saveChat || (async () => {});
 export const chat = [];
 export const characters = [];
+export const personas = [];
 export const chat_metadata = {};
 export const extension_prompts = {};
 const sync = () => {
   chat.splice(0, chat.length, ...(ctx().chat || []));
   characters.splice(0, characters.length, ...(ctx().characters || []));
+  personas.splice(0, personas.length, ...(ctx().personas || []));
 };
 sync();
 globalThis.setInterval?.(sync, 250);
 export const name1 = ctx().name1 || 'User';
 export const name2 = ctx().name2 || 'Char';
 export const this_chid = ctx().characterId ?? 0;
-export const user_avatar = 'default.png';
+export const user_avatar = ctx().selectedPersona?.avatar || '';
 export const system_avatar = 'system.png';
 export const default_avatar = 'default.png';
 export const is_send_press = false;
@@ -459,6 +602,66 @@ export default {};
 @app.get("/scripts/{module_path:path}")
 async def scripts_compat_module(module_path: str) -> Response:
     modules = {
+        "personas.js": """
+const ctx = () => globalThis.SillyTavern?.getContext?.() || {};
+export const personas = {};
+export const persona_names = [];
+export const default_avatar = '';
+export let user_avatar = '';
+const avatarFileName = (value = '') => {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  try {
+    const parsed = new URL(text, globalThis.location?.origin || 'http://localhost');
+    return decodeURIComponent(parsed.pathname.split('/').filter(Boolean).pop() || '');
+  } catch {
+    return decodeURIComponent(text.split(/[\\/]/).filter(Boolean).pop() || text);
+  }
+};
+const avatarUrl = (value = '') => {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  if (text.startsWith('/') || /^(?:https?:|data:)/i.test(text)) return text;
+  return `/User Avatars/${encodeURIComponent(text)}`;
+};
+const normalizePersona = (persona = {}) => ({
+  id: String(persona.id || persona.name || ''),
+  name: String(persona.name || ''),
+  description: String(persona.description || ''),
+  avatar: avatarFileName(persona.avatar || persona.avatar_url || ''),
+  avatar_url: String(persona.avatar_url || avatarUrl(persona.avatar || '')),
+  file: avatarFileName(persona.avatar || persona.avatar_url || ''),
+  active: Boolean(persona.active),
+});
+export const syncPersonas = () => {
+  const nextPersonas = (ctx().personas || []).map(normalizePersona).filter((persona) => persona.name);
+  const selectedId = String(ctx().selectedPersonaId || '');
+  const selected = nextPersonas.find((persona) => persona.id === selectedId) || nextPersonas.find((persona) => persona.active) || nextPersonas[0] || null;
+  user_avatar = selected?.file || '';
+  persona_names.splice(0, persona_names.length, ...nextPersonas.map((persona) => persona.name));
+  Object.keys(personas).forEach((name) => delete personas[name]);
+  nextPersonas.forEach((persona) => { personas[persona.name] = persona; });
+  return nextPersonas;
+};
+export const getUserAvatars = async () => syncPersonas().map((persona) => persona.file).filter(Boolean);
+export const getUserAvatar = (name) => {
+  const avatarId = String(name || '').trim();
+  const persona = syncPersonas().find((item) => item.file === avatarId || item.name === avatarId || item.id === avatarId);
+  return persona?.avatar_url || avatarUrl(avatarId);
+};
+export const getPersonaAvatar = (name) => {
+  const persona = syncPersonas().find((item) => item.name === name || item.id === name) || ctx().selectedPersona;
+  return persona?.avatar_url || avatarUrl(persona?.avatar || persona?.file || '');
+};
+export const getPersonaDescription = (name) => {
+  const persona = syncPersonas().find((item) => item.name === name || item.id === name) || ctx().selectedPersona;
+  return persona?.description || '';
+};
+export const selectCurrentPersona = async () => ctx().selectedPersona || syncPersonas()[0] || null;
+syncPersonas();
+globalThis.setInterval?.(syncPersonas, 500);
+export default personas;
+""",
         "utils.js": """
 export const uuidv4 = () => crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 export const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -660,10 +863,15 @@ async def extension_avatars(request: Request) -> list[str]:
     return [path.name for path in sorted(personas_service.avatars_dir.iterdir()) if path.is_file()]
 
 
-@app.get("/User Avatars/{filename}")
-async def extension_user_avatar(filename: str, request: Request) -> FileResponse:
+@app.get("/User Avatars/{filename:path}")
+@app.head("/User Avatars/{filename:path}")
+async def extension_user_avatar(filename: str, request: Request) -> Response:
+    _require_permission(request, "view_personas")
+    safe_name = Path(filename).name
+    if not safe_name or safe_name in {"default.png", "default.jpg", "system.png"}:
+        return Response(content=_transparent_png(), media_type="image/png")
     try:
-        path = personas_service.avatar_path(filename)
+        path = personas_service.avatar_path(safe_name)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Persona avatar not found") from error
     return FileResponse(path)
@@ -678,6 +886,7 @@ async def public_config() -> dict[str, object]:
             "public_url": config.server.public_url,
         },
         "auth": {"mode": config.auth.mode, "required": settings_service.auth_required()},
+        "registration_allowed": settings_service.registration_allowed(),
         "access_password_required": settings_service.access_password_required(),
         "default_session_id": DEFAULT_SESSION_ID,
     }
@@ -686,6 +895,8 @@ async def public_config() -> dict[str, object]:
 @app.post("/api/auth/register")
 async def auth_register(payload: AuthRequest, request: Request) -> dict[str, object]:
     _require_access_password(request)
+    if not settings_service.registration_allowed():
+        raise HTTPException(status_code=403, detail="Registration is disabled")
     try:
         user, token = auth_service.register(payload.username, payload.password)
     except ValueError as error:
@@ -733,6 +944,8 @@ async def get_security_permissions() -> dict[str, object]:
     settings = settings_service.security_settings_payload()
     return {
         "auth_required": settings.auth_required,
+        "registration_allowed": settings.registration_allowed,
+        "bot_reply_allowed": settings.bot_reply_allowed,
         "access_password_required": settings.access_password_required,
         "access_password_configured": settings.access_password_configured,
         "permissions": settings.permissions.model_dump(mode="json"),
@@ -766,6 +979,8 @@ async def update_security_permissions(payload: SecuritySettingsPayload, request:
         {
             "type": "security.updated",
             "auth_required": settings.auth_required,
+            "registration_allowed": settings.registration_allowed,
+            "bot_reply_allowed": settings.bot_reply_allowed,
             "access_password_required": settings.access_password_required,
             "access_password_configured": settings.access_password_configured,
             "permissions": settings.permissions.model_dump(mode="json"),
@@ -773,10 +988,95 @@ async def update_security_permissions(payload: SecuritySettingsPayload, request:
     )
     return {
         "auth_required": settings.auth_required,
+        "registration_allowed": settings.registration_allowed,
+        "bot_reply_allowed": settings.bot_reply_allowed,
         "access_password_required": settings.access_password_required,
         "access_password_configured": settings.access_password_configured,
         "permissions": settings.permissions.model_dump(mode="json"),
     }
+
+
+@app.get("/api/keys")
+async def list_managed_keys(request: Request) -> dict[str, object]:
+    _require_permission(request, "manage_keys")
+    return {"keys": _provider_key_payloads()}
+
+
+@app.post("/api/keys")
+async def create_managed_key(payload: KeyUpdateRequest, request: Request) -> dict[str, object]:
+    _require_permission(request, "manage_keys")
+    name = payload.name.strip()
+    value = payload.value.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Key name is required")
+    if not value:
+        raise HTTPException(status_code=400, detail="Key value is required")
+    entries = _provider_key_registry()
+    had_active_key = bool(_active_provider_key_id())
+    key_id = f"provider_api_key:{uuid4()}"
+    entries.append({"id": key_id, "name": name})
+    _save_provider_key_registry(entries)
+    secret_store.write(key_id, value)
+    if not had_active_key:
+        _set_active_provider_key(key_id)
+    generation_service.update_config(settings_service.generation_config())
+    await _broadcast_shared_settings("keys")
+    return {"keys": _provider_key_payloads()}
+
+
+@app.put("/api/keys/{key_id}")
+async def update_managed_key(key_id: str, payload: KeyUpdateRequest, request: Request) -> dict[str, object]:
+    _require_permission(request, "manage_keys")
+    entries = _provider_key_registry()
+    entry = next((item for item in entries if item["id"] == key_id), None)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Key not found")
+    name = payload.name.strip()
+    value = payload.value.strip()
+    if name:
+        entry["name"] = name
+        _save_provider_key_registry(entries)
+    if value:
+        secret_store.write(key_id, value)
+        if key_id == _active_provider_key_id():
+            _set_active_provider_key(key_id)
+    generation_service.update_config(settings_service.generation_config())
+    await _broadcast_shared_settings("keys")
+    return {"keys": _provider_key_payloads()}
+
+
+@app.post("/api/keys/{key_id}/active")
+async def activate_managed_key(key_id: str, request: Request) -> dict[str, object]:
+    _require_permission(request, "manage_keys")
+    if not any(entry["id"] == key_id for entry in _provider_key_registry()):
+        raise HTTPException(status_code=404, detail="Key not found")
+    try:
+        _set_active_provider_key(key_id)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    generation_service.update_config(settings_service.generation_config())
+    await _broadcast_shared_settings("keys")
+    return {"keys": _provider_key_payloads()}
+
+
+@app.delete("/api/keys/{key_id}")
+async def delete_managed_key(key_id: str, request: Request) -> dict[str, object]:
+    _require_permission(request, "manage_keys")
+    entries = _provider_key_registry()
+    if not any(entry["id"] == key_id for entry in entries):
+        raise HTTPException(status_code=404, detail="Key not found")
+    was_active = key_id == _active_provider_key_id()
+    next_entries = [entry for entry in entries if entry["id"] != key_id]
+    _save_provider_key_registry(next_entries)
+    secret_store.delete(key_id)
+    if was_active and next_entries:
+        _set_active_provider_key(next_entries[0]["id"])
+    elif was_active:
+        secret_store.delete(PROVIDER_KEY_ACTIVE_SECRET)
+        secret_store.delete("provider_api_key")
+    generation_service.update_config(settings_service.generation_config())
+    await _broadcast_shared_settings("keys")
+    return {"keys": _provider_key_payloads()}
 
 
 @app.get("/api/delete-locks")
@@ -839,6 +1139,7 @@ async def generation_settings() -> dict[str, object]:
 async def update_generation_settings(request: GenerationSettingsUpdate) -> dict[str, object]:
     generation = settings_service.update_generation_settings(request)
     generation_service.update_config(generation)
+    await _broadcast_shared_settings("generation")
     return settings_service.generation_settings()
 
 
@@ -856,6 +1157,7 @@ async def save_generation_preset(request: GenerationPresetSave, http_request: Re
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     generation_service.update_config(settings_service.generation_config())
+    await _broadcast_shared_settings("generation")
     return {"preset": preset.model_dump(mode="json"), "settings": settings_service.generation_settings(), "active": settings_service.active_generation_preset()}
 
 
@@ -866,6 +1168,7 @@ async def apply_generation_connection_preset(name: str) -> dict[str, object]:
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Preset not found") from error
     generation_service.update_config(generation)
+    await _broadcast_shared_settings("generation")
     return {"settings": settings_service.generation_settings(), "active": settings_service.active_generation_preset()}
 
 
@@ -876,6 +1179,7 @@ async def delete_generation_preset(name: str, request: Request) -> dict[str, obj
         settings_service.delete_generation_preset(name)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Preset not found") from error
+    await _broadcast_shared_settings("generation")
     return {"ok": True, "active": settings_service.active_generation_preset()}
 
 
@@ -886,6 +1190,75 @@ async def generation_models(request: GenerationSettingsUpdate) -> dict[str, obje
     api_key = request.api_key.strip() or secret_store.read(settings_service.generation_config().api_key_secret, settings_service.generation_config().api_key_env)
     provider = OpenAICompatibleProvider(request.base_url, api_key, request.timeout_seconds)
     return await provider.status()
+
+
+@app.post("/api/image-generation/models")
+async def image_generation_models(payload: ImageModelsRequest, request: Request) -> dict[str, object]:
+    _require_permission(request, "manage_extensions")
+    api_type = payload.api_type.strip().lower()
+    if api_type == "naistera":
+        return {"ok": True, "models": ["grok", "grok-pro", "nano banana 2", "novelai"]}
+
+    endpoint = payload.endpoint.strip().rstrip("/")
+    if not endpoint:
+        return {"ok": False, "error": "Image endpoint is not configured"}
+
+    headers: dict[str, str] = {}
+    params: dict[str, str] = {}
+    if payload.api_key.strip():
+        headers["Authorization"] = f"Bearer {payload.api_key.strip()}"
+
+    if api_type == "gemini":
+        root = endpoint
+        root = re.sub(r"/v1(?:beta)?/models(?:/.*)?$", "", root).rstrip("/")
+        root = re.sub(r"/v1(?:beta)?$", "", root).rstrip("/")
+        urls = [f"{root}/v1beta/models", f"{root}/v1/models"]
+        if payload.api_key.strip():
+            params["key"] = payload.api_key.strip()
+    else:
+        root = endpoint
+        root = re.sub(r"/v1/images/generations$", "/v1", root).rstrip("/")
+        root = re.sub(r"/images/generations$", "", root).rstrip("/")
+        root = re.sub(r"/v1/models$", "/v1", root).rstrip("/")
+        root = re.sub(r"/models$", "", root).rstrip("/")
+        urls = [f"{root}/models" if root.endswith("/v1") else f"{root}/v1/models"]
+
+    last_error: dict[str, object] | None = None
+    try:
+        async with httpx.AsyncClient(timeout=max(payload.timeout_seconds, 30.0)) as client:
+            for url in urls:
+                try:
+                    response = await client.get(url, headers=headers, params=params)
+                    response.raise_for_status()
+                    return {"ok": True, "models": response.json()}
+                except httpx.HTTPStatusError as error:
+                    last_error = _image_models_provider_error(error.response, url)
+                except ValueError:
+                    last_error = {"status_code": response.status_code, "error": f"Провайдер вернул не-JSON ответ для списка моделей: {url}"}
+        return {"ok": False, **(last_error or {"error": "Не удалось загрузить модели"})}
+    except httpx.HTTPError as error:
+        return {"ok": False, "error": str(error)}
+
+
+def _image_models_provider_error(response: httpx.Response, url: str) -> dict[str, object]:
+    content_type = response.headers.get("content-type", "").lower()
+    detail = ""
+    if "application/json" in content_type:
+        try:
+            parsed = response.json()
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            raw_detail = parsed.get("error") or parsed.get("detail") or parsed.get("message")
+            if isinstance(raw_detail, dict):
+                raw_detail = raw_detail.get("message") or raw_detail.get("error")
+            detail = str(raw_detail or "").strip()
+    if not detail and "html" not in content_type:
+        detail = response.text.strip()[:300]
+    if not detail:
+        reason = response.reason_phrase or "HTTP error"
+        detail = f"{response.status_code} {reason}"
+    return {"status_code": response.status_code, "error": f"Провайдер не отдал список моделей ({detail}) для {url}"}
 
 
 @app.get("/api/presets/types")
@@ -910,6 +1283,22 @@ async def list_presets(preset_type: str, request: Request) -> dict[str, object]:
     return {"presets": [preset.model_dump(mode="json") for preset in presets]}
 
 
+@app.get("/api/presets/{preset_type}/active-draft")
+async def active_preset_draft(preset_type: str, request: Request) -> dict[str, object]:
+    _require_permission(request, "view_presets")
+    if preset_type not in presets_service.TYPES:
+        raise HTTPException(status_code=404, detail="Preset type not found")
+    active = settings_service.active_preset_settings()
+    name = str(active.get(preset_type) or "")
+    preset = active_preset_overrides.get(preset_type)
+    if preset is None and name:
+        try:
+            preset = presets_service.get_preset(preset_type, name)
+        except (KeyError, FileNotFoundError):
+            preset = {}
+    return {"active": active, "name": name, "preset": preset or {}}
+
+
 @app.get("/api/presets/{preset_type}/{name}")
 async def get_preset(preset_type: str, name: str, request: Request) -> dict[str, object]:
     _require_permission(request, "view_presets")
@@ -931,6 +1320,7 @@ async def save_preset(preset_type: str, payload: PresetPayload, request: Request
         raise HTTPException(status_code=404, detail="Preset type not found") from error
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_shared_settings("presets")
     await _broadcast_notification(f"сохранил пресет: {preset.name}", actor=_actor_from_request(request))
     return {"preset": preset.model_dump(mode="json")}
 
@@ -946,6 +1336,7 @@ async def import_preset(preset_type: str, request: Request, file: UploadFile = F
         raise HTTPException(status_code=404, detail="Preset type not found") from error
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_shared_settings("presets")
     await _broadcast_notification(f"импортировал пресет: {preset.name}", actor=_actor_from_request(request))
     return {"preset": preset.model_dump(mode="json")}
 
@@ -959,6 +1350,7 @@ async def delete_preset(preset_type: str, name: str, request: Request) -> dict[s
         raise HTTPException(status_code=404, detail="Preset type not found") from error
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Preset not found") from error
+    await _broadcast_shared_settings("presets")
     await _broadcast_notification(f"удалил пресет: {name}", actor=_actor_from_request(request))
     return {"ok": True}
 
@@ -993,6 +1385,7 @@ async def apply_preset(preset_type: str, name: str, request: Request) -> dict[st
     generation = _apply_generation_preset(preset_type, preset)
     if generation:
         generation_service.update_config(generation)
+    await _broadcast_shared_settings("presets")
     await _broadcast_notification(f"изменил активный пресет: {name}", actor=_actor_from_request(request))
     return {"active": active, "settings": settings_service.generation_settings()}
 
@@ -1007,6 +1400,7 @@ async def update_active_preset_draft(preset_type: str, payload: PresetPayload, r
     generation = _apply_generation_preset(preset_type, payload.preset)
     if generation:
         generation_service.update_config(generation)
+    await _broadcast_shared_settings("presets")
     return {"active": active, "settings": settings_service.generation_settings()}
 
 
@@ -1014,6 +1408,7 @@ async def update_active_preset_draft(preset_type: str, payload: PresetPayload, r
 async def import_sillytavern_defaults(request: Request, source_root: str = Form("E:/ST/SillyTavern/default/content")) -> dict[str, object]:
     _require_permission(request, "manage_presets")
     copied = presets_service.import_directory(Path(source_root))
+    await _broadcast_shared_settings("presets")
     await _broadcast_notification(f"импортировал дефолтные пресеты ST: {copied}", actor=_actor_from_request(request))
     return {"copied": copied}
 
@@ -1033,6 +1428,7 @@ async def import_lorebook(request: Request, file: UploadFile = File(...)) -> dic
         book = lorebooks_service.import_book(file.filename, await file.read())
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_shared_settings("lorebooks")
     await _broadcast_notification(f"импортировал лорбук: {book.name}", actor=_actor_from_request(request))
     return {"lorebook": book.model_dump(mode="json")}
 
@@ -1053,6 +1449,7 @@ async def save_lorebook(payload: LorebookPayload, request: Request) -> dict[str,
         book = lorebooks_service.save_book(payload)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_shared_settings("lorebooks")
     await _broadcast_notification(f"сохранил лорбук: {book.name}", actor=_actor_from_request(request))
     return {"lorebook": book.model_dump(mode="json")}
 
@@ -1064,6 +1461,7 @@ async def delete_lorebook(name: str, request: Request) -> dict[str, object]:
         lorebooks_service.delete_book(name)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Lorebook not found") from error
+    await _broadcast_shared_settings("lorebooks")
     await _broadcast_notification(f"удалил лорбук: {name}", actor=_actor_from_request(request))
     return {"ok": True}
 
@@ -1087,6 +1485,7 @@ async def export_lorebook(name: str, request: Request) -> Response:
 async def save_lorebook_bindings(payload: LorebookBindingPayload, request: Request) -> dict[str, object]:
     _require_permission(request, "manage_lorebooks")
     bindings = lorebooks_service.save_bindings(payload.bindings)
+    await _broadcast_shared_settings("lorebooks")
     await _broadcast_notification("обновил привязки лорбуков", actor=_actor_from_request(request))
     return {"bindings": [binding.model_dump(mode="json") for binding in bindings]}
 
@@ -1100,8 +1499,8 @@ async def list_character_cards(request: Request) -> dict[str, object]:
 @app.post("/api/cards/import")
 async def import_character_card(request: Request, file: UploadFile = File(...)) -> dict[str, object]:
     _require_permission(request, "edit_cards")
-    if not file.filename or not file.filename.lower().endswith(".png"):
-        raise HTTPException(status_code=400, detail="Only PNG character cards are supported")
+    if not file.filename or not file.filename.lower().endswith((".png", ".json")):
+        raise HTTPException(status_code=400, detail="Only PNG or JSON character cards are supported")
     try:
         card = character_cards_service.import_card(file.filename, await file.read())
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
@@ -1118,6 +1517,7 @@ async def create_character_card(
     personality: str = Form(""),
     scenario: str = Form(""),
     first_message: str = Form(""),
+    alternate_greetings: list[str] = Form(default=[]),
     message_example: str = Form(""),
     creator: str = Form(""),
     tags: str = Form(""),
@@ -1130,6 +1530,7 @@ async def create_character_card(
         personality=personality,
         scenario=scenario,
         first_message=first_message,
+        alternate_greetings=alternate_greetings,
         message_example=message_example,
         creator=creator,
         tags=[tag.strip() for tag in tags.split(",") if tag.strip()],
@@ -1216,7 +1617,7 @@ async def create_bot_chat(card_id: str, request: ChatCreate, http_request: Reque
 async def get_bot_chat(card_id: str, chat_id: str, request: Request) -> dict[str, object]:
     _require_permission(request, "view_chats")
     try:
-        chat = bot_chats_service.get_chat(card_id, chat_id)
+        chat = _ensure_card_first_message(card_id, chat_id)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Chat not found") from error
     return {"chat": chat.model_dump(mode="json")}
@@ -1330,6 +1731,8 @@ async def swipe_bot_chat_message(card_id: str, chat_id: str, message_id: str, re
 @app.post("/api/cards/{card_id}/chats/{chat_id}/bot/reply")
 async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Request, request: BotReplyRequest | None = None) -> dict[str, object]:
     _require_permission(http_request, "generate")
+    if not settings_service.bot_reply_allowed() and not (request and request.replace_message_id):
+        raise HTTPException(status_code=403, detail="Bot reply button is disabled")
     task_key = f"{card_id}:{chat_id}"
     if task_key in generation_tasks:
         raise HTTPException(status_code=409, detail="Generation is already running")
@@ -1343,16 +1746,23 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
             if target_index < 0:
                 raise KeyError(replace_message_id)
             history = chat.messages[:target_index]
-        openai_preset = _active_openai_preset()
+        openai_preset = request.openai_preset if request and isinstance(request.openai_preset, dict) else _active_openai_preset()
         character_data = character_cards_service.card_data(card_id)
-        persona_id = request.persona_id if request else None
-        persona_name = request.persona_name if request else None
-        persona_description = request.persona_description if request else None
+        persona_name, persona_description, multi_user_mode, persona_id = _generation_persona_context(request)
         lorebook_context = lorebooks_service.active_context([message.content for message in history if not message.hidden], card_id, chat_id, persona_id or "")
-        task = asyncio.create_task(generation_service.generate_chat_reply(chat.character_name, history, openai_preset, character_data, persona_name, persona_description, lorebook_context.model_dump(mode="json")))
+        async def broadcast_stream(content: str) -> None:
+            await _broadcast_generation_state(card_id, chat_id, "generation.stream", content, replace_message_id)
+
+        streaming_enabled = generation_service.should_stream_chat_reply(openai_preset)
+        if streaming_enabled:
+            task = asyncio.create_task(generation_service.generate_chat_reply_stream(chat.character_name, history, openai_preset, character_data, persona_name, persona_description, lorebook_context.model_dump(mode="json"), multi_user_mode, broadcast_stream))
+        else:
+            task = asyncio.create_task(generation_service.generate_chat_reply(chat.character_name, history, openai_preset, character_data, persona_name, persona_description, lorebook_context.model_dump(mode="json"), multi_user_mode))
         generation_tasks[task_key] = task
-        await _broadcast_generation_state(card_id, chat_id, "generation.started", replace_message_id=replace_message_id)
+        await _broadcast_generation_state(card_id, chat_id, "generation.started", replace_message_id=replace_message_id, streaming=streaming_enabled)
         reply = await task
+        if streaming_enabled:
+            await _broadcast_generation_state(card_id, chat_id, "generation.stream", reply, replace_message_id)
         avatar_url = next((card.image_url for card in character_cards_service.list_cards() if card.id == card_id), "")
         if replace_message_id:
             chat = bot_chats_service.replace_bot_message(card_id, chat_id, replace_message_id, chat.character_name, reply, avatar_url, reset_swipes)
@@ -1374,7 +1784,11 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
         await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id)
         raise HTTPException(status_code=502, detail=message) from error
     except httpx.HTTPStatusError as error:
-        message = f"Provider returned {error.response.status_code}: {error.response.text}"
+        try:
+            response_text = error.response.text
+        except httpx.ResponseNotRead:
+            response_text = "<streaming response body was not read>"
+        message = f"Provider returned {error.response.status_code}: {response_text}"
         await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id)
         raise HTTPException(status_code=502, detail=message) from error
     except httpx.HTTPError as error:
@@ -1550,6 +1964,18 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
 
             if event.type == "notification" and event.content:
                 await _broadcast_notification(event.content, session_id, event.username or event.persona_name or event.name or "")
+
+            if event.type in {"image_generation.pending", "image_generation.finished"} and event.card_id and event.chat_id and event.message_id:
+                await connection_manager.broadcast(
+                    session_id,
+                    {
+                        "type": event.type,
+                        "card_id": event.card_id,
+                        "chat_id": event.chat_id,
+                        "message_id": event.message_id,
+                        "source_participant_id": event.source_participant_id or event.participant_id or "",
+                    },
+                )
 
             if event.type == "message.send" and event.participant_id and event.content:
                 message = session_service.add_message(

@@ -37,13 +37,19 @@ class SessionService:
 
         if participant_id and participant_id in session.participants:
             participant = session.participants[participant_id]
+            next_persona_id = persona_id.strip()
+            next_persona_name = persona_name.strip()
+            next_avatar_url = avatar_url.strip()
+            if not next_persona_id and not next_persona_name and not next_avatar_url and participant.persona_id:
+                normalized_name = participant.name
             if not participant.connected:
                 participant.connected_at = utc_now()
             participant.name = normalized_name
             participant.connected = True
-            participant.persona_id = persona_id.strip()
-            participant.persona_name = persona_name.strip()
-            participant.avatar_url = avatar_url.strip()
+            if next_persona_id or next_persona_name or next_avatar_url or not participant.persona_id:
+                participant.persona_id = next_persona_id
+                participant.persona_name = next_persona_name
+                participant.avatar_url = next_avatar_url
             participant.username = username.strip()
             participant.is_admin = is_admin
             return participant

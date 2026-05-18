@@ -25,6 +25,7 @@ class CharacterCardSummary(BaseModel):
     personality: str = ""
     scenario: str = ""
     first_message: str = ""
+    alternate_greetings: list[str] = Field(default_factory=list)
     message_example: str = ""
     creator: str = ""
     tags: list[str] = Field(default_factory=list)
@@ -39,6 +40,7 @@ class CharacterCardCreate(BaseModel):
     personality: str = ""
     scenario: str = ""
     first_message: str = ""
+    alternate_greetings: list[str] = Field(default_factory=list)
     message_example: str = ""
     creator: str = ""
     tags: list[str] = Field(default_factory=list)
@@ -63,11 +65,11 @@ class CharacterCardsService:
         return cards
 
     def import_card(self, filename: str, content: bytes) -> CharacterCardSummary:
-        metadata = self.read_card_metadata(content)
+        metadata = self._read_json_metadata(content) if filename.lower().endswith(".json") else self.read_card_metadata(content)
         data = self._card_data(metadata)
         name = str(data.get("name") or metadata.get("name") or Path(filename).stem or "Character")
         target = self._unique_path(self._safe_filename(name), ".png")
-        target.write_bytes(content)
+        target.write_bytes(self._write_card_metadata(FALLBACK_PNG, metadata) if filename.lower().endswith(".json") else content)
         return self._summary_from_metadata(target, metadata)
 
     def create_card(self, request: CharacterCardCreate, avatar_content: bytes | None = None) -> CharacterCardSummary:
@@ -95,6 +97,7 @@ class CharacterCardsService:
                 "personality": request.personality,
                 "scenario": request.scenario,
                 "first_mes": request.first_message,
+                "alternate_greetings": [greeting for greeting in request.alternate_greetings if greeting.strip()],
                 "mes_example": request.message_example,
                 "creator": request.creator,
                 "tags": request.tags,
@@ -145,6 +148,15 @@ class CharacterCardsService:
         decoded = base64.b64decode(encoded).decode("utf-8")
         return json.loads(decoded)
 
+    def _read_json_metadata(self, content: bytes) -> dict[str, Any]:
+        metadata = json.loads(content.decode("utf-8"))
+        if not isinstance(metadata, dict):
+            raise ValueError("JSON card must be an object")
+        data = self._card_data(metadata)
+        if not str(data.get("name") or metadata.get("name") or "").strip():
+            raise ValueError("JSON card has no character name")
+        return metadata
+
     def _summary_from_file(self, path: Path) -> CharacterCardSummary:
         metadata = self.read_card_metadata(path.read_bytes())
         return self._summary_from_metadata(path, metadata)
@@ -160,6 +172,7 @@ class CharacterCardsService:
             personality=str(data.get("personality") or metadata.get("personality") or ""),
             scenario=str(data.get("scenario") or metadata.get("scenario") or ""),
             first_message=str(data.get("first_mes") or metadata.get("first_mes") or ""),
+            alternate_greetings=self._alternate_greetings(data, metadata),
             message_example=str(data.get("mes_example") or metadata.get("mes_example") or ""),
             creator=str(data.get("creator") or metadata.get("creator") or ""),
             tags=[str(tag) for tag in tags] if isinstance(tags, list) else [],
@@ -171,6 +184,14 @@ class CharacterCardsService:
     def _card_data(self, metadata: dict[str, Any]) -> dict[str, Any]:
         data = metadata.get("data")
         return data if isinstance(data, dict) else metadata
+
+    def _alternate_greetings(self, data: dict[str, Any], metadata: dict[str, Any]) -> list[str]:
+        raw = data.get("alternate_greetings", metadata.get("alternate_greetings", []))
+        if isinstance(raw, list):
+            return [str(item) for item in raw if str(item).strip()]
+        if isinstance(raw, str) and raw.strip():
+            return [raw]
+        return []
 
     def _read_png_text_chunks(self, content: bytes) -> dict[str, str]:
         if not content.startswith(PNG_SIGNATURE):
@@ -261,7 +282,7 @@ class CharacterCardsService:
                 "creator_notes": "Created in DoubleTrouble",
                 "system_prompt": "",
                 "post_history_instructions": "",
-                "alternate_greetings": [],
+                "alternate_greetings": [greeting for greeting in request.alternate_greetings if greeting.strip()],
                 "tags": request.tags,
                 "creator": request.creator,
                 "character_version": "1.0",

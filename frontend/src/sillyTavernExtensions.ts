@@ -22,17 +22,35 @@ type RuntimeCharacter = {
   image_url: string;
 };
 
+type RuntimePersona = {
+  id: string;
+  name: string;
+  description: string;
+  avatar: string;
+  avatar_url: string;
+  active?: boolean;
+};
+
+type RuntimeReasoningSettings = {
+  prefix?: string;
+  suffix?: string;
+};
+
 type RuntimeState = {
   chat: Record<string, unknown>[];
   messages: RuntimeMessage[];
   characters: RuntimeCharacter[];
+  personas: RuntimePersona[];
+  activePersonas: RuntimePersona[];
+  selectedPersonaId: string;
   characterId?: number;
   name1: string;
   name2: string;
   getRequestHeaders: () => Record<string, string>;
-  saveMessageByIndex: (index: number, content: string) => Promise<void>;
+  saveMessageByIndex: (index: number, content: string, expectedMessageId?: string) => Promise<void>;
   toast: (message: string) => void;
   extensionLeader: boolean;
+  reasoning: RuntimeReasoningSettings;
 };
 
 type EventHandler = (...args: unknown[]) => unknown | Promise<unknown>;
@@ -109,10 +127,17 @@ async function runExtensionHandler(record: EventHandlerRecord, args: unknown[], 
 
 function shouldRunExtensionHandler(record: EventHandlerRecord, event: string) {
   const owner = record.owner.toLowerCase();
-  if (owner.includes('sillyimages') && event === eventTypes.CHARACTER_MESSAGE_RENDERED && !runtime.extensionLeader) {
+  if (isImageGenerationOwner(owner) && event === eventTypes.CHAT_CHANGED) {
+    return false;
+  }
+  if (isImageGenerationOwner(owner) && event === eventTypes.CHARACTER_MESSAGE_RENDERED && !runtime.extensionLeader) {
     return false;
   }
   return true;
+}
+
+function isImageGenerationOwner(owner: string) {
+  return /(?:sillyimages|inline.*image|image.*generation|iig|stable-diffusion|sd-webui|comfy)/i.test(owner);
 }
 
 function tagNewExtensionSettingsChildren(settingsHost: HTMLElement | null, before: Set<Element>, owner: string) {
@@ -162,6 +187,9 @@ let runtime: RuntimeState = {
   chat: [],
   messages: [],
   characters: [],
+  personas: [],
+  activePersonas: [],
+  selectedPersonaId: '',
   characterId: undefined,
   name1: 'Player',
   name2: 'Bot',
@@ -169,6 +197,7 @@ let runtime: RuntimeState = {
   saveMessageByIndex: async () => {},
   toast: () => {},
   extensionLeader: true,
+  reasoning: {},
 };
 
 function loadExtensionSettings(): Record<string, unknown> {
@@ -184,6 +213,11 @@ function saveSettingsDebounced() {
   settingsSaveTimer = window.setTimeout(() => {
     window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(extensionSettings));
   }, 250);
+}
+
+export function updateSillyTavernExtensionSettings(patch: Record<string, unknown>) {
+  Object.assign(extensionSettings, patch);
+  saveSettingsDebounced();
 }
 
 function toast(kind: 'success' | 'info' | 'warning' | 'error', message: string, title?: string) {
@@ -379,24 +413,32 @@ const lodashShim = Object.assign((value: unknown) => lodashChain(value), lodashM
 function ensureGlobals() {
   const win = window as typeof window & { SillyTavern?: unknown; toastr?: unknown; $?: unknown; jQuery?: unknown; t?: unknown; _?: unknown; hljs?: unknown; Popper?: unknown; createPopper?: unknown };
   win.SillyTavern = {
-    getContext: () => ({
-      chat: runtime.chat,
-      characters: runtime.characters,
-      characterId: runtime.characterId,
-      name1: runtime.name1,
-      name2: runtime.name2,
-      extensionSettings: extensionSettings,
-      eventSource,
-      eventTypes,
-      event_types: eventTypes,
-      getRequestHeaders: () => ({ 'Content-Type': 'application/json', ...runtime.getRequestHeaders() }),
-      isExtensionLeader: runtime.extensionLeader,
-      saveSettingsDebounced,
-      saveChat: saveChatFromExtension,
-      messageFormatting: formatExtensionMessageHtml,
-      getCharacterAvatar: (characterId: number) => runtime.characters[characterId]?.image_url || runtime.characters[characterId]?.avatar || '',
-      scrollOnMediaLoad: () => window.requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })),
-    }),
+    getContext: () => {
+      const contextChat = runtime.chat;
+      return {
+        chat: contextChat,
+        characters: runtime.characters,
+        personas: runtime.personas,
+        activePersonas: runtime.activePersonas,
+        connectedPersonas: runtime.activePersonas,
+        selectedPersona: runtime.personas.find((persona) => persona.id === runtime.selectedPersonaId) || runtime.personas[0] || null,
+        selectedPersonaId: runtime.selectedPersonaId,
+        characterId: runtime.characterId,
+        name1: runtime.name1,
+        name2: runtime.name2,
+        extensionSettings: extensionSettings,
+        eventSource,
+        eventTypes,
+        event_types: eventTypes,
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json', ...runtime.getRequestHeaders() }),
+        isExtensionLeader: runtime.extensionLeader,
+        saveSettingsDebounced,
+        saveChat: () => saveChatFromExtension(contextChat),
+        messageFormatting: formatExtensionMessageHtml,
+        getCharacterAvatar: (characterId: number) => runtime.characters[characterId]?.image_url || runtime.characters[characterId]?.avatar || '',
+        scrollOnMediaLoad: () => window.requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })),
+      };
+    },
   };
   win.toastr = {
     success: (message: string, title?: string) => toast('success', message, title),
@@ -697,11 +739,16 @@ function jqueryCollection(elements: unknown[]) {
   return api;
 }
 
-async function saveChatFromExtension() {
-  await Promise.all(runtime.chat.map(async (message, index) => {
+async function saveChatFromExtension(sourceChat = runtime.chat) {
+  await Promise.all(sourceChat.map(async (message, index) => {
     const nextContent = String(message.mes ?? '');
-    if (runtime.messages[index]?.content !== nextContent) {
-      await runtime.saveMessageByIndex(index, nextContent);
+    const expectedMessageId = typeof message.dt_message_id === 'string' ? message.dt_message_id : undefined;
+    const currentIndex = expectedMessageId ? runtime.messages.findIndex((item) => item.id === expectedMessageId) : index;
+    if (currentIndex < 0) {
+      return;
+    }
+    if (runtime.messages[currentIndex]?.content !== nextContent) {
+      await runtime.saveMessageByIndex(currentIndex, nextContent, expectedMessageId);
     }
   }));
 }
@@ -715,25 +762,55 @@ function escapeHtml(value: string) {
     .replace(/'/g, '&#39;');
 }
 
-export function formatExtensionMessageHtml(content: string) {
-  return sanitizeExtensionHtml(stripReasoningBlocks(content));
+export type ExtensionMessageFormatOptions = {
+  forceImagePending?: boolean;
+  renderPendingMarkersAsSpinner?: boolean;
+  reasoning?: RuntimeReasoningSettings;
+};
+
+export function formatExtensionMessageHtml(content: string, options: ExtensionMessageFormatOptions = {}) {
+  const formatOptions = options && typeof options === 'object' ? options : {};
+  return sanitizeExtensionHtml(stripReasoningBlocks(content, formatOptions.reasoning ?? runtime.reasoning), formatOptions);
 }
 
-function stripReasoningBlocks(content: string) {
-  return content
-    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
-    .replace(/<think>[\s\S]*?<\/think>/gi, '')
-    .replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, '')
-    .trim();
+function stripReasoningBlocks(content: string, reasoning: RuntimeReasoningSettings = {}) {
+  const prefix = String(reasoning.prefix || '');
+  const suffix = String(reasoning.suffix || '');
+  if (!prefix || !suffix) {
+    return content.trim();
+  }
+  let output = content;
+  while (true) {
+    const start = findMarker(output, [prefix, prefix.trim()], 0);
+    if (start.index < 0) {
+      break;
+    }
+    const bodyStart = start.index + start.marker.length;
+    const end = findMarker(output, [suffix, suffix.trim()], bodyStart);
+    output = end.index < 0
+      ? output.slice(0, start.index)
+      : `${output.slice(0, start.index)}${output.slice(end.index + end.marker.length)}`;
+  }
+  return output.trim();
 }
 
-function sanitizeExtensionHtml(content: string) {
+function findMarker(content: string, markers: string[], fromIndex: number) {
+  return Array.from(new Set(markers.filter(Boolean))).reduce((best, marker) => {
+    const index = content.indexOf(marker, fromIndex);
+    if (index < 0 || (best.index >= 0 && best.index <= index)) {
+      return best;
+    }
+    return { index, marker };
+  }, { index: -1, marker: '' });
+}
+
+function sanitizeExtensionHtml(content: string, options: ExtensionMessageFormatOptions) {
   const template = document.createElement('template');
   template.innerHTML = content;
-  return Array.from(template.content.childNodes).map(sanitizeNode).join('');
+  return Array.from(template.content.childNodes).map((node) => sanitizeNode(node, options)).join('');
 }
 
-function sanitizeNode(node: ChildNode): string {
+function sanitizeNode(node: ChildNode, options: ExtensionMessageFormatOptions): string {
   if (node.nodeType === Node.TEXT_NODE) {
     return escapeHtml(node.textContent || '').replace(/\n/g, '<br>');
   }
@@ -748,37 +825,77 @@ function sanitizeNode(node: ChildNode): string {
   }
 
   const attrs = Array.from(node.attributes)
-    .filter((attr) => isAllowedAttribute(tag, attr.name, attr.value))
-    .map((attr) => ` ${attr.name}="${escapeHtml(attr.value)}"`)
+    .map((attr) => sanitizeAttribute(tag, attr.name, attr.value))
+    .filter((attr): attr is string => Boolean(attr))
     .join('');
+  if ((tag === 'img' || tag === 'video') && shouldRenderImagePending(node, options)) {
+    return renderImagePendingPlaceholder(node);
+  }
+  if ((tag === 'img' || tag === 'video') && isImagePendingMarker(node)) {
+    return `<span class="iig-pending-media-shell">${renderSanitizedElement(tag, attrs, node, options)}</span>`;
+  }
   if (tag === 'br' || tag === 'img' || tag === 'input' || tag === 'source') {
     return `<${tag}${attrs}>`;
   }
-  return `<${tag}${attrs}>${Array.from(node.childNodes).map(sanitizeNode).join('')}</${tag}>`;
+  return renderSanitizedElement(tag, attrs, node, options);
 }
 
-function isAllowedAttribute(tag: string, name: string, value: string) {
-  const attr = name.toLowerCase();
-  if (attr.startsWith('on')) {
+function shouldRenderImagePending(node: Element, options: ExtensionMessageFormatOptions) {
+  if (options.forceImagePending) {
+    return true;
+  }
+  if (!isImagePendingMarker(node)) {
     return false;
   }
+  return Boolean(options.renderPendingMarkersAsSpinner);
+}
+
+function isImagePendingMarker(node: Element) {
+  const hasInstruction = node.hasAttribute('data-iig-instruction');
+  const pendingSrc = node.getAttribute('data-iig-pending-src') || node.getAttribute('src') || '';
+  const pendingPoster = node.getAttribute('data-iig-pending-poster') || node.getAttribute('poster') || '';
+  return Boolean(hasInstruction && /^\[(?:IMG|VID):/i.test(pendingSrc || pendingPoster));
+}
+
+function renderImagePendingPlaceholder(node: Element) {
+  const instruction = node.getAttribute('data-iig-instruction') || '';
+  const pendingSrc = node.getAttribute('data-iig-pending-src') || node.getAttribute('src') || '';
+  return `<div class="iig-loading-placeholder iig-rendered-pending" data-iig-instruction="${escapeHtml(instruction)}" data-iig-pending-src="${escapeHtml(pendingSrc)}"><div class="iig-spinner"></div><div class="iig-status">Генерация картинки...</div></div>`;
+}
+
+function renderSanitizedElement(tag: string, attrs: string, node: Element, options: ExtensionMessageFormatOptions) {
+  if (tag === 'br' || tag === 'img' || tag === 'input' || tag === 'source') {
+    return `<${tag}${attrs}>`;
+  }
+  return `<${tag}${attrs}>${Array.from(node.childNodes).map((child) => sanitizeNode(child, options)).join('')}</${tag}>`;
+}
+
+function sanitizeAttribute(tag: string, name: string, value: string) {
+  const attr = name.toLowerCase();
+  if (attr.startsWith('on')) {
+    return '';
+  }
   if (attr.startsWith('data-') || attr.startsWith('aria-')) {
-    return true;
+    return ` ${attr}="${escapeHtml(value)}"`;
   }
   if (['class', 'id', 'style', 'title', 'alt', 'name', 'type', 'value', 'checked', 'for'].includes(attr)) {
-    return true;
+    return ` ${attr}="${escapeHtml(value)}"`;
   }
   if (['controls', 'autoplay', 'loop', 'muted', 'playsinline'].includes(attr)) {
-    return tag === 'video';
+    return tag === 'video' ? ` ${attr}="${escapeHtml(value)}"` : '';
   }
   if (['src', 'poster'].includes(attr)) {
-    return /^(https?:|data:image\/|data:video\/|\/|\[IMG:|\[VID:|#)/i.test(value);
+    if (/^\[(?:IMG|VID):/i.test(value)) {
+      return ` data-iig-pending-${attr}="${escapeHtml(value)}"`;
+    }
+    return /^(https?:|data:image\/|data:video\/|\/|#)/i.test(value) ? ` ${attr}="${escapeHtml(value)}"` : '';
   }
-  return false;
+  return '';
 }
 
 function toSillyTavernChat(messages: RuntimeMessage[]) {
   return messages.map((message) => ({
+    dt_message_id: message.id,
     name: message.author,
     is_user: message.role === 'user',
     is_system: message.role === 'system',
@@ -874,7 +991,6 @@ export async function initSillyTavernExtensions() {
 
   await eventSource.emit(eventTypes.APP_READY);
   await eventSource.emit(eventTypes.CHAT_CHANGED);
-  await Promise.all(runtime.messages.map((message, index) => eventSource.emit(message.role === 'user' ? eventTypes.USER_MESSAGE_RENDERED : eventTypes.CHARACTER_MESSAGE_RENDERED, index)));
 }
 
 export async function emitSillyTavernChatChanged() {

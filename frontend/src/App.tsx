@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react';
-import { emitSillyTavernChatChanged, emitSillyTavernMessageRendered, emitSillyTavernMessageSwiped, formatExtensionMessageHtml, initSillyTavernExtensions, updateSillyTavernRuntime } from './sillyTavernExtensions';
+import { Fragment, useEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
+import { emitSillyTavernChatChanged, emitSillyTavernMessageRendered, emitSillyTavernMessageSwiped, formatExtensionMessageHtml, initSillyTavernExtensions, updateSillyTavernExtensionSettings, updateSillyTavernRuntime, type ExtensionMessageFormatOptions } from './sillyTavernExtensions';
 
 type MenuSection = 'presets' | 'connection' | 'visual' | 'personas' | 'security' | 'lorebooks' | 'cards' | 'extensions';
-type IconName = 'sliders' | 'plug' | 'palette' | 'user' | 'card' | 'book' | 'bot' | 'lock' | 'menu' | 'send' | 'edit' | 'trash' | 'eye' | 'eyeOff' | 'check' | 'x';
-type ThemeId = 'midnight' | 'parchment' | 'abyss' | 'forest' | 'ocean' | 'plum' | 'ember';
+type IconName = 'sliders' | 'plug' | 'palette' | 'user' | 'card' | 'book' | 'bot' | 'lock' | 'key' | 'menu' | 'send' | 'edit' | 'trash' | 'eye' | 'eyeOff' | 'check' | 'x';
+type ThemeId = 'midnight' | 'parchment' | 'abyss' | 'forest' | 'ocean' | 'plum' | 'ember' | 'aurora' | 'rose' | 'slate' | 'noir' | 'cyberpunk' | 'dracula' | 'nord' | 'coffee' | 'porcelain' | 'mint' | 'lavender' | 'solar' | 'sand' | 'linen' | 'cloud' | 'buttercream' | 'seashell' | 'morning' | 'paper';
 type VisualSettings = {
   theme: ThemeId;
   textScale: 'small' | 'normal' | 'large' | 'huge';
@@ -14,6 +15,12 @@ type VisualSettings = {
   highContrast: boolean;
   showAvatars: boolean;
   stickyComposer: boolean;
+  gradients: boolean;
+  glass: boolean;
+  texture: boolean;
+  panelShadows: boolean;
+  messageTint: boolean;
+  backgroundVignette: boolean;
 };
 
 type CharacterCard = {
@@ -24,6 +31,7 @@ type CharacterCard = {
   personality: string;
   scenario: string;
   first_message: string;
+  alternate_greetings: string[];
   message_example: string;
   creator: string;
   tags: string[];
@@ -38,6 +46,7 @@ type CardDraft = {
   personality: string;
   scenario: string;
   firstMessage: string;
+  alternateGreetings: string[];
   messageExample: string;
   creator: string;
   tags: string;
@@ -131,6 +140,17 @@ type ExtensionSummary = {
   updated_at: string;
 };
 
+type ManagedKeySummary = {
+  id: string;
+  name: string;
+  label: string;
+  configured: boolean;
+  masked: string;
+  active: boolean;
+  env_name: string;
+  env_configured: boolean;
+};
+
 type LorebookBinding = { book: string; target_type: 'global' | 'card' | 'chat' | 'persona'; target_id: string };
 type LorebookSummary = { name: string; filename: string; entry_count: number; updated_at: number; bindings: LorebookBinding[] };
 
@@ -147,6 +167,14 @@ type Participant = {
   is_admin: boolean;
 };
 
+type GenerationParticipant = {
+  persona_id: string;
+  persona_name: string;
+  persona_description: string;
+  participant_id?: string;
+  username?: string;
+};
+
 type AuthUser = {
   username: string;
   is_admin: boolean;
@@ -157,6 +185,10 @@ type PermissionRule = { mode: PermissionMode; users: string[] };
 type SecurityPermissions = Record<string, PermissionRule>;
 type AccessDeniedState = { cards: boolean; personas: boolean; chats: boolean; presets: boolean; lorebooks: boolean };
 type DeletionLocks = { cards: string[]; personas: string[]; chats: string[] };
+type BuiltInExtensionSettings = { noriMynInfoblock: boolean };
+type ImageExtensionSettings = { apiType: string; endpoint: string; model: string; apiKey: string };
+type ImageEndpointPreset = { name: string; apiType: string; endpoint: string; model: string };
+type ImageKeyRecord = { id: string; name: string; value: string; active: boolean };
 
 type ToastMessage = {
   id: string;
@@ -170,8 +202,13 @@ type RealtimePayload = {
   chat?: BotChat;
   session?: { participants?: Record<string, Participant> };
   message?: string;
+  message_id?: string;
   replace_message_id?: string | null;
+  source_participant_id?: string;
+  section?: string;
   auth_required?: boolean;
+  registration_allowed?: boolean;
+  bot_reply_allowed?: boolean;
   access_password_required?: boolean;
   access_password_configured?: boolean;
   permissions?: SecurityPermissions;
@@ -179,6 +216,9 @@ type RealtimePayload = {
 };
 
 type RawPreset = Record<string, unknown>;
+
+const imagePendingKey = (cardId: string, chatId: string, messageId: string) => `${cardId}:${chatId}:${messageId}`;
+const extensionMessageSignature = (message: ChatMessage) => `${message.role}:${message.active_swipe_index ?? 0}:${message.content}`;
 
 type OpenAiPrompt = RawPreset & {
   identifier?: string;
@@ -227,6 +267,7 @@ const menuItems: Array<{ id: MenuSection; label: string; icon: IconName; descrip
 
 const VISUAL_STORAGE_KEY = 'doubletrouble.visualSettings';
 const SELECTED_PERSONA_STORAGE_KEY = 'doubletrouble.selectedPersonaId';
+const BUILT_IN_EXTENSIONS_STORAGE_KEY = 'doubletrouble.builtInExtensions';
 const PARTICIPANT_STORAGE_KEY = 'doubletrouble.participantId';
 const LAST_CARD_STORAGE_KEY = 'doubletrouble.lastCardId';
 const LAST_CHAT_BY_CARD_STORAGE_KEY = 'doubletrouble.lastChatByCard';
@@ -251,14 +292,20 @@ const permissionLabels: Record<string, string> = {
   manage_presets: 'Пресеты и подключения',
   manage_lorebooks: 'Лорбуки и привязки',
   manage_extensions: 'Установка и управление расширениями',
+  manage_keys: 'Доступ к менеджеру ключей',
   manage_security: 'Настройки безопасности',
 };
 
-const defaultSecurityPermissions: SecurityPermissions = Object.fromEntries(Object.keys(permissionLabels).map((key) => [key, { mode: key === 'manage_security' ? 'admins' : 'everyone', users: [] }])) as SecurityPermissions;
+const defaultSecurityPermissions: SecurityPermissions = Object.fromEntries(Object.keys(permissionLabels).map((key) => [key, { mode: key === 'manage_security' || key === 'manage_keys' ? 'admins' : 'everyone', users: [] }])) as SecurityPermissions;
 const accessDeniedText = 'Доступ запрещен. Войдите или попросите администратора выдать права.';
 const defaultDeletionLocks: DeletionLocks = { cards: [], personas: [], chats: [] };
+const defaultBuiltInExtensionSettings: BuiltInExtensionSettings = { noriMynInfoblock: true };
+const defaultImageExtensionSettings: ImageExtensionSettings = { apiType: 'openai', endpoint: '', model: '', apiKey: '' };
+const EXTENSION_SETTINGS_STORAGE_KEY = 'doubletrouble.sillyTavernExtensionSettings';
+const IMAGE_ENDPOINTS_STORAGE_KEY = 'doubletrouble.imageEndpoints';
+const IMAGE_KEYS_STORAGE_KEY = 'doubletrouble.imageKeys';
 
-const emptyCardDraft: CardDraft = { name: '', description: '', personality: '', scenario: '', firstMessage: '', messageExample: '', creator: '', tags: '' };
+const emptyCardDraft: CardDraft = { name: '', description: '', personality: '', scenario: '', firstMessage: '', alternateGreetings: [], messageExample: '', creator: '', tags: '' };
 
 const connectionMethods = [
   ['disabled', 'Отключено'],
@@ -296,6 +343,7 @@ function draftFromCard(card: CharacterCard): CardDraft {
     personality: card.personality,
     scenario: card.scenario,
     firstMessage: card.first_message,
+    alternateGreetings: card.alternate_greetings || [],
     messageExample: card.message_example,
     creator: card.creator,
     tags: card.tags.join(', '),
@@ -335,17 +383,45 @@ const defaultVisualSettings: VisualSettings = {
   highContrast: false,
   showAvatars: true,
   stickyComposer: true,
+  gradients: false,
+  glass: false,
+  texture: false,
+  panelShadows: false,
+  messageTint: false,
+  backgroundVignette: false,
 };
 
-const themes: Array<{ id: ThemeId; name: string; description: string; swatches: string[] }> = [
-  { id: 'midnight', name: 'Midnight', description: 'Темная библиотека, янтарь и teal', swatches: ['#0f1418', '#1d2630', '#d8a75f', '#73b7a7'] },
-  { id: 'parchment', name: 'Parchment', description: 'Светлая бумага, чернила, бронза', swatches: ['#f4eddf', '#fffaf0', '#9c6b2f', '#3e746c'] },
-  { id: 'abyss', name: 'Abyss', description: 'Почти полный черный для OLED', swatches: ['#000000', '#0a0a0a', '#d6b46a', '#6fb5a5'] },
-  { id: 'forest', name: 'Forest', description: 'Темный лес, мох, теплый свет', swatches: ['#0f1712', '#1c2a20', '#c69a55', '#7fb069'] },
-  { id: 'ocean', name: 'Ocean', description: 'Холодная ночь, синий и циан', swatches: ['#0c1420', '#172638', '#7fb7ff', '#76d1cf'] },
-  { id: 'plum', name: 'Plum', description: 'Черничный тон без кислотности', swatches: ['#17111b', '#261d2d', '#c69ad7', '#d2a75f'] },
-  { id: 'ember', name: 'Ember', description: 'Уголь, медь и приглушенное тепло', swatches: ['#17110d', '#2a1d17', '#e09a58', '#c76f54'] },
+const themes: Array<{ id: ThemeId; name: string; description: string; swatches: string[]; tone: 'dark' | 'light' }> = [
+  { id: 'midnight', name: 'Midnight', description: 'Темная библиотека, янтарь и teal', swatches: ['#0f1418', '#1d2630', '#d8a75f', '#73b7a7'], tone: 'dark' },
+  { id: 'abyss', name: 'Abyss', description: 'Почти полный черный для OLED', swatches: ['#000000', '#0a0a0a', '#d6b46a', '#6fb5a5'], tone: 'dark' },
+  { id: 'forest', name: 'Forest', description: 'Темный лес, мох, теплый свет', swatches: ['#0f1712', '#1c2a20', '#c69a55', '#7fb069'], tone: 'dark' },
+  { id: 'ocean', name: 'Ocean', description: 'Холодная ночь, синий и циан', swatches: ['#0c1420', '#172638', '#7fb7ff', '#76d1cf'], tone: 'dark' },
+  { id: 'plum', name: 'Plum', description: 'Черничный тон без кислотности', swatches: ['#17111b', '#261d2d', '#c69ad7', '#d2a75f'], tone: 'dark' },
+  { id: 'ember', name: 'Ember', description: 'Уголь, медь и приглушенное тепло', swatches: ['#17110d', '#2a1d17', '#e09a58', '#c76f54'], tone: 'dark' },
+  { id: 'aurora', name: 'Aurora', description: 'Северное сияние, холодный изумруд и фиолетовый', swatches: ['#071317', '#10262a', '#8de3c6', '#a991ff'], tone: 'dark' },
+  { id: 'slate', name: 'Slate', description: 'Нейтральный графит без яркой театральности', swatches: ['#111417', '#1f252b', '#9db0bf', '#d1a66b'], tone: 'dark' },
+  { id: 'noir', name: 'Noir', description: 'Черно-белый нуар с красным акцентом', swatches: ['#08090b', '#15171c', '#e6e1d8', '#c94747'], tone: 'dark' },
+  { id: 'cyberpunk', name: 'Cyberpunk', description: 'Темный неон, розовый и циан', swatches: ['#10071f', '#1b0e33', '#ff5bd8', '#47e6ff'], tone: 'dark' },
+  { id: 'dracula', name: 'Dracula', description: 'Фиолетовая ночь, розовый и зеленый', swatches: ['#171421', '#282238', '#ff79c6', '#50fa7b'], tone: 'dark' },
+  { id: 'nord', name: 'Nord', description: 'Полярная ночь, холодный голубой', swatches: ['#1d2430', '#2e3440', '#88c0d0', '#a3be8c'], tone: 'dark' },
+  { id: 'coffee', name: 'Coffee', description: 'Эспрессо, сливки и медь', swatches: ['#17100c', '#261914', '#c58b5a', '#8db596'], tone: 'dark' },
+  { id: 'parchment', name: 'Parchment', description: 'Светлая бумага, чернила, бронза', swatches: ['#f4eddf', '#fffaf0', '#9c6b2f', '#3e746c'], tone: 'light' },
+  { id: 'rose', name: 'Rose Tea', description: 'Теплая светлая тема с розой и чаем', swatches: ['#f4e6df', '#fff6ee', '#b95d68', '#7b5f3f'], tone: 'light' },
+  { id: 'porcelain', name: 'Porcelain', description: 'Белый фарфор, синий и мягкий серый', swatches: ['#edf3f8', '#ffffff', '#4d7ea8', '#7a8a99'], tone: 'light' },
+  { id: 'mint', name: 'Mint', description: 'Светлая мята, эвкалипт и графит', swatches: ['#e8f4ed', '#f7fff9', '#3a8f73', '#53685f'], tone: 'light' },
+  { id: 'lavender', name: 'Lavender', description: 'Лавандовая бумага и черничные чернила', swatches: ['#eee8f8', '#fbf8ff', '#7d61b3', '#8b6d8f'], tone: 'light' },
+  { id: 'solar', name: 'Solar', description: 'Теплый дневной свет, янтарь и синева', swatches: ['#f5ead2', '#fff9e8', '#c77923', '#407c9c'], tone: 'light' },
+  { id: 'sand', name: 'Sand', description: 'Песок, охра и приглушенный шалфей', swatches: ['#efe3cc', '#fbf2df', '#a66f2d', '#6f8060'], tone: 'light' },
+  { id: 'linen', name: 'Linen', description: 'Лен, теплые чернила и оливковый акцент', swatches: ['#f1eadc', '#fffaf0', '#8a6b3e', '#6f7d54'], tone: 'light' },
+  { id: 'cloud', name: 'Cloud', description: 'Мягкий облачный интерфейс с голубым акцентом', swatches: ['#eef4f7', '#ffffff', '#5c89a8', '#8da6b5'], tone: 'light' },
+  { id: 'buttercream', name: 'Buttercream', description: 'Сливочный свет, мед и карамель', swatches: ['#f7efd6', '#fff9e6', '#bf7d2e', '#8a7350'], tone: 'light' },
+  { id: 'seashell', name: 'Seashell', description: 'Ракушка, коралл и тихая бирюза', swatches: ['#f7ebe4', '#fff7f1', '#c46b60', '#4f8f8a'], tone: 'light' },
+  { id: 'morning', name: 'Morning', description: 'Утреннее окно, холодный свет и лаванда', swatches: ['#edf0fb', '#fbfcff', '#637cc0', '#9b7fb5'], tone: 'light' },
+  { id: 'paper', name: 'Paper', description: 'Чистая бумага, графит и спокойный зеленый', swatches: ['#f2f0e8', '#fffdf7', '#5f6f5d', '#7d8f73'], tone: 'light' },
 ];
+
+const darkThemes = themes.filter((theme) => theme.tone === 'dark');
+const lightThemes = themes.filter((theme) => theme.tone === 'light');
 
 const slashCommands = [
   { command: '/hide', hint: '0-3', description: 'Скрыть сообщения' },
@@ -363,6 +439,122 @@ function loadVisualSettings(): VisualSettings {
   } catch {
     return defaultVisualSettings;
   }
+}
+
+function loadBuiltInExtensionSettings(): BuiltInExtensionSettings {
+  try {
+    return { ...defaultBuiltInExtensionSettings, ...JSON.parse(window.localStorage.getItem(BUILT_IN_EXTENSIONS_STORAGE_KEY) || '{}') };
+  } catch {
+    return defaultBuiltInExtensionSettings;
+  }
+}
+
+function loadImageExtensionSettings(): ImageExtensionSettings {
+  const saved = loadRawImageExtensionSettings();
+  return { ...defaultImageExtensionSettings, ...saved, apiKey: '' };
+}
+
+function loadRawImageExtensionSettings(): Partial<ImageExtensionSettings> {
+  try {
+    const settings = JSON.parse(window.localStorage.getItem(EXTENSION_SETTINGS_STORAGE_KEY) || '{}') as Record<string, unknown>;
+    const raw = (settings.sillyimages || settings.inline_image_gen || settings.inlineImageGeneration || settings.iig || {}) as Record<string, unknown>;
+    return {
+      ...raw,
+      apiType: String(raw.apiType || raw.provider || defaultImageExtensionSettings.apiType),
+      endpoint: String(raw.endpoint || raw.baseUrl || ''),
+      model: String(raw.model || ''),
+      apiKey: String(raw.apiKey || ''),
+    };
+  } catch {
+    return {};
+  }
+}
+
+function loadImageEndpointPresets(): ImageEndpointPreset[] {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(IMAGE_ENDPOINTS_STORAGE_KEY) || '[]') as unknown;
+    return Array.isArray(parsed)
+      ? parsed
+        .filter((item): item is Partial<ImageEndpointPreset> => Boolean(item) && typeof item === 'object')
+        .map((item) => {
+          const raw = item as Partial<ImageEndpointPreset> & { provider?: string; baseUrl?: string };
+          return { name: String(raw.name || ''), apiType: String(raw.apiType || raw.provider || 'openai'), endpoint: String(raw.endpoint || raw.baseUrl || ''), model: String(raw.model || '') };
+        })
+        .filter((item) => item.name)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveImageEndpointPresets(presets: ImageEndpointPreset[]) {
+  window.localStorage.setItem(IMAGE_ENDPOINTS_STORAGE_KEY, JSON.stringify(presets));
+}
+
+function loadImageKeys(): ImageKeyRecord[] {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(IMAGE_KEYS_STORAGE_KEY) || '[]') as unknown;
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    let activeAssigned = false;
+    return parsed
+      .filter((item): item is Partial<ImageKeyRecord> => Boolean(item) && typeof item === 'object')
+      .map((item, index) => {
+        const active = Boolean(item.active) && !activeAssigned;
+        if (active) {
+          activeAssigned = true;
+        }
+        return {
+          id: String(item.id || `image_key_${index}_${Date.now()}`),
+          name: String(item.name || 'Image API key'),
+          value: String(item.value || ''),
+          active,
+        };
+      })
+      .filter((item) => item.value);
+  } catch {
+    return [];
+  }
+}
+
+function saveImageKeys(keys: ImageKeyRecord[]) {
+  window.localStorage.setItem(IMAGE_KEYS_STORAGE_KEY, JSON.stringify(keys));
+}
+
+function maskSecret(value: string) {
+  return value ? `********${value.slice(-4)}` : '';
+}
+
+function syncImageExtensionSettingsDom(settings: Partial<ImageExtensionSettings>) {
+  window.setTimeout(() => {
+    const apiType = document.getElementById('iig_api_type');
+    const endpoint = document.getElementById('iig_endpoint');
+    const model = document.getElementById('iig_model');
+    const apiKey = document.getElementById('iig_api_key');
+    if (apiType instanceof HTMLSelectElement && settings.apiType) {
+      apiType.value = settings.apiType;
+      apiType.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    if (endpoint instanceof HTMLInputElement && settings.endpoint !== undefined) {
+      endpoint.value = settings.endpoint;
+      endpoint.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    if (model instanceof HTMLSelectElement && settings.model !== undefined) {
+      if (settings.model && !Array.from(model.options).some((option) => option.value === settings.model)) {
+        const option = document.createElement('option');
+        option.value = settings.model;
+        option.textContent = settings.model;
+        model.appendChild(option);
+      }
+      model.value = settings.model;
+      model.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    if (apiKey instanceof HTMLInputElement && settings.apiKey !== undefined) {
+      apiKey.value = settings.apiKey;
+      apiKey.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  }, 0);
 }
 
 function participantId(): string {
@@ -407,6 +599,8 @@ export default function App() {
   const [editingMessageText, setEditingMessageText] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationStatus, setGenerationStatus] = useState('');
+  const [generationStreamText, setGenerationStreamText] = useState('');
+  const [generationReplaceMessageId, setGenerationReplaceMessageId] = useState<string | null>(null);
   const [topbarVisible, setTopbarVisible] = useState(true);
   const [chatRenameDrafts, setChatRenameDrafts] = useState<Record<string, string>>({});
   const [presetTypes, setPresetTypes] = useState<PresetTypeInfo[]>([]);
@@ -428,11 +622,15 @@ export default function App() {
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [imagePreview, setImagePreview] = useState<{ src: string; title: string } | null>(null);
+  const [imagePendingMessages, setImagePendingMessages] = useState<Record<string, boolean>>({});
+  const [extensionMessageRenderVersions, setExtensionMessageRenderVersions] = useState<Record<string, number>>({});
   const [authToken, setAuthToken] = useState(() => window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '');
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [authDraft, setAuthDraft] = useState({ username: '', password: '', adminCode: '' });
   const [authMessage, setAuthMessage] = useState('');
   const [authRequired, setAuthRequired] = useState(false);
+  const [registrationAllowed, setRegistrationAllowed] = useState(true);
+  const [botReplyAllowed, setBotReplyAllowed] = useState(true);
   const [authChecked, setAuthChecked] = useState(false);
   const [accessToken, setAccessToken] = useState(() => window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || '');
   const [accessPasswordRequired, setAccessPasswordRequired] = useState(false);
@@ -440,6 +638,7 @@ export default function App() {
   const [accessUnlocked, setAccessUnlocked] = useState(false);
   const [accessPasswordDraft, setAccessPasswordDraft] = useState('');
   const [accessPasswordMessage, setAccessPasswordMessage] = useState('');
+  const [securityAccessPasswordRequiredDraft, setSecurityAccessPasswordRequiredDraft] = useState(false);
   const [securityAccessPasswordDraft, setSecurityAccessPasswordDraft] = useState('');
   const [securityPermissions, setSecurityPermissions] = useState<SecurityPermissions>(defaultSecurityPermissions);
   const [accessDenied, setAccessDenied] = useState<AccessDeniedState>({ cards: false, personas: false, chats: false, presets: false, lorebooks: false });
@@ -449,17 +648,51 @@ export default function App() {
   const reasoningDisplay = reasoningSettingsFromPreset(parsePresetDraft(presetJsonDraft));
   const selectedPersona = personas.find((persona) => persona.id === selectedPersonaId) ?? personas[0] ?? null;
   const connectedPlayers = participants.filter((participant) => participant.connected && participant.role === 'player');
+  const activeReferencePersonas = (() => {
+    const byKey = new Map<string, Persona>();
+    const addPersona = (persona: Persona | null, participant?: Participant) => {
+      const id = persona?.id || participant?.persona_id || participant?.id || '';
+      const name = persona?.name || participant?.persona_name || participant?.name || '';
+      const avatarUrl = persona?.avatar_url || participant?.avatar_url || '';
+      if (!id || !name || !avatarUrl) {
+        return;
+      }
+      byKey.set(id, {
+        id,
+        name,
+        description: persona?.description || '',
+        avatar: persona?.avatar || avatarUrl,
+        avatar_url: avatarUrl,
+        active: Boolean(persona?.active),
+      });
+    };
+    connectedPlayers.forEach((participant) => addPersona(participant.persona_id ? personas.find((persona) => persona.id === participant.persona_id) || null : null, participant));
+    addPersona(selectedPersona);
+    return Array.from(byKey.values());
+  })();
   const connectedCount = participants.filter((participant) => participant.connected).length;
   const websocketRef = useRef<WebSocket | null>(null);
   const participantIdRef = useRef(participantId());
+  const imageEventSourceIdRef = useRef(window.crypto?.randomUUID?.() || `image_source_${Date.now()}_${Math.random().toString(36).slice(2)}`);
   const authTokenRef = useRef(authToken);
   const authUserRef = useRef<AuthUser | null>(null);
   const activeCardRef = useRef<CharacterCard | null>(null);
   const activeChatRef = useRef<BotChat | null>(null);
-  const swipeTouchStartRef = useRef<Record<string, number>>({});
+  const personasRef = useRef<Persona[]>([]);
+  const personasLoadedRef = useRef(false);
+  const selectedPersonaIdRef = useRef(selectedPersonaId);
+  const sessionSnapshotReceivedRef = useRef(false);
+  const participantPersonaRestoredRef = useRef(false);
+  const lastKnownParticipantPersonaIdRef = useRef('');
+  const selectedPresetTypeRef = useRef(selectedPresetType);
+  const selectedLorebookNameRef = useRef(selectedLorebookName);
+  const topbarScrollYRef = useRef(0);
+  const swipeTouchStartRef = useRef<Record<string, { x: number; y: number }>>({});
   const restoredSelectionRef = useRef(false);
   const activePresetDraftSignatureRef = useRef('');
-  const renderedExtensionMessageIdsRef = useRef<Set<string>>(new Set());
+  const generationSettingsLoadedRef = useRef(false);
+  const generationSettingsSaveSignatureRef = useRef('');
+  const renderedExtensionMessageSignaturesRef = useRef<Map<string, string>>(new Map());
   const activeGenerationRef = useRef(false);
   const extensionLeaderId = connectedPlayers.length
     ? [...connectedPlayers].sort((left, right) => {
@@ -473,6 +706,22 @@ export default function App() {
     activeCardRef.current = activeCard;
     activeChatRef.current = activeChat;
   }, [activeCard, activeChat]);
+
+  useEffect(() => {
+    selectedPersonaIdRef.current = selectedPersonaId;
+  }, [selectedPersonaId]);
+
+  useEffect(() => {
+    personasRef.current = personas;
+  }, [personas]);
+
+  useEffect(() => {
+    selectedPresetTypeRef.current = selectedPresetType;
+  }, [selectedPresetType]);
+
+  useEffect(() => {
+    selectedLorebookNameRef.current = selectedLorebookName;
+  }, [selectedLorebookName]);
 
   useEffect(() => {
     authUserRef.current = authUser;
@@ -490,6 +739,12 @@ export default function App() {
     document.documentElement.dataset.radius = visualSettings.radius;
     document.documentElement.dataset.motion = String(visualSettings.motion);
     document.documentElement.dataset.contrast = String(visualSettings.highContrast);
+    document.documentElement.dataset.gradients = String(visualSettings.gradients);
+    document.documentElement.dataset.glass = String(visualSettings.glass);
+    document.documentElement.dataset.texture = String(visualSettings.texture);
+    document.documentElement.dataset.panelShadows = String(visualSettings.panelShadows);
+    document.documentElement.dataset.messageTint = String(visualSettings.messageTint);
+    document.documentElement.dataset.backgroundVignette = String(visualSettings.backgroundVignette);
   }, [visualSettings]);
 
   useEffect(() => {
@@ -525,19 +780,25 @@ export default function App() {
     }
   }, [accessToken, accessPasswordRequired]);
 
+  const updateTopbarForScroll = (currentY: number) => {
+    if (window.matchMedia('(max-width: 900px)').matches) {
+      setTopbarVisible(true);
+      topbarScrollYRef.current = currentY;
+      return;
+    }
+    const lastY = topbarScrollYRef.current;
+    if (currentY < 24) {
+      setTopbarVisible(true);
+    } else if (currentY < lastY - 8) {
+      setTopbarVisible(true);
+    } else if (currentY > lastY + 8) {
+      setTopbarVisible(false);
+    }
+    topbarScrollYRef.current = currentY;
+  };
+
   useEffect(() => {
-    let lastY = window.scrollY;
-    const onScroll = () => {
-      const currentY = window.scrollY;
-      if (currentY < 24) {
-        setTopbarVisible(true);
-      } else if (currentY < lastY - 8) {
-        setTopbarVisible(true);
-      } else if (currentY > lastY + 8) {
-        setTopbarVisible(false);
-      }
-      lastY = currentY;
-    };
+    const onScroll = () => updateTopbarForScroll(window.scrollY);
     window.addEventListener('scroll', onScroll, { passive: true });
     return () => window.removeEventListener('scroll', onScroll);
   }, []);
@@ -586,6 +847,9 @@ export default function App() {
     updateSillyTavernRuntime({
       messages: activeMessages,
       characters: activeCard ? [{ id: activeCard.id, name: activeCard.name, avatar: activeCard.image_url, image_url: imageSrc(activeCard.image_url) }] : [],
+      personas: personas.map((persona) => ({ ...persona, avatar_url: imageSrc(persona.avatar_url) })),
+      activePersonas: activeReferencePersonas.map((persona) => ({ ...persona, avatar_url: imageSrc(persona.avatar_url) })),
+      selectedPersonaId,
       characterId: activeCard ? 0 : undefined,
       name1: selectedPersona?.name || authUser?.username || 'Player',
       name2: activeCard?.name || generationSettings.bot_name || 'Bot',
@@ -593,8 +857,9 @@ export default function App() {
       saveMessageByIndex: saveExtensionMessageByIndex,
       toast: addToast,
       extensionLeader,
+      reasoning: reasoningDisplay,
     });
-  }, [activeMessages, activeCard?.id, activeCard?.name, activeCard?.image_url, selectedPersona?.name, authUser?.username, generationSettings.bot_name, authToken, accessToken, extensionLeader]);
+  }, [activeMessages, activeCard?.id, activeCard?.name, activeCard?.image_url, personas, activeReferencePersonas, selectedPersonaId, selectedPersona?.name, authUser?.username, generationSettings.bot_name, authToken, accessToken, extensionLeader, presetJsonDraft]);
 
   useEffect(() => {
     if (authChecked && (!authRequired || authUser)) {
@@ -603,7 +868,7 @@ export default function App() {
   }, [authChecked, authRequired, authUser]);
 
   useEffect(() => {
-    renderedExtensionMessageIdsRef.current = new Set();
+    renderedExtensionMessageSignaturesRef.current = new Map(activeMessages.map((message) => [message.id, extensionMessageSignature(message)]));
     const timer = window.setTimeout(() => { void emitSillyTavernChatChanged(); }, 80);
     return () => window.clearTimeout(timer);
   }, [activeCard?.id, activeChat?.id]);
@@ -611,8 +876,9 @@ export default function App() {
   useEffect(() => {
     const timer = window.setTimeout(() => {
       activeMessages.forEach((message, index) => {
-        if (!renderedExtensionMessageIdsRef.current.has(message.id)) {
-          renderedExtensionMessageIdsRef.current.add(message.id);
+        const signature = extensionMessageSignature(message);
+        if (renderedExtensionMessageSignaturesRef.current.get(message.id) !== signature) {
+          renderedExtensionMessageSignaturesRef.current.set(message.id, signature);
           void emitSillyTavernMessageRendered(index, message.role);
         }
       });
@@ -631,9 +897,24 @@ export default function App() {
       if (payload.type === 'chat.updated' && payload.chat) {
         if (activeChatRef.current?.id === payload.chat.id) {
           setActiveChat(payload.chat);
+          setImagePendingMessages((current) => Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${payload.card_id || payload.chat?.card_id || ''}:${payload.chat?.id || ''}:`))));
+          document.querySelectorAll('#chat .iig-local-pending').forEach((element) => element.classList.remove('iig-local-pending'));
         }
         if (payload.card_id && activeCardRef.current?.id === payload.card_id) {
           void refreshCardChats(payload.card_id);
+        }
+      }
+      if ((payload.type === 'image_generation.pending' || payload.type === 'image_generation.finished') && payload.card_id && payload.chat_id && payload.message_id && payload.source_participant_id !== imageEventSourceIdRef.current) {
+        if (payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
+          const key = imagePendingKey(payload.card_id, payload.chat_id, payload.message_id);
+          setImagePendingMessages((current) => {
+            if (payload.type === 'image_generation.pending') {
+              return { ...current, [key]: true };
+            }
+            const next = { ...current };
+            delete next[key];
+            return next;
+          });
         }
       }
       if (payload.type === 'chat.deleted' && payload.chat_id === activeChatRef.current?.id) {
@@ -648,7 +929,16 @@ export default function App() {
         }
       }
       if ((payload.type === 'presence.updated' || payload.type === 'session.snapshot' || payload.type === 'session.updated') && payload.session?.participants) {
-        setParticipants(Object.values(payload.session.participants));
+        sessionSnapshotReceivedRef.current = true;
+        const nextParticipants = Object.values(payload.session.participants);
+        const ownParticipant = nextParticipants.find((participant) => participant.id === participantIdRef.current);
+        if (ownParticipant?.persona_id) {
+          lastKnownParticipantPersonaIdRef.current = ownParticipant.persona_id;
+          restoreSelectedPersonaFromParticipant(ownParticipant.persona_id);
+        } else {
+          selectDefaultPersonaIfNeeded();
+        }
+        setParticipants(nextParticipants);
       }
       if (payload.type === 'notification' && payload.message) {
         addToast(payload.message);
@@ -656,19 +946,33 @@ export default function App() {
       if (payload.type === 'generation.started' && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
         activeGenerationRef.current = true;
         setIsGenerating(true);
-        setGenerationStatus(payload.replace_message_id ? 'Бот перегенерирует ответ...' : 'Бот думает...');
+        setGenerationStreamText('');
+        setGenerationReplaceMessageId(payload.replace_message_id || null);
+        setGenerationStatus(`${activeCardRef.current?.name || 'Бот'} печатает...`);
+      }
+      if (payload.type === 'generation.stream' && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
+        activeGenerationRef.current = true;
+        setIsGenerating(true);
+        setGenerationStatus(`${activeCardRef.current?.name || 'Бот'} печатает...`);
+        setGenerationReplaceMessageId(payload.replace_message_id || null);
+        setGenerationStreamText(payload.message || '');
       }
       if ((payload.type === 'generation.finished' || payload.type === 'generation.cancelled' || payload.type === 'generation.failed') && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
         activeGenerationRef.current = false;
         setIsGenerating(false);
         setGenerationStatus('');
+        setGenerationStreamText('');
+        setGenerationReplaceMessageId(null);
         if (payload.type === 'generation.failed' && payload.message) {
           addToast(payload.message);
         }
       }
       if (payload.type === 'security.updated') {
         setAuthRequired(Boolean(payload.auth_required));
+        setRegistrationAllowed(payload.registration_allowed !== false);
+        setBotReplyAllowed(payload.bot_reply_allowed !== false);
         setAccessPasswordRequired(Boolean(payload.access_password_required));
+        setSecurityAccessPasswordRequiredDraft(Boolean(payload.access_password_required));
         setAccessPasswordConfigured(Boolean(payload.access_password_configured));
         if (!payload.access_password_required) {
           setAccessUnlocked(true);
@@ -677,6 +981,11 @@ export default function App() {
           setSecurityPermissions({ ...defaultSecurityPermissions, ...payload.permissions });
         }
         void refreshAccessControlledData();
+      }
+      if (payload.type === 'settings.updated') {
+        const section = payload.section || '';
+        void refreshSharedSettings(section);
+        window.dispatchEvent(new CustomEvent('doubletrouble:shared-settings-updated', { detail: { section } }));
       }
       if (payload.type === 'delete_locks.updated' && payload.delete_locks) {
         setDeletionLocks({ ...defaultDeletionLocks, ...payload.delete_locks });
@@ -700,6 +1009,40 @@ export default function App() {
     socket.send(JSON.stringify({ username: authUserRef.current?.username || '', is_admin: Boolean(authUserRef.current?.is_admin), ...event }));
   };
 
+  const applySelectedPersonaId = (personaId: string) => {
+    window.localStorage.setItem(SELECTED_PERSONA_STORAGE_KEY, personaId);
+    selectedPersonaIdRef.current = personaId;
+    setSelectedPersonaId(personaId);
+  };
+
+  const restoreSelectedPersonaFromParticipant = (personaId: string) => {
+    if (!personaId || participantPersonaRestoredRef.current) {
+      return;
+    }
+    const exists = personasRef.current.some((persona) => persona.id === personaId);
+    if (!exists) {
+      return;
+    }
+    participantPersonaRestoredRef.current = true;
+    if (selectedPersonaIdRef.current !== personaId) {
+      applySelectedPersonaId(personaId);
+    }
+  };
+
+  const selectDefaultPersonaIfNeeded = () => {
+    if (!personasLoadedRef.current) {
+      return;
+    }
+    const currentId = selectedPersonaIdRef.current || window.localStorage.getItem(SELECTED_PERSONA_STORAGE_KEY) || '';
+    if (personasRef.current.some((persona) => persona.id === currentId)) {
+      return;
+    }
+    const nextPersona = personasRef.current.find((persona) => persona.active) || personasRef.current[0];
+    if (nextPersona) {
+      applySelectedPersonaId(nextPersona.id);
+    }
+  };
+
   const actorHeaders = (token = authToken) => ({
     'X-DoubleTrouble-Actor': authUserRef.current?.username || selectedPersona?.name || 'Player',
     ...(accessToken ? { 'X-DoubleTrouble-Access': accessToken } : {}),
@@ -707,6 +1050,12 @@ export default function App() {
   });
 
   const sendPresence = (persona: Persona | null) => {
+    if (!persona && !personasLoadedRef.current) {
+      return;
+    }
+    if (persona && !selectedPersonaIdRef.current && !sessionSnapshotReceivedRef.current) {
+      return;
+    }
     sendRealtimeEvent({
       type: 'presence.update',
       participant_id: participantIdRef.current,
@@ -717,6 +1066,153 @@ export default function App() {
       username: authUserRef.current?.username || '',
       is_admin: Boolean(authUserRef.current?.is_admin),
     });
+  };
+
+  const notifyImageGenerationPending = (messageIndex: number, pending: boolean) => {
+    const card = activeCardRef.current;
+    const chat = activeChatRef.current;
+    const message = chat?.messages[messageIndex];
+    if (!card || !chat || !message) {
+      return;
+    }
+    sendRealtimeEvent({
+      type: pending ? 'image_generation.pending' : 'image_generation.finished',
+      card_id: card.id,
+      chat_id: chat.id,
+      message_id: message.id,
+      source_participant_id: imageEventSourceIdRef.current,
+    });
+  };
+
+  const cancelImageGeneration = (messageIndex: number, message: ChatMessage) => {
+    const iig = (window as Window & { DoubleTroubleIIG?: { cancelMessageImageGeneration?: (messageIndex: number, messageId?: string) => boolean } }).DoubleTroubleIIG;
+    iig?.cancelMessageImageGeneration?.(messageIndex, message.id);
+    window.dispatchEvent(new CustomEvent('doubletrouble:iig-cancel', { detail: { messageIndex, messageId: message.id } }));
+    const card = activeCardRef.current;
+    const chat = activeChatRef.current;
+    if (card && chat) {
+      const key = imagePendingKey(card.id, chat.id, message.id);
+      setImagePendingMessages((current) => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+      notifyImageGenerationPending(messageIndex, false);
+    }
+    document.querySelector(`#chat .mes[mesid="${messageIndex}"]`)?.classList.remove('iig-local-pending');
+  };
+
+  useEffect(() => {
+    const seenPlaceholders = new WeakSet<Element>();
+    const pendingFallbackTimers = new Map<number, number>();
+    const setLocalImagePending = (messageIndex: number, pending: boolean) => {
+      const card = activeCardRef.current;
+      const chat = activeChatRef.current;
+      const message = chat?.messages[messageIndex];
+      if (!card || !chat || !message) {
+        return;
+      }
+      const key = imagePendingKey(card.id, chat.id, message.id);
+      setImagePendingMessages((current) => {
+        if (pending) {
+          return { ...current, [key]: true };
+        }
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+      if (pending) {
+        window.setTimeout(() => {
+          setImagePendingMessages((current) => {
+            const next = { ...current };
+            delete next[key];
+            return next;
+          });
+        }, 180000);
+      }
+    };
+    const notifyMessageElement = (messageElement: Element | null) => {
+      const messageIndex = Number(messageElement?.getAttribute('mesid'));
+      if (Number.isInteger(messageIndex)) {
+        setLocalImagePending(messageIndex, true);
+        notifyImageGenerationPending(messageIndex, true);
+      }
+    };
+    const notifyPlaceholder = (node: Node) => {
+      if (!(node instanceof Element)) {
+        return;
+      }
+      const placeholders = [node, ...Array.from(node.querySelectorAll('.iig-loading-placeholder'))].filter((item): item is Element => item instanceof Element && item.classList.contains('iig-loading-placeholder'));
+      placeholders.forEach((placeholder) => {
+        if (seenPlaceholders.has(placeholder) || placeholder.classList.contains('iig-rendered-pending')) {
+          return;
+        }
+        seenPlaceholders.add(placeholder);
+        const messageElement = placeholder.closest('.mes[mesid]');
+        messageElement?.classList.remove('iig-local-pending');
+        notifyMessageElement(messageElement);
+      });
+    };
+    const notifyRegenerateClick = (event: Event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      const regenerateButton = target?.closest('.iig-regenerate-btn');
+      if (regenerateButton) {
+        const messageElement = regenerateButton.closest('.mes[mesid]');
+        const messageIndex = Number(messageElement?.getAttribute('mesid'));
+        if (Number.isInteger(messageIndex)) {
+          window.setTimeout(() => notifyMessageElement(messageElement), 0);
+          window.clearTimeout(pendingFallbackTimers.get(messageIndex));
+          pendingFallbackTimers.set(messageIndex, window.setTimeout(() => {
+            const currentMessageElement = document.querySelector(`#chat .mes[mesid="${messageIndex}"]`);
+            if (!currentMessageElement?.querySelector('.iig-loading-placeholder')) {
+              setLocalImagePending(messageIndex, true);
+            }
+          }, 1200));
+          window.setTimeout(() => {
+            document.querySelector(`#chat .mes[mesid="${messageIndex}"]`)?.classList.remove('iig-local-pending');
+          }, 180000);
+        }
+      }
+    };
+    const notifyImagePendingEvent = (event: Event) => {
+      const detail = (event as CustomEvent<{ messageIndex?: number; pending?: boolean }>).detail || {};
+      const messageIndex = Number(detail.messageIndex);
+      if (Number.isInteger(messageIndex)) {
+        setLocalImagePending(messageIndex, detail.pending !== false);
+      }
+    };
+    const observer = new MutationObserver((mutations) => mutations.forEach((mutation) => mutation.addedNodes.forEach(notifyPlaceholder)));
+    observer.observe(document.getElementById('chat') || document.body, { childList: true, subtree: true });
+    document.addEventListener('click', notifyRegenerateClick, true);
+    window.addEventListener('doubletrouble:iig-pending', notifyImagePendingEvent);
+    return () => {
+      observer.disconnect();
+      document.removeEventListener('click', notifyRegenerateClick, true);
+      window.removeEventListener('doubletrouble:iig-pending', notifyImagePendingEvent);
+      pendingFallbackTimers.forEach((timer) => window.clearTimeout(timer));
+    };
+  }, []);
+
+  const generationParticipants = (): GenerationParticipant[] => {
+    const byKey = new Map<string, GenerationParticipant>();
+    const addParticipant = (participant: Partial<Participant>, fallbackPersona: Persona | null = null) => {
+      const persona = participant.persona_id ? personas.find((item) => item.id === participant.persona_id) : fallbackPersona;
+      const personaName = participant.persona_name || persona?.name || participant.name || fallbackPersona?.name || '';
+      if (!personaName.trim()) {
+        return;
+      }
+      const key = participant.persona_id || participant.id || personaName.toLowerCase();
+      byKey.set(key, {
+        persona_id: participant.persona_id || persona?.id || fallbackPersona?.id || '',
+        persona_name: personaName,
+        persona_description: persona?.description || fallbackPersona?.description || '',
+        participant_id: participant.id,
+        username: participant.username,
+      });
+    };
+    connectedPlayers.forEach((participant) => addParticipant(participant));
+    addParticipant({ id: participantIdRef.current, persona_id: selectedPersona?.id || '', persona_name: selectedPersona?.name || '', name: selectedPersona?.name || '', username: authUser?.username || '' }, selectedPersona);
+    return Array.from(byKey.values());
   };
 
   const authJsonHeaders = (token = authToken) => ({ 'Content-Type': 'application/json', ...actorHeaders(token) });
@@ -761,10 +1257,37 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [presetJsonDraft, presetNameDraft, selectedPresetName, selectedPresetType, authToken, accessDenied.presets]);
 
-  const saveExtensionMessageByIndex = async (index: number, content: string) => {
+  useEffect(() => {
+    if (!generationSettingsLoadedRef.current) {
+      return;
+    }
+    const signature = JSON.stringify(generationSettings);
+    if (generationSettingsSaveSignatureRef.current === signature) {
+      return;
+    }
+    const timer = window.setTimeout(async () => {
+      const response = await fetch('/api/generation/settings', {
+        method: 'PUT',
+        headers: authJsonHeaders(),
+        body: JSON.stringify(generationSettings),
+      });
+      if (!response.ok) {
+        setConnectionMessage('Не удалось применить настройки подключения');
+        return;
+      }
+      const data = await response.json() as Partial<GenerationSettings>;
+      const nextSettings = { ...generationSettings, ...data, api_key: '', clear_api_key: false };
+      generationSettingsSaveSignatureRef.current = JSON.stringify(nextSettings);
+      setGenerationSettings(nextSettings);
+    }, 650);
+    return () => window.clearTimeout(timer);
+  }, [generationSettings]);
+
+  const saveExtensionMessageByIndex = async (index: number, content: string, expectedMessageId?: string) => {
     const chat = activeChatRef.current;
     const card = activeCardRef.current;
-    const message = chat?.messages[index];
+    const messageIndex = expectedMessageId && chat ? chat.messages.findIndex((item) => item.id === expectedMessageId) : index;
+    const message = chat?.messages[messageIndex];
     if (!chat || !card || !message || message.content === content) {
       return;
     }
@@ -779,6 +1302,10 @@ export default function App() {
     }
     const data = await response.json() as { chat: BotChat };
     setActiveChat(data.chat);
+    window.setTimeout(() => {
+      setExtensionMessageRenderVersions((current) => ({ ...current, [message.id]: (current[message.id] || 0) + 1 }));
+      setActiveChat((current) => current?.id === data.chat.id ? { ...current, messages: [...current.messages] } : current);
+    }, 0);
     if (!activeGenerationRef.current) {
       setIsGenerating(false);
       setGenerationStatus('');
@@ -867,9 +1394,12 @@ export default function App() {
       if (!response.ok) {
         return;
       }
-      const data = await response.json() as { auth_required?: boolean; access_password_required?: boolean; access_password_configured?: boolean; permissions: SecurityPermissions };
+      const data = await response.json() as { auth_required?: boolean; registration_allowed?: boolean; bot_reply_allowed?: boolean; access_password_required?: boolean; access_password_configured?: boolean; permissions: SecurityPermissions };
       setAuthRequired(Boolean(data.auth_required));
+      setRegistrationAllowed(data.registration_allowed !== false);
+      setBotReplyAllowed(data.bot_reply_allowed !== false);
       setAccessPasswordRequired(Boolean(data.access_password_required));
+      setSecurityAccessPasswordRequiredDraft(Boolean(data.access_password_required));
       setAccessPasswordConfigured(Boolean(data.access_password_configured));
       if (!data.access_password_required) {
         setAccessUnlocked(true);
@@ -887,6 +1417,7 @@ export default function App() {
     const data = await response.json().catch(() => null) as { required?: boolean; unlocked?: boolean } | null;
     const required = Boolean(data?.required);
     setAccessPasswordRequired(required);
+    setSecurityAccessPasswordRequiredDraft(required);
     setAccessUnlocked(!required || Boolean(data?.unlocked));
     if (required && !data?.unlocked && token) {
       setAccessToken('');
@@ -912,26 +1443,39 @@ export default function App() {
   };
 
   const saveSecurityPermissions = async () => {
+    const nextAccessPasswordRequired = securityAccessPasswordRequiredDraft;
+    if (nextAccessPasswordRequired && !accessPasswordConfigured && securityAccessPasswordDraft.trim().length < 4) {
+      setAuthMessage('Введите пароль доступа минимум из 4 символов перед включением защиты');
+      return;
+    }
     const response = await fetch('/api/security/permissions', {
       method: 'PUT',
       headers: authJsonHeaders(),
       body: JSON.stringify({
         auth_required: authRequired,
-        access_password_required: accessPasswordRequired,
+        registration_allowed: registrationAllowed,
+        bot_reply_allowed: botReplyAllowed,
+        access_password_required: nextAccessPasswordRequired,
         access_password: securityAccessPasswordDraft,
         permissions: securityPermissions,
       }),
     });
-    const data = await response.json().catch(() => null) as { auth_required?: boolean; access_password_required?: boolean; access_password_configured?: boolean; permissions?: SecurityPermissions; detail?: string } | null;
+    const data = await response.json().catch(() => null) as { auth_required?: boolean; registration_allowed?: boolean; bot_reply_allowed?: boolean; access_password_required?: boolean; access_password_configured?: boolean; permissions?: SecurityPermissions; detail?: string } | null;
     if (!response.ok || !data?.permissions) {
       setAuthMessage(data?.detail || 'Не удалось сохранить права');
       return;
     }
     setAuthRequired(Boolean(data.auth_required));
+    setRegistrationAllowed(data.registration_allowed !== false);
+    setBotReplyAllowed(data.bot_reply_allowed !== false);
     setAccessPasswordRequired(Boolean(data.access_password_required));
+    setSecurityAccessPasswordRequiredDraft(Boolean(data.access_password_required));
     setAccessPasswordConfigured(Boolean(data.access_password_configured));
     if (!data.access_password_required) {
       setAccessUnlocked(true);
+    } else {
+      setAccessToken('');
+      setAccessUnlocked(false);
     }
     setSecurityPermissions({ ...defaultSecurityPermissions, ...data.permissions });
     setSecurityAccessPasswordDraft('');
@@ -955,12 +1499,25 @@ export default function App() {
     if (personasResponse.ok) {
       const data = await personasResponse.json() as { personas: Persona[] };
       markAccessDenied('personas', false);
+      personasLoadedRef.current = true;
+      personasRef.current = data.personas;
       setPersonas(data.personas);
-      if (!selectedPersonaId && data.personas[0]) {
-        setSelectedPersonaId(data.personas[0].id);
+      const currentId = selectedPersonaIdRef.current || window.localStorage.getItem(SELECTED_PERSONA_STORAGE_KEY) || '';
+      const participantPersonaId = lastKnownParticipantPersonaIdRef.current;
+      const participantPersona = data.personas.find((persona) => persona.id === participantPersonaId);
+      if (participantPersona && !participantPersonaRestoredRef.current) {
+        participantPersonaRestoredRef.current = true;
+        applySelectedPersonaId(participantPersona.id);
+      } else if (sessionSnapshotReceivedRef.current && !data.personas.some((persona) => persona.id === currentId)) {
+        const nextPersona = data.personas.find((persona) => persona.active) || data.personas[0];
+        if (nextPersona) {
+          applySelectedPersonaId(nextPersona.id);
+        }
       }
     } else if (deniedResponse(personasResponse)) {
       markAccessDenied('personas', true);
+      personasLoadedRef.current = false;
+      personasRef.current = [];
       setPersonas([]);
     }
   };
@@ -971,7 +1528,10 @@ export default function App() {
       return;
     }
     const data = await response.json() as Partial<GenerationSettings>;
-    setGenerationSettings({ ...defaultGenerationSettings, ...data, api_key: '', clear_api_key: false });
+    const nextSettings = { ...defaultGenerationSettings, ...data, api_key: '', clear_api_key: false };
+    generationSettingsSaveSignatureRef.current = JSON.stringify(nextSettings);
+    generationSettingsLoadedRef.current = true;
+    setGenerationSettings(nextSettings);
   };
 
   const loadConnectionPresets = async (token = authToken) => {
@@ -990,7 +1550,7 @@ export default function App() {
     setActiveConnectionPresetName(data.active || '');
   };
 
-  const loadPresetTypes = async (token = authToken) => {
+  const loadPresetTypes = async (token = authToken, openActivePreset = true) => {
     const [typesResponse, activeResponse] = await Promise.all([authedFetch('/api/presets/types', {}, token), authedFetch('/api/presets/active', {}, token)]);
     let active: Record<string, string> = {};
     if (typesResponse.ok) {
@@ -1013,7 +1573,32 @@ export default function App() {
       setPresetJsonDraft('{}');
       return;
     }
-    await loadPresets(selectedPresetType, active[selectedPresetType], token);
+    const currentPresetType = selectedPresetTypeRef.current || selectedPresetType;
+    if (!openActivePreset) {
+      return;
+    }
+    await loadPresets(currentPresetType, active[currentPresetType], token);
+  };
+
+  const loadActivePresetDraft = async (token = authToken) => {
+    const presetType = selectedPresetTypeRef.current || selectedPresetType;
+    const response = await authedFetch(`/api/presets/${encodeURIComponent(presetType)}/active-draft`, {}, token);
+    if (!response.ok) {
+      return;
+    }
+    const data = await response.json() as { active?: Record<string, string>; name?: string; preset?: Record<string, unknown> };
+    if (data.active) {
+      setActivePresets(data.active);
+    }
+    if (!data.preset || !Object.keys(data.preset).length) {
+      return;
+    }
+    const name = data.name || data.active?.[presetType] || selectedPresetName || 'unsaved';
+    const draft = JSON.stringify(data.preset, null, 2);
+    activePresetDraftSignatureRef.current = `${presetType}:${name}:${draft}`;
+    setSelectedPresetName(name);
+    setPresetNameDraft(name);
+    setPresetJsonDraft(draft);
   };
 
   const loadPresets = async (presetType: string, presetToOpen = '', token = authToken) => {
@@ -1196,6 +1781,53 @@ export default function App() {
     markAccessDenied('lorebooks', false);
     setLorebooks(data.lorebooks);
     setLorebookBindings(data.bindings);
+  };
+
+  const reloadSelectedLorebook = async (token = authTokenRef.current) => {
+    const name = selectedLorebookNameRef.current;
+    if (!name) {
+      return;
+    }
+    const response = await authedFetch(`/api/lorebooks/${encodeURIComponent(name)}`, {}, token);
+    if (response.ok) {
+      const data = await response.json() as { book: unknown };
+      setLorebookNameDraft(name);
+      setLorebookBindingDraft((current) => ({ ...current, book: name }));
+      setLorebookJsonDraft(JSON.stringify(data.book, null, 2));
+      return;
+    }
+    if (response.status === 404) {
+      setSelectedLorebookName('');
+      setLorebookNameDraft('');
+      setLorebookJsonDraft('{\n  "entries": {}\n}');
+    }
+  };
+
+  const refreshSharedSettings = async (section = '') => {
+    const token = authTokenRef.current;
+    if (section === 'generation') {
+      await Promise.all([loadGenerationSettings(token), loadConnectionPresets(token)]);
+      return;
+    }
+    if (section === 'presets') {
+      await Promise.all([loadGenerationSettings(token), loadConnectionPresets(token), loadPresetTypes(token, false)]);
+      await loadActivePresetDraft(token);
+      return;
+    }
+    if (section === 'lorebooks') {
+      await loadLorebooks(token);
+      await reloadSelectedLorebook(token);
+      return;
+    }
+    if (section === 'keys') {
+      await loadGenerationSettings(token);
+      return;
+    }
+    if (section === 'extensions') {
+      return;
+    }
+    await Promise.all([loadGenerationSettings(token), loadConnectionPresets(token), loadPresetTypes(token), loadLorebooks(token)]);
+    await reloadSelectedLorebook(token);
   };
 
   const openLorebook = async (name: string) => {
@@ -1497,6 +2129,7 @@ export default function App() {
     body.append('personality', cardDraft.personality);
     body.append('scenario', cardDraft.scenario);
     body.append('first_message', cardDraft.firstMessage);
+    cardDraft.alternateGreetings.filter((greeting) => greeting.trim()).forEach((greeting) => body.append('alternate_greetings', greeting));
     body.append('message_example', cardDraft.messageExample);
     body.append('creator', cardDraft.creator);
     body.append('tags', cardDraft.tags);
@@ -1531,6 +2164,7 @@ export default function App() {
         personality: draft.personality,
         scenario: draft.scenario,
         first_message: draft.firstMessage,
+        alternate_greetings: draft.alternateGreetings.filter((greeting) => greeting.trim()),
         message_example: draft.messageExample,
         creator: draft.creator,
         tags: draft.tags.split(',').map((tag) => tag.trim()).filter(Boolean),
@@ -1982,13 +2616,19 @@ export default function App() {
 
   const requestBotReply = async (replaceMessageId?: string, sourceChat?: BotChat, resetSwipes = false) => {
     const chat = sourceChat || activeChat;
+    if (!replaceMessageId && !botReplyAllowed) {
+      setLibraryMessage('Кнопка "Ответ бота" отключена в настройках безопасности');
+      return;
+    }
     if (!activeCard || !chat || isGenerating) {
       setLibraryMessage('Сначала выбери карточку и чат');
       return;
     }
     activeGenerationRef.current = true;
     setIsGenerating(true);
-    setGenerationStatus(replaceMessageId ? 'Бот перегенерирует ответ...' : 'Бот думает...');
+    setGenerationStreamText('');
+    setGenerationReplaceMessageId(replaceMessageId || null);
+    setGenerationStatus(`${activeCard.name} печатает...`);
     setLibraryMessage(replaceMessageId ? 'Реролл ответа...' : 'Бот отвечает...');
     try {
       const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(chat.id)}/bot/reply`, {
@@ -1997,9 +2637,11 @@ export default function App() {
         body: JSON.stringify({
           replace_message_id: replaceMessageId || null,
           reset_swipes: resetSwipes,
+          openai_preset: selectedPresetTypeRef.current === 'openai' ? parsePresetDraft(presetJsonDraft) : null,
           persona_id: selectedPersona?.id || '',
           persona_name: selectedPersona?.name || '',
           persona_description: selectedPersona?.description || '',
+          participants: generationParticipants(),
         }),
       });
       if (!response.ok) {
@@ -2013,6 +2655,8 @@ export default function App() {
     } finally {
       activeGenerationRef.current = false;
       setIsGenerating(false);
+      setGenerationStreamText('');
+      setGenerationReplaceMessageId(null);
       setGenerationStatus('');
     }
   };
@@ -2051,14 +2695,16 @@ export default function App() {
     }
     const data = await response.json() as { persona: Persona };
     setPersonaDraft({ name: '', description: '' });
-    setSelectedPersonaId(data.persona.id);
+    participantPersonaRestoredRef.current = true;
+    applySelectedPersonaId(data.persona.id);
     setLibraryMessage('Персона создана');
     await refreshLibrary();
   };
 
   const selectLocalPersona = (personaId: string) => {
     const persona = personas.find((item) => item.id === personaId) ?? null;
-    setSelectedPersonaId(personaId);
+    participantPersonaRestoredRef.current = true;
+    applySelectedPersonaId(personaId);
     setLibraryMessage('Персона выбрана для этого браузера');
     if (persona) {
       sendRealtimeEvent({ type: 'notification', content: `выбрал персону: ${persona.name}`, persona_name: persona.name });
@@ -2104,6 +2750,7 @@ export default function App() {
       return;
     }
     if (selectedPersonaId === persona.id) {
+      selectedPersonaIdRef.current = '';
       setSelectedPersonaId('');
       window.localStorage.removeItem(SELECTED_PERSONA_STORAGE_KEY);
     }
@@ -2143,6 +2790,7 @@ export default function App() {
         authDraft={authDraft}
         setAuthDraft={setAuthDraft}
         authMessage={authMessage}
+        registrationAllowed={registrationAllowed}
         login={() => submitAuth('login')}
         register={() => submitAuth('register')}
       />
@@ -2155,6 +2803,13 @@ export default function App() {
       data-message-width={visualSettings.messageWidth}
       data-show-avatars={String(visualSettings.showAvatars)}
       data-sticky-composer={String(visualSettings.stickyComposer)}
+      data-gradients={String(visualSettings.gradients)}
+      data-glass={String(visualSettings.glass)}
+      data-texture={String(visualSettings.texture)}
+      data-panel-shadows={String(visualSettings.panelShadows)}
+      data-message-tint={String(visualSettings.messageTint)}
+      data-background-vignette={String(visualSettings.backgroundVignette)}
+      data-topbar-visible={String(topbarVisible)}
     >
       <header className={`${topbarVisible ? 'topbar topbar-visible' : 'topbar topbar-hidden'}${mobileTopbarCollapsed ? ' topbar-collapsed' : ''}`} onClick={toggleMobileTopbar}>
         <button className="menu-trigger" type="button" onClick={() => setMenuOpen(true)}>
@@ -2200,12 +2855,14 @@ export default function App() {
 
       <section className="hybrid-layout">
         <section className="chat-stage">
-          <div className="chat-scroll" id="chat">
+          <div className="chat-scroll" id="chat" onScroll={(event) => updateTopbarForScroll(event.currentTarget.scrollTop)}>
             {accessDenied.chats ? <AccessDeniedNotice /> : activeMessages.length ? activeMessages.map((message, messageIndex) => {
               const isOwnMessage = message.role === 'user' && (message.participant_id ? message.participant_id === participantIdRef.current : message.author === selectedPersona?.name);
               const messageClass = `mes ${message.role === 'assistant' ? 'message bot-message' : 'message'}${message.hidden ? ' hidden-message' : ''}${isOwnMessage ? ' own-message' : ''}`;
               const swipeCount = message.swipes?.length ?? 0;
               const canSwipe = message.role === 'assistant' && swipeCount > 1;
+              const isImagePending = Boolean(activeCard && activeChat && imagePendingMessages[imagePendingKey(activeCard.id, activeChat.id, message.id)]);
+              const visibleMessageContent = generationReplaceMessageId === message.id && generationStreamText ? generationStreamText : message.content;
               return (
                <article
                  className={messageClass}
@@ -2219,31 +2876,37 @@ export default function App() {
                   event.preventDefault();
                   void swipeBotMessage(message, event.key === 'ArrowLeft' ? -1 : 1);
                 }}
-                onTouchStart={(event) => {
-                  if (canSwipe) {
-                    swipeTouchStartRef.current[message.id] = event.touches[0]?.clientX ?? 0;
-                  }
-                }}
+                 onTouchStart={(event) => {
+                   if (canSwipe) {
+                     const touch = event.touches[0];
+                     swipeTouchStartRef.current[message.id] = touch ? { x: touch.clientX, y: touch.clientY } : { x: 0, y: 0 };
+                   }
+                 }}
                 onTouchEnd={(event) => {
                   if (!canSwipe) {
                     return;
                   }
-                  const startX = swipeTouchStartRef.current[message.id] ?? 0;
-                  const deltaX = (event.changedTouches[0]?.clientX ?? startX) - startX;
-                  delete swipeTouchStartRef.current[message.id];
-                  if (Math.abs(deltaX) > 48) {
-                    void swipeBotMessage(message, deltaX > 0 ? -1 : 1);
-                  }
+                   const start = swipeTouchStartRef.current[message.id] ?? { x: 0, y: 0 };
+                   const touch = event.changedTouches[0];
+                   const deltaX = (touch?.clientX ?? start.x) - start.x;
+                   const deltaY = (touch?.clientY ?? start.y) - start.y;
+                   delete swipeTouchStartRef.current[message.id];
+                   if (Math.abs(deltaX) > 56 && Math.abs(deltaX) > Math.abs(deltaY) * 1.6) {
+                     void swipeBotMessage(message, deltaX > 0 ? -1 : 1);
+                   }
                 }}
               >
                 <div className="message-avatar-rail">
                   {message.avatar_url ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(message.avatar_url), title: message.author })}><img src={imageSrc(message.avatar_url)} alt="" loading="lazy" /></button> : <i>{message.author.slice(0, 1) || '?'}</i>}
                   <small className="message-index">#{messageIndex}</small>
+                  <small className="message-token-count">{approxTokens(visibleMessageContent)} ток.</small>
                 </div>
                 <div className="message-actions extraMesButtons" aria-label="Действия сообщения">
                   {canSwipe ? <button className="mes_button" type="button" title="Предыдущий swipe" onClick={() => void swipeBotMessage(message, -1)}>‹</button> : null}
                   {canSwipe ? <button className="mes_button" type="button" title="Следующий swipe" onClick={() => void swipeBotMessage(message, 1)}>›</button> : null}
+                  {canSwipe ? <small className="swipe-counter">{(message.active_swipe_index ?? 0) + 1}/{swipeCount}</small> : null}
                   {message.role === 'assistant' ? <button className="mes_button" type="button" title="Новый swipe" onClick={() => void requestBotReply(message.id)}>↻</button> : null}
+                  {isImagePending ? <button className="mes_button" type="button" title="Отменить генерацию картинки" onClick={() => cancelImageGeneration(messageIndex, message)}><Icon name="x" /></button> : null}
                   <button className="mes_button" type="button" title="Редактировать" onClick={() => startEditMessage(message)}><Icon name="edit" /></button>
                   <button className="mes_button" type="button" title={message.hidden ? 'Показать' : 'Скрыть'} onClick={() => void toggleMessageHidden(message)}><Icon name={message.hidden ? 'eye' : 'eyeOff'} /></button>
                   <button className="mes_button" type="button" title="Удалить" onClick={() => void deleteChatMessage(message)}><Icon name="trash" /></button>
@@ -2264,13 +2927,12 @@ export default function App() {
                         <button type="button" title="Отмена" onClick={() => { setEditingMessageId(''); setEditingMessageText(''); }}><Icon name="x" /></button>
                       </div>
                     </div>
-                  ) : <MessageContent content={message.content} reasoning={reasoningDisplay} />}
-                  {canSwipe ? <small className="swipe-counter">Swipe {(message.active_swipe_index ?? 0) + 1}/{swipeCount}</small> : null}
+                  ) : <MessageContent key={`${message.id}:${extensionMessageRenderVersions[message.id] || 0}`} content={visibleMessageContent} reasoning={reasoningDisplay} imagePending={isImagePending} renderPendingMarkersAsSpinner={!extensionLeader} isStreaming={generationReplaceMessageId === message.id && Boolean(generationStreamText)} />}
                 </div>
               </article>
               );
             }) : <p className="empty-library">Выбери карточку и чат в меню у поля ввода или во вкладке Карточки.</p>}
-            {isGenerating ? (
+            {isGenerating && !generationReplaceMessageId ? (
               <article className="message bot-message thinking-message">
                 <div className="message-avatar-rail">
                   {activeCard?.image_url ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(activeCard.image_url), title: activeCard.name })}><img src={imageSrc(activeCard.image_url)} alt="" loading="lazy" /></button> : <i>{activeCard?.name.slice(0, 1) || '?'}</i>}
@@ -2279,7 +2941,7 @@ export default function App() {
                   <header>
                     <span className="message-name-block"><strong className="identity-name"><span>{activeCard?.name || 'Бот'}</span></strong></span>
                   </header>
-                  <div className="message-content"><p><span className="thinking-dots"><i /> <i /> <i /></span>{generationStatus || 'Бот думает...'}</p></div>
+                  {generationStreamText ? <MessageContent content={generationStreamText} reasoning={reasoningDisplay} isStreaming /> : <div className="message-content"><p><span className="thinking-dots"><i /> <i /> <i /></span>{generationStatus || `${activeCard?.name || 'Бот'} печатает...`}</p></div>}
                 </div>
               </article>
             ) : null}
@@ -2336,7 +2998,7 @@ export default function App() {
               {isGenerating ? (
                 <button className="ghost-button bot-reply-button" type="button" onClick={() => void cancelGeneration()}>Отмена</button>
               ) : (
-                <button className="ghost-button bot-reply-button" type="button" disabled={!activeChat || accessDenied.chats} onClick={() => void requestBotReply()}>Ответ бота</button>
+                <button className="ghost-button bot-reply-button" type="button" disabled={!activeChat || accessDenied.chats || !botReplyAllowed} title={!botReplyAllowed ? 'Отключено в настройках безопасности' : undefined} onClick={() => void requestBotReply()}>Ответ бота</button>
               )}
             </div>
           </form>
@@ -2422,11 +3084,16 @@ export default function App() {
           authMessage={authMessage}
           securityPermissions={securityPermissions}
           authRequired={authRequired}
+          registrationAllowed={registrationAllowed}
+          botReplyAllowed={botReplyAllowed}
           accessPasswordRequired={accessPasswordRequired}
+          securityAccessPasswordRequiredDraft={securityAccessPasswordRequiredDraft}
           accessPasswordConfigured={accessPasswordConfigured}
           securityAccessPasswordDraft={securityAccessPasswordDraft}
           setAuthRequired={setAuthRequired}
-          setAccessPasswordRequired={setAccessPasswordRequired}
+          setRegistrationAllowed={setRegistrationAllowed}
+          setBotReplyAllowed={setBotReplyAllowed}
+          setSecurityAccessPasswordRequiredDraft={setSecurityAccessPasswordRequiredDraft}
           setSecurityAccessPasswordDraft={setSecurityAccessPasswordDraft}
           setSecurityPermissions={setSecurityPermissions}
           openImagePreview={(src, title) => setImagePreview({ src: imageSrc(src), title })}
@@ -2543,11 +3210,16 @@ function MenuOverlay({
   authMessage,
   securityPermissions,
   authRequired,
+  registrationAllowed,
+  botReplyAllowed,
   accessPasswordRequired,
+  securityAccessPasswordRequiredDraft,
   accessPasswordConfigured,
   securityAccessPasswordDraft,
   setAuthRequired,
-  setAccessPasswordRequired,
+  setRegistrationAllowed,
+  setBotReplyAllowed,
+  setSecurityAccessPasswordRequiredDraft,
   setSecurityAccessPasswordDraft,
   setSecurityPermissions,
   openImagePreview,
@@ -2658,11 +3330,16 @@ function MenuOverlay({
   authMessage: string;
   securityPermissions: SecurityPermissions;
   authRequired: boolean;
+  registrationAllowed: boolean;
+  botReplyAllowed: boolean;
   accessPasswordRequired: boolean;
+  securityAccessPasswordRequiredDraft: boolean;
   accessPasswordConfigured: boolean;
   securityAccessPasswordDraft: string;
   setAuthRequired: (required: boolean) => void;
-  setAccessPasswordRequired: (required: boolean) => void;
+  setRegistrationAllowed: (allowed: boolean) => void;
+  setBotReplyAllowed: (allowed: boolean) => void;
+  setSecurityAccessPasswordRequiredDraft: (required: boolean) => void;
   setSecurityAccessPasswordDraft: (password: string) => void;
   setSecurityPermissions: (permissions: SecurityPermissions) => void;
   openImagePreview: (src: string, title: string) => void;
@@ -2806,11 +3483,16 @@ function MenuOverlay({
               authMessage={authMessage}
               securityPermissions={securityPermissions}
               authRequired={authRequired}
+              registrationAllowed={registrationAllowed}
+              botReplyAllowed={botReplyAllowed}
               accessPasswordRequired={accessPasswordRequired}
+              securityAccessPasswordRequiredDraft={securityAccessPasswordRequiredDraft}
               accessPasswordConfigured={accessPasswordConfigured}
               securityAccessPasswordDraft={securityAccessPasswordDraft}
               setAuthRequired={setAuthRequired}
-              setAccessPasswordRequired={setAccessPasswordRequired}
+              setRegistrationAllowed={setRegistrationAllowed}
+              setBotReplyAllowed={setBotReplyAllowed}
+              setSecurityAccessPasswordRequiredDraft={setSecurityAccessPasswordRequiredDraft}
               setSecurityAccessPasswordDraft={setSecurityAccessPasswordDraft}
               setSecurityPermissions={setSecurityPermissions}
               openImagePreview={openImagePreview}
@@ -2872,7 +3554,7 @@ function MenuOverlay({
   );
 }
 
-function AuthGate({ authDraft, setAuthDraft, authMessage, login, register }: { authDraft: { username: string; password: string; adminCode: string }; setAuthDraft: (draft: { username: string; password: string; adminCode: string }) => void; authMessage: string; login: () => Promise<void>; register: () => Promise<void> }) {
+function AuthGate({ authDraft, setAuthDraft, authMessage, registrationAllowed, login, register }: { authDraft: { username: string; password: string; adminCode: string }; setAuthDraft: (draft: { username: string; password: string; adminCode: string }) => void; authMessage: string; registrationAllowed: boolean; login: () => Promise<void>; register: () => Promise<void> }) {
   return (
     <main className="auth-gate-shell">
       <section className="auth-gate-card">
@@ -2886,8 +3568,9 @@ function AuthGate({ authDraft, setAuthDraft, authMessage, login, register }: { a
           <EditableField label="Пароль" type="password" value={authDraft.password} onChange={(password) => setAuthDraft({ ...authDraft, password })} />
           <div className="preset-actions">
             <button type="button" onClick={() => void login()}>Войти</button>
-            <button className="ghost-button" type="button" onClick={() => void register()}>Регистрация</button>
+            {registrationAllowed ? <button className="ghost-button" type="button" onClick={() => void register()}>Регистрация</button> : null}
           </div>
+          {!registrationAllowed ? <p className="helper-text">Регистрация на сервере отключена администратором.</p> : null}
           {authMessage ? <p className="library-message">{authMessage}</p> : null}
         </div>
       </section>
@@ -2916,11 +3599,418 @@ function AccessPasswordGate({ password, setPassword, message, unlock }: { passwo
   );
 }
 
+function KeyManager({ mode = 'panel' }: { mode?: 'panel' | 'popover' }) {
+  const [keys, setKeys] = useState<ManagedKeySummary[]>([]);
+  const [nameDrafts, setNameDrafts] = useState<Record<string, string>>({});
+  const [valueDrafts, setValueDrafts] = useState<Record<string, string>>({});
+  const [newKeyName, setNewKeyName] = useState('');
+  const [newKeyValue, setNewKeyValue] = useState('');
+  const [message, setMessage] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [open, setOpen] = useState(false);
+  const [editingKeyId, setEditingKeyId] = useState('');
+
+  const headers = (json = false) => {
+    const token = window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '';
+    const accessToken = window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || '';
+    return {
+      ...(json ? { 'Content-Type': 'application/json' } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(accessToken ? { 'X-DoubleTrouble-Access': accessToken } : {}),
+    };
+  };
+
+  const loadKeys = async () => {
+    setLoading(true);
+    try {
+      const response = await fetch('/api/keys', { headers: headers() });
+      const data = await response.json().catch(() => null) as { keys?: ManagedKeySummary[]; detail?: string } | null;
+      if (!response.ok) {
+        setMessage(response.status === 401 || response.status === 403 ? 'Нет доступа к менеджеру ключей' : data?.detail || 'Не удалось загрузить ключи');
+        return;
+      }
+      setKeys(data?.keys || []);
+      setMessage('');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadKeys();
+    const onSharedSettingsUpdated = (event: Event) => {
+      const section = (event as CustomEvent<{ section?: string }>).detail?.section || '';
+      if (!section || section === 'keys') {
+        void loadKeys();
+      }
+    };
+    window.addEventListener('doubletrouble:shared-settings-updated', onSharedSettingsUpdated);
+    return () => window.removeEventListener('doubletrouble:shared-settings-updated', onSharedSettingsUpdated);
+  }, []);
+
+  const applyKeys = (nextKeys: ManagedKeySummary[]) => {
+    setKeys(nextKeys);
+    setNameDrafts({});
+    setValueDrafts({});
+    setNewKeyName('');
+    setNewKeyValue('');
+    setEditingKeyId('');
+  };
+
+  const createKey = async () => {
+    const name = newKeyName.trim();
+    const value = newKeyValue.trim();
+    if (!name || !value) {
+      setMessage('Введите название и значение ключа');
+      return;
+    }
+    const response = await fetch('/api/keys', {
+      method: 'POST',
+      headers: headers(true),
+      body: JSON.stringify({ name, value }),
+    });
+    const data = await response.json().catch(() => null) as { keys?: ManagedKeySummary[]; detail?: string } | null;
+    if (!response.ok || !data?.keys) {
+      setMessage(data?.detail || 'Не удалось создать ключ');
+      return;
+    }
+    applyKeys(data.keys);
+    setMessage('Ключ добавлен');
+  };
+
+  const saveKey = async (key: ManagedKeySummary) => {
+    const name = (nameDrafts[key.id] ?? key.name ?? key.label).trim();
+    const value = (valueDrafts[key.id] || '').trim();
+    if (!name) {
+      setMessage('Введите название ключа');
+      return;
+    }
+    const response = await fetch(`/api/keys/${encodeURIComponent(key.id)}`, {
+      method: 'PUT',
+      headers: headers(true),
+      body: JSON.stringify({ name, value }),
+    });
+    const data = await response.json().catch(() => null) as { keys?: ManagedKeySummary[]; detail?: string } | null;
+    if (!response.ok || !data?.keys) {
+      setMessage(data?.detail || 'Не удалось сохранить ключ');
+      return;
+    }
+    applyKeys(data.keys);
+    setMessage('Ключ сохранен');
+  };
+
+  const activateKey = async (keyId: string) => {
+    const response = await fetch(`/api/keys/${encodeURIComponent(keyId)}/active`, { method: 'POST', headers: headers() });
+    const data = await response.json().catch(() => null) as { keys?: ManagedKeySummary[]; detail?: string } | null;
+    if (!response.ok || !data?.keys) {
+      setMessage(data?.detail || 'Не удалось выбрать ключ');
+      return;
+    }
+    applyKeys(data.keys);
+    setMessage('Активный ключ выбран');
+  };
+
+  const deleteKey = async (keyId: string) => {
+    const response = await fetch(`/api/keys/${encodeURIComponent(keyId)}`, { method: 'DELETE', headers: headers() });
+    const data = await response.json().catch(() => null) as { keys?: ManagedKeySummary[]; detail?: string } | null;
+    if (!response.ok || !data?.keys) {
+      setMessage(data?.detail || 'Не удалось удалить ключ');
+      return;
+    }
+    applyKeys(data.keys);
+    setMessage('Ключ удален');
+  };
+
+  const activeKey = keys.find((key) => key.active);
+  const manager = (
+    <div className={mode === 'panel' ? 'key-manager' : 'key-manager key-manager-compact'}>
+      <div className="key-manager-toolbar">
+        <div>
+          <strong>{activeKey ? activeKey.name : 'Активный ключ не выбран'}</strong>
+          <small>{activeKey?.masked || (activeKey?.configured ? 'Ключ сохранен' : 'Добавь ключ или выбери сохраненный')}</small>
+        </div>
+        <button className="ghost-button" type="button" disabled={loading} onClick={() => void loadKeys()}>Обновить</button>
+      </div>
+      <article className="key-manager-create">
+        <input value={newKeyName} placeholder="Название ключа" onChange={(event) => setNewKeyName(event.target.value)} />
+        <input type="password" value={newKeyValue} placeholder="API key" onChange={(event) => setNewKeyValue(event.target.value)} />
+        <button type="button" onClick={() => void createKey()}>Добавить</button>
+      </article>
+      {keys.length ? keys.map((key) => {
+        const configured = key.configured || key.env_configured;
+        const keyName = key.name || key.label;
+        const editing = editingKeyId === key.id;
+        return (
+          <article className={key.active ? 'key-manager-row active' : 'key-manager-row'} key={key.id}>
+            <button className={key.active ? 'key-select-button active' : 'key-select-button'} type="button" disabled={key.active || !key.configured} onClick={() => void activateKey(key.id)}>
+              <strong>{keyName}</strong>
+              <small>{key.active ? 'Активный' : configured ? 'Сделать активным' : 'Нет значения'}{key.masked ? ` · ${key.masked}` : ''}{key.env_configured ? ` · env ${key.env_name}` : ''}</small>
+            </button>
+            <div className="key-manager-actions">
+              <button className="ghost-button" type="button" onClick={() => { setEditingKeyId(editing ? '' : key.id); setNameDrafts({ ...nameDrafts, [key.id]: keyName }); }}>{editing ? 'Свернуть' : 'Править'}</button>
+              <button className="ghost-button danger-button" type="button" onClick={() => void deleteKey(key.id)}>Удалить</button>
+            </div>
+            {editing ? (
+              <div className="key-manager-edit">
+                <input className="key-name-input" value={nameDrafts[key.id] ?? keyName} aria-label="Название ключа" onChange={(event) => setNameDrafts({ ...nameDrafts, [key.id]: event.target.value })} />
+                <input type="password" value={valueDrafts[key.id] || ''} placeholder={configured ? 'Новое значение' : 'Значение ключа'} onChange={(event) => setValueDrafts({ ...valueDrafts, [key.id]: event.target.value })} />
+                <button type="button" onClick={() => void saveKey(key)}>Сохранить</button>
+              </div>
+            ) : null}
+          </article>
+        );
+      }) : <p className="empty-library">Ключи не загружены.</p>}
+      {message ? <p className="library-message">{message}</p> : null}
+    </div>
+  );
+
+  if (mode === 'popover') {
+    return (
+      <div className="field-preview api-key-field">
+        <span>API key</span>
+        <button className={open ? 'api-key-trigger active' : 'api-key-trigger'} type="button" onClick={() => setOpen(!open)}>
+          <Icon name="key" />
+          <span>
+            <strong>{activeKey ? activeKey.name : 'Менеджер ключей'}</strong>
+            <small>{activeKey?.masked || (generationKeyState(keys) || 'Открыть сохраненные ключи')}</small>
+          </span>
+        </button>
+        {open ? (
+          <div className="api-key-popover" role="dialog" aria-label="Менеджер API ключей">
+            <div className="key-popover-header">
+              <div>
+                <span className="eyebrow">Provider</span>
+                <h3>API keys</h3>
+              </div>
+              <button className="ghost-button" type="button" onClick={() => setOpen(false)}>Закрыть</button>
+            </div>
+            {manager}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  return manager;
+}
+
+function ImageKeyManager({ onApplyKey }: { onApplyKey: (apiKey: string) => void }) {
+  const [keys, setKeys] = useState<ImageKeyRecord[]>(loadImageKeys);
+  const [newKeyName, setNewKeyName] = useState('');
+  const [newKeyValue, setNewKeyValue] = useState('');
+  const [nameDrafts, setNameDrafts] = useState<Record<string, string>>({});
+  const [valueDrafts, setValueDrafts] = useState<Record<string, string>>({});
+  const [editingKeyId, setEditingKeyId] = useState('');
+  const [open, setOpen] = useState(false);
+  const [message, setMessage] = useState('');
+
+  const activeKey = keys.find((key) => key.active);
+  const persistKeys = (nextKeys: ImageKeyRecord[], nextMessage: string, applyActive = false) => {
+    setKeys(nextKeys);
+    saveImageKeys(nextKeys);
+    setNameDrafts({});
+    setValueDrafts({});
+    setNewKeyName('');
+    setNewKeyValue('');
+    setEditingKeyId('');
+    setMessage(nextMessage);
+    if (applyActive) {
+      onApplyKey(nextKeys.find((key) => key.active)?.value || '');
+    }
+  };
+
+  const createKey = () => {
+    const value = newKeyValue.trim();
+    if (!value) {
+      setMessage('Введите значение ключа');
+      return;
+    }
+    const key: ImageKeyRecord = {
+      id: window.crypto?.randomUUID?.() || `image_key_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+      name: newKeyName.trim() || `Image key ${keys.length + 1}`,
+      value,
+      active: !activeKey,
+    };
+    persistKeys([...keys, key], key.active ? 'Ключ добавлен и выбран' : 'Ключ добавлен', key.active);
+  };
+
+  const saveKey = (key: ImageKeyRecord) => {
+    const name = (nameDrafts[key.id] ?? key.name).trim() || key.name;
+    const value = (valueDrafts[key.id] || '').trim() || key.value;
+    const nextKeys = keys.map((item) => item.id === key.id ? { ...item, name, value } : item);
+    persistKeys(nextKeys, 'Ключ сохранен', key.active);
+  };
+
+  const activateKey = (keyId: string) => {
+    const nextKeys = keys.map((key) => ({ ...key, active: key.id === keyId }));
+    persistKeys(nextKeys, 'Ключ выбран для картинок', true);
+  };
+
+  const deleteKey = (keyId: string) => {
+    const wasActive = keys.some((key) => key.id === keyId && key.active);
+    const nextKeys = keys.filter((key) => key.id !== keyId).map((key, index) => ({ ...key, active: wasActive ? index === 0 : key.active }));
+    persistKeys(nextKeys, 'Ключ удален', wasActive);
+  };
+
+  const manager = (
+    <div className="key-manager key-manager-compact image-local-key-manager">
+      <div className="key-manager-toolbar">
+        <div>
+          <strong>{activeKey ? activeKey.name : 'Ключ картинок не выбран'}</strong>
+          <small>{activeKey ? maskSecret(activeKey.value) : 'Отдельные ключи image-extension'}</small>
+        </div>
+      </div>
+      <article className="key-manager-create">
+        <input value={newKeyName} placeholder="Название ключа" onChange={(event) => setNewKeyName(event.target.value)} />
+        <input type="password" value={newKeyValue} placeholder="Image API key" onChange={(event) => setNewKeyValue(event.target.value)} />
+        <button type="button" onClick={createKey}>Добавить</button>
+      </article>
+      {keys.length ? keys.map((key) => {
+        const editing = editingKeyId === key.id;
+        return (
+          <article className={key.active ? 'key-manager-row active' : 'key-manager-row'} key={key.id}>
+            <button className={key.active ? 'key-select-button active' : 'key-select-button'} type="button" disabled={key.active} onClick={() => activateKey(key.id)}>
+              <strong>{key.name}</strong>
+              <small>{key.active ? 'Активный для картинок' : 'Сделать активным'} · {maskSecret(key.value)}</small>
+            </button>
+            <div className="key-manager-actions">
+              <button className="ghost-button" type="button" onClick={() => { setEditingKeyId(editing ? '' : key.id); setNameDrafts({ ...nameDrafts, [key.id]: key.name }); }}>{editing ? 'Свернуть' : 'Править'}</button>
+              <button className="ghost-button danger-button" type="button" onClick={() => deleteKey(key.id)}>Удалить</button>
+            </div>
+            {editing ? (
+              <div className="key-manager-edit">
+                <input className="key-name-input" value={nameDrafts[key.id] ?? key.name} aria-label="Название ключа" onChange={(event) => setNameDrafts({ ...nameDrafts, [key.id]: event.target.value })} />
+                <input type="password" value={valueDrafts[key.id] || ''} placeholder="Новое значение" onChange={(event) => setValueDrafts({ ...valueDrafts, [key.id]: event.target.value })} />
+                <button type="button" onClick={() => saveKey(key)}>Сохранить</button>
+              </div>
+            ) : null}
+          </article>
+        );
+      }) : <p className="empty-library">Ключей картинок пока нет.</p>}
+      {message ? <p className="library-message">{message}</p> : null}
+    </div>
+  );
+
+  return (
+    <div className="image-key-button-wrap">
+      <button className={open ? 'ghost-button image-key-button active' : 'ghost-button image-key-button'} type="button" onClick={() => setOpen(!open)}>
+        <Icon name="key" />
+        <span>Ключи</span>
+      </button>
+      {open ? (
+        <div className="api-key-popover image-key-popover" role="dialog" aria-label="Ключи image-extension">
+          <div className="key-popover-header">
+            <div>
+              <span className="eyebrow">Images</span>
+              <h3>Ключи картинок</h3>
+            </div>
+            <button className="ghost-button" type="button" onClick={() => setOpen(false)}>Закрыть</button>
+          </div>
+          {manager}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ImageExtensionSettingsPortal({ extension, imageSettings, setImageSettings, imageEndpointPresets, selectedImageEndpointName, imageEndpointName, setImageEndpointName, applyImageEndpointPreset, saveImageEndpointPreset, saveImageSettings, applyImageKey }: { extension: ExtensionSummary | null; imageSettings: ImageExtensionSettings; setImageSettings: (settings: ImageExtensionSettings) => void; imageEndpointPresets: ImageEndpointPreset[]; selectedImageEndpointName: string; imageEndpointName: string; setImageEndpointName: (name: string) => void; applyImageEndpointPreset: (name: string) => void; saveImageEndpointPreset: () => void; saveImageSettings: () => void; applyImageKey: (apiKey: string) => void }) {
+  const [host, setHost] = useState<HTMLElement | null>(null);
+  const [imageModels, setImageModels] = useState<string[]>([]);
+  const [imageModelsLoading, setImageModelsLoading] = useState(false);
+  const [imageModelsMessage, setImageModelsMessage] = useState('');
+
+  useEffect(() => {
+    setHost(document.getElementById('extensions_settings'));
+  }, []);
+
+  if (!host || !extension) {
+    return null;
+  }
+
+  const loadImageModels = async () => {
+    setImageModelsLoading(true);
+    setImageModelsMessage('');
+    try {
+      const existingSettings = loadRawImageExtensionSettings();
+      const token = window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '';
+      const response = await fetch('/api/image-generation/models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({
+          api_type: imageSettings.apiType,
+          endpoint: imageSettings.endpoint,
+          api_key: imageSettings.apiKey.trim() || String(existingSettings.apiKey || ''),
+          timeout_seconds: 30,
+        }),
+      });
+      const data = await response.json().catch(() => null) as { ok?: boolean; error?: string; models?: unknown } | null;
+      if (!response.ok || !data?.ok) {
+        setImageModels([]);
+        setImageModelsMessage(data?.error || 'Не удалось загрузить модели');
+        return;
+      }
+      const modelNames = extractModelNames(data.models);
+      setImageModels(modelNames);
+      setImageModelsMessage(modelNames.length ? `Загружено моделей: ${modelNames.length}` : 'Провайдер вернул пустой список');
+    } finally {
+      setImageModelsLoading(false);
+    }
+  };
+
+  return createPortal(
+    <section className="image-extension-settings-panel image-extension-settings-portal" data-dt-extension-owner={extension.external_name}>
+      <div className="image-extension-settings-header">
+        <div>
+          <strong>Подключение картинок</strong>
+          <small>DoubleTrouble: сохраненные endpoints и отдельные ключи для SillyImages.</small>
+        </div>
+        <ImageKeyManager onApplyKey={applyImageKey} />
+      </div>
+      <div className="image-endpoint-row">
+        <select value={selectedImageEndpointName} onChange={(event) => applyImageEndpointPreset(event.target.value)}>
+          <option value="">Выбрать endpoint</option>
+          {imageEndpointPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}</option>)}
+        </select>
+        <input value={imageEndpointName} placeholder="Имя endpoint" onChange={(event) => setImageEndpointName(event.target.value)} />
+        <button className="ghost-button tiny-button" type="button" onClick={saveImageEndpointPreset}>Сохр.</button>
+      </div>
+      <div className="key-manager-edit image-extension-fields">
+        <select value={imageSettings.apiType} onChange={(event) => setImageSettings({ ...imageSettings, apiType: event.target.value })}>
+          <option value="openai">OpenAI Images</option>
+          <option value="gemini">Gemini / nano-banana</option>
+          <option value="naistera">Naistera</option>
+        </select>
+        <input value={imageSettings.endpoint} placeholder="Endpoint URL" onChange={(event) => setImageSettings({ ...imageSettings, endpoint: event.target.value })} />
+        <div className="image-model-picker-row">
+          <input value={imageSettings.model} list="image-model-options" placeholder="Model" onChange={(event) => setImageSettings({ ...imageSettings, model: event.target.value })} />
+          <datalist id="image-model-options">
+            {imageModels.map((model) => <option value={model} key={model} />)}
+          </datalist>
+          <button className="ghost-button tiny-button" type="button" disabled={imageModelsLoading} onClick={() => void loadImageModels()}>{imageModelsLoading ? '...' : 'Модели'}</button>
+        </div>
+        <input type="password" value={imageSettings.apiKey} placeholder="API key (оставь пустым, чтобы не менять)" onChange={(event) => setImageSettings({ ...imageSettings, apiKey: event.target.value })} />
+        <button type="button" onClick={saveImageSettings}>Применить</button>
+      </div>
+      {imageModelsMessage ? <small className="helper-text">{imageModelsMessage}</small> : null}
+    </section>,
+    host,
+  );
+}
+
+function generationKeyState(keys: ManagedKeySummary[]) {
+  if (!keys.length) {
+    return '';
+  }
+  return keys.some((key) => key.configured || key.env_configured) ? 'Есть сохраненные ключи' : 'Ключи не заданы';
+}
+
 function ExtensionsManager() {
   const [extensions, setExtensions] = useState<ExtensionSummary[]>([]);
-  const [source, setSource] = useState('');
-  const [name, setName] = useState('');
-  const [overwrite, setOverwrite] = useState(false);
+  const [builtInSettings, setBuiltInSettings] = useState(loadBuiltInExtensionSettings);
+  const [imageSettings, setImageSettings] = useState(loadImageExtensionSettings);
+  const [imageEndpointPresets, setImageEndpointPresets] = useState(loadImageEndpointPresets);
+  const [selectedImageEndpointName, setSelectedImageEndpointName] = useState('');
+  const [imageEndpointName, setImageEndpointName] = useState('');
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -2932,7 +4022,6 @@ function ExtensionsManager() {
     };
   };
 
-  const reloadClient = () => window.setTimeout(() => window.location.reload(), 700);
   const openExtensionSettingsPanel = (extension: ExtensionSummary) => window.dispatchEvent(new CustomEvent('doubletrouble:extension-settings-open', { detail: { name: extension.external_name } }));
 
   const loadExtensions = async () => {
@@ -2945,6 +4034,14 @@ function ExtensionsManager() {
       }
       const data = await response.json() as { extensions: ExtensionSummary[] };
       setExtensions(data.extensions);
+      const noriMynExtension = data.extensions.find((extension) => extension.name === 'norimyn-infoblock' || extension.external_name.includes('norimyn-infoblock'));
+      if (noriMynExtension) {
+        setBuiltInSettings((current) => {
+          const nextSettings = { ...current, noriMynInfoblock: noriMynExtension.enabled };
+          window.localStorage.setItem(BUILT_IN_EXTENSIONS_STORAGE_KEY, JSON.stringify(nextSettings));
+          return nextSettings;
+        });
+      }
       setMessage('');
     } finally {
       setLoading(false);
@@ -2953,33 +4050,17 @@ function ExtensionsManager() {
 
   useEffect(() => {
     void loadExtensions();
+    const onSharedSettingsUpdated = (event: Event) => {
+      const section = (event as CustomEvent<{ section?: string }>).detail?.section || '';
+      if (!section || section === 'extensions') {
+        void loadExtensions();
+      }
+    };
+    window.addEventListener('doubletrouble:shared-settings-updated', onSharedSettingsUpdated);
+    return () => window.removeEventListener('doubletrouble:shared-settings-updated', onSharedSettingsUpdated);
   }, []);
 
-  const installExtension = async () => {
-    if (!source.trim()) {
-      setMessage('Укажи Git URL или локальный путь к папке расширения');
-      return;
-    }
-    setLoading(true);
-    try {
-      const response = await fetch('/api/extensions/install', {
-        method: 'POST',
-        headers: headers(true),
-        body: JSON.stringify({ source, name, enabled: true, overwrite }),
-      });
-      const data = await response.json().catch(() => null) as { detail?: string } | null;
-      if (!response.ok) {
-        setMessage(data?.detail || 'Не удалось установить расширение');
-        return;
-      }
-      setMessage('Расширение установлено. Перезагрузка страницы...');
-      reloadClient();
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const setEnabled = async (extension: ExtensionSummary, enabled: boolean) => {
+  const setEnabled = async (extension: ExtensionSummary, enabled: boolean): Promise<boolean> => {
     setLoading(true);
     try {
       const response = await fetch(`/api/extensions/${encodeURIComponent(extension.name)}/enabled`, {
@@ -2989,13 +4070,82 @@ function ExtensionsManager() {
       });
       if (!response.ok) {
         setMessage('Не удалось изменить состояние расширения');
-        return;
+        return false;
       }
-      setMessage(`${enabled ? 'Включено' : 'Выключено'}. Перезагрузка страницы...`);
-      reloadClient();
+      setExtensions((current) => current.map((item) => item.name === extension.name ? { ...item, enabled } : item));
+      setMessage(`${enabled ? 'Включено' : 'Выключено'}. Старые сообщения не перерендериваются.`);
+      return true;
     } finally {
       setLoading(false);
     }
+  };
+
+  const setNoriMynEnabled = async (extension: ExtensionSummary | null, enabled: boolean) => {
+    if (extension && !(await setEnabled(extension, enabled))) {
+      return;
+    }
+    const nextSettings = { ...builtInSettings, noriMynInfoblock: enabled };
+    setBuiltInSettings(nextSettings);
+    window.localStorage.setItem(BUILT_IN_EXTENSIONS_STORAGE_KEY, JSON.stringify(nextSettings));
+    setMessage(`${enabled ? 'Включено' : 'Выключено'}. Новые сообщения применят настройку без перезагрузки.`);
+  };
+
+  const persistImageSettings = (settings: ImageExtensionSettings, messageText = '', clearApiKeyDraft = false) => {
+    const existingSettings = loadRawImageExtensionSettings();
+    const apiKey = settings.apiKey.trim() || String(existingSettings.apiKey || '');
+    const sharedSettings = {
+      ...existingSettings,
+      apiType: settings.apiType,
+      endpoint: settings.endpoint.trim(),
+      model: settings.model.trim(),
+      ...(apiKey ? { apiKey } : {}),
+    };
+    updateSillyTavernExtensionSettings({
+      sillyimages: sharedSettings,
+    });
+    syncImageExtensionSettingsDom(sharedSettings);
+    if (clearApiKeyDraft) {
+      setImageSettings((current) => ({ ...current, apiKey: '' }));
+    }
+    if (messageText) {
+      setMessage(messageText);
+    }
+  };
+
+  const updateImageSettings = (nextSettings: ImageExtensionSettings) => {
+    setImageSettings(nextSettings);
+    persistImageSettings(nextSettings);
+  };
+
+  const saveImageSettings = () => {
+    persistImageSettings(imageSettings, 'Настройки картинок сохранены локально для расширения.', true);
+  };
+
+  const applyImageKey = (apiKey: string) => {
+    persistImageSettings({ ...imageSettings, apiKey });
+    setImageSettings((current) => ({ ...current, apiKey: '' }));
+    setMessage(apiKey ? 'Ключ картинок выбран отдельно от ключей подключения.' : 'Активный ключ картинок очищен.');
+  };
+
+  const applyImageEndpointPreset = (name: string) => {
+    setSelectedImageEndpointName(name);
+    const preset = imageEndpointPresets.find((item) => item.name === name);
+    if (!preset) {
+      return;
+    }
+    setImageEndpointName(preset.name);
+    updateImageSettings({ ...imageSettings, apiType: preset.apiType, endpoint: preset.endpoint, model: preset.model });
+  };
+
+  const saveImageEndpointPreset = () => {
+    const name = (imageEndpointName.trim() || imageSettings.model.trim() || imageSettings.endpoint.trim() || imageSettings.apiType).slice(0, 80);
+    const preset = { name, apiType: imageSettings.apiType, endpoint: imageSettings.endpoint.trim(), model: imageSettings.model.trim() };
+    const nextPresets = [...imageEndpointPresets.filter((item) => item.name.toLowerCase() !== name.toLowerCase()), preset].sort((left, right) => left.name.localeCompare(right.name));
+    setImageEndpointPresets(nextPresets);
+    saveImageEndpointPresets(nextPresets);
+    setSelectedImageEndpointName(name);
+    setImageEndpointName(name);
+    setMessage('Endpoint картинок сохранен.');
   };
 
   const deleteExtension = async (extension: ExtensionSummary) => {
@@ -3006,23 +4156,25 @@ function ExtensionsManager() {
         setMessage('Не удалось удалить расширение');
         return;
       }
-      setMessage('Расширение удалено. Перезагрузка страницы...');
-      reloadClient();
+      setExtensions((current) => current.filter((item) => item.name !== extension.name));
+      setMessage('Расширение удалено из списка. Если его скрипт уже загружен, обнови страницу вручную.');
     } finally {
       setLoading(false);
     }
   };
 
+  const inlineImageExtension = extensions.find((extension) => extension.name === 'sillyimages' || extension.external_name.includes('sillyimages')) || null;
+  const noriMynExtension = extensions.find((extension) => extension.name === 'norimyn-infoblock' || extension.external_name.includes('norimyn-infoblock')) || null;
+  const noriMynEnabled = noriMynExtension?.enabled ?? builtInSettings.noriMynInfoblock;
+  const thirdPartyExtensions = extensions.filter((extension) => extension.type !== 'system' && extension !== inlineImageExtension && extension !== noriMynExtension);
+
   return (
     <section className="extensions-manager">
       <div className="extension-install-card">
-        <EditableField label="Git URL или локальный путь" value={source} onChange={setSource} />
-        <TwoColumns
-          left={<EditableField label="Имя папки (опционально)" value={name} onChange={setName} />}
-          right={<ToggleRow label="Перезаписать, если уже установлено" checked={overwrite} onChange={setOverwrite} />}
-        />
+        <span className="extension-warning">Пока не работает стабильно</span>
+        <p className="helper-text">Установка расширений по ссылке, локальному пути или файлом временно отключена, чтобы не ломать чат и генерацию картинок. Сторонние расширения можно просмотреть в списке ниже.</p>
         <div className="preset-actions">
-          <button type="button" disabled={loading} onClick={() => void installExtension()}>Установить</button>
+          <button type="button" disabled>Установка отключена</button>
           <button className="ghost-button" type="button" disabled={loading} onClick={() => void loadExtensions()}>Обновить список</button>
         </div>
       </div>
@@ -3030,7 +4182,13 @@ function ExtensionsManager() {
       {message ? <p className="library-message">{message}</p> : null}
 
       <div className="extension-list">
-        {extensions.length ? extensions.map((extension) => {
+        <div className="preset-title-row">
+          <div>
+            <span className="eyebrow">Сторонние</span>
+            <h3>Установленные расширения</h3>
+          </div>
+        </div>
+        {thirdPartyExtensions.length ? thirdPartyExtensions.map((extension) => {
           const manifest = extension.manifest || {};
           return (
             <article className={extension.enabled ? 'extension-row enabled' : 'extension-row'} key={extension.name}>
@@ -3040,14 +4198,57 @@ function ExtensionsManager() {
                 <small>{extension.source || 'local install'}</small>
               </div>
               <div className="extension-row-actions">
-                <span className={extension.enabled ? 'extension-status enabled' : 'extension-status'}>{extension.enabled ? 'Включено' : 'Выключено'}</span>
+                <span className="extension-status">Пока не работает</span>
                 <button className="ghost-button" type="button" disabled={loading || !extension.enabled} onClick={() => openExtensionSettingsPanel(extension)}>Настройки</button>
                 <button type="button" disabled={loading} onClick={() => void setEnabled(extension, !extension.enabled)}>{extension.enabled ? 'Выключить' : 'Включить'}</button>
                 <button className="ghost-button danger-button" type="button" disabled={loading} onClick={() => void deleteExtension(extension)}>Удалить</button>
               </div>
             </article>
           );
-        }) : <EmptyLibrary text="Расширений пока нет. Установи папку с manifest.json или Git URL." />}
+        }) : <EmptyLibrary text="Сторонних расширений пока нет. Установка временно отключена." />}
+      </div>
+
+      <div className="extension-list">
+        <div className="preset-title-row">
+          <div>
+            <span className="eyebrow">Встроенные</span>
+            <h3>Расширения DoubleTrouble</h3>
+          </div>
+        </div>
+        <article className={inlineImageExtension?.enabled ? 'extension-row enabled' : 'extension-row'}>
+          <div className="extension-row-main">
+            <strong>{inlineImageExtension?.manifest.display_name || 'SillyImages'}</strong>
+            <small>Генерация картинок из HTML-блоков с [IMG:GEN]. Toggle не перезагружает страницу, чтобы не трогать старые сообщения.</small>
+          </div>
+          <div className="extension-row-actions">
+            <span className={inlineImageExtension?.enabled ? 'extension-status enabled' : 'extension-status'}>{inlineImageExtension?.enabled ? 'Включено' : 'Выключено'}</span>
+            <button className="ghost-button" type="button" disabled={loading || !inlineImageExtension?.enabled} onClick={() => inlineImageExtension && openExtensionSettingsPanel(inlineImageExtension)}>Настройки</button>
+            <button type="button" disabled={loading || !inlineImageExtension} onClick={() => inlineImageExtension && void setEnabled(inlineImageExtension, !inlineImageExtension.enabled)}>{inlineImageExtension?.enabled ? 'Выключить' : 'Включить'}</button>
+          </div>
+        </article>
+        <ImageExtensionSettingsPortal
+          extension={inlineImageExtension}
+          imageSettings={imageSettings}
+          setImageSettings={updateImageSettings}
+          imageEndpointPresets={imageEndpointPresets}
+          selectedImageEndpointName={selectedImageEndpointName}
+          imageEndpointName={imageEndpointName}
+          setImageEndpointName={setImageEndpointName}
+          applyImageEndpointPreset={applyImageEndpointPreset}
+          saveImageEndpointPreset={saveImageEndpointPreset}
+          saveImageSettings={saveImageSettings}
+          applyImageKey={applyImageKey}
+        />
+        <article className={noriMynEnabled ? 'extension-row enabled' : 'extension-row'}>
+          <div className="extension-row-main">
+            <strong>NoriMyn Infoblock</strong>
+            <small>Встроенный рендер инфоблока сцены и персонажей в сообщениях.</small>
+          </div>
+          <div className="extension-row-actions">
+            <span className={noriMynEnabled ? 'extension-status enabled' : 'extension-status'}>{noriMynEnabled ? 'Включено' : 'Выключено'}</span>
+            <button type="button" disabled={loading} onClick={() => void setNoriMynEnabled(noriMynExtension, !noriMynEnabled)}>{noriMynEnabled ? 'Выключить' : 'Включить'}</button>
+          </div>
+        </article>
       </div>
     </section>
   );
@@ -3108,11 +4309,16 @@ function SettingsSection({
   authMessage,
   securityPermissions,
   authRequired,
+  registrationAllowed,
+  botReplyAllowed,
   accessPasswordRequired,
+  securityAccessPasswordRequiredDraft,
   accessPasswordConfigured,
   securityAccessPasswordDraft,
   setAuthRequired,
-  setAccessPasswordRequired,
+  setRegistrationAllowed,
+  setBotReplyAllowed,
+  setSecurityAccessPasswordRequiredDraft,
   setSecurityAccessPasswordDraft,
   setSecurityPermissions,
   openImagePreview,
@@ -3221,11 +4427,16 @@ function SettingsSection({
   authMessage: string;
   securityPermissions: SecurityPermissions;
   authRequired: boolean;
+  registrationAllowed: boolean;
+  botReplyAllowed: boolean;
   accessPasswordRequired: boolean;
+  securityAccessPasswordRequiredDraft: boolean;
   accessPasswordConfigured: boolean;
   securityAccessPasswordDraft: string;
   setAuthRequired: (required: boolean) => void;
-  setAccessPasswordRequired: (required: boolean) => void;
+  setRegistrationAllowed: (allowed: boolean) => void;
+  setBotReplyAllowed: (allowed: boolean) => void;
+  setSecurityAccessPasswordRequiredDraft: (required: boolean) => void;
   setSecurityAccessPasswordDraft: (password: string) => void;
   setSecurityPermissions: (permissions: SecurityPermissions) => void;
   openImagePreview: (src: string, title: string) => void;
@@ -3508,6 +4719,7 @@ function SettingsSection({
           <div>
             <span className="eyebrow">SillyTavern compatible</span>
             <h3>{selectedPresetType === 'openai' ? 'Пресеты для OpenAI' : 'Пресеты SillyTavern'}</h3>
+            <TokenBadge count={approxTokens(presetJsonDraft)} label="токенов в JSON" />
           </div>
           <button className="ghost-button" type="button" onClick={() => void importSillyTavernDefaults()}>Импорт дефолтов ST</button>
         </div>
@@ -3648,7 +4860,7 @@ function SettingsSection({
 
   if (section === 'connection') {
     return (
-      <div className="form-stack">
+      <div className="form-stack connection-settings-panel">
         {accessDenied.presets ? <AccessDeniedNotice /> : null}
         <TwoColumns
           left={(
@@ -3661,16 +4873,22 @@ function SettingsSection({
             </label>
           )}
           right={(
-            <label className="field-preview">
+            <div className="field-preview delete-preset-field">
               <span>Удалить пресет</span>
-              <select value={presetToDelete} onChange={(event) => setPresetToDelete(event.target.value)}>
-                <option value="">Выбрать</option>
-                {connectionPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}</option>)}
-              </select>
-              <button type="button" onClick={() => void deleteConnectionPreset(presetToDelete)}>Удалить</button>
-            </label>
+              <div className="delete-preset-row">
+                <select value={presetToDelete} onChange={(event) => setPresetToDelete(event.target.value)}>
+                  <option value="">Выбрать</option>
+                  {connectionPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}</option>)}
+                </select>
+                <button type="button" onClick={() => void deleteConnectionPreset(presetToDelete)}>Удалить</button>
+              </div>
+            </div>
           )}
         />
+        <div className="connection-save-row">
+          <EditableField label="Название пресета для сохранения" value={connectionPresetName} onChange={setConnectionPresetName} />
+          <button type="button" onClick={() => void saveGenerationSettings()}>Сохранить подключение</button>
+        </div>
         <label className="field-preview">
           <span>Метод подключения</span>
           <select value={generationSettings.provider} onChange={(event) => setGenerationSettings({ ...generationSettings, provider: event.target.value })}>
@@ -3681,51 +4899,79 @@ function SettingsSection({
         <p className="helper-text">Имя и аватар бота берутся из выбранной карточки. Имя и аватар игрока берутся из локально выбранной персоны.</p>
         <TwoColumns
           left={(
-            <label className="field-preview">
+            <label className="field-preview model-field">
               <span>Model</span>
-              <input list="model-options" value={generationSettings.model} onChange={(event) => setGenerationSettings({ ...generationSettings, model: event.target.value })} />
-              <datalist id="model-options">
-                {models.map((model) => <option value={model} key={model} />)}
-              </datalist>
+              <input value={generationSettings.model} onChange={(event) => setGenerationSettings({ ...generationSettings, model: event.target.value })} />
+              <select className="model-picker" value={models.includes(generationSettings.model) ? generationSettings.model : ''} disabled={!models.length} onChange={(event) => event.target.value && setGenerationSettings({ ...generationSettings, model: event.target.value })}>
+                <option value="">{models.length ? 'Выбрать из загруженных моделей' : 'Список моделей еще не загружен'}</option>
+                {models.map((model) => <option value={model} key={model}>{model}</option>)}
+              </select>
+              <button className="ghost-button model-load-button" type="button" onClick={() => void checkConnection()}>Запросить модели / проверить</button>
+              {connectionMessage ? <p className="library-message connection-message-inline">{connectionMessage}</p> : null}
             </label>
           )}
-          right={<EditableField label={generationSettings.api_key_configured ? 'API key (сохранен)' : 'API key'} value={generationSettings.api_key} onChange={(api_key) => setGenerationSettings({ ...generationSettings, api_key })} />}
+          right={<KeyManager mode="popover" />}
         />
         <EditableTextArea label="System prompt" value={generationSettings.system_prompt} onChange={(system_prompt) => setGenerationSettings({ ...generationSettings, system_prompt })} />
         <TwoColumns
           left={<EditableField label="Temperature" value={String(generationSettings.temperature)} onChange={(temperature) => setGenerationSettings({ ...generationSettings, temperature: Number(temperature) || 0 })} />}
           right={<EditableField label="Max tokens" value={String(generationSettings.max_tokens)} onChange={(maxTokens) => setGenerationSettings({ ...generationSettings, max_tokens: Number(maxTokens) || 1 })} />}
         />
-        <ToggleRow label="Очистить сохраненный API key" checked={generationSettings.clear_api_key} onChange={(clear_api_key) => setGenerationSettings({ ...generationSettings, clear_api_key })} />
-        <EditableField label="Название пресета для сохранения" value={connectionPresetName} onChange={setConnectionPresetName} />
-        {connectionMessage ? <p className="library-message">{connectionMessage}</p> : null}
-        <TwoColumns left={<button type="button" onClick={() => void saveGenerationSettings()}>Сохранить подключение</button>} right={<button type="button" onClick={() => void checkConnection()}>Запросить модели / проверить</button>} />
       </div>
     );
   }
 
   if (section === 'visual') {
+    const activeTheme = themes.find((theme) => theme.id === visualSettings.theme) || themes[0];
     return (
       <div className="form-stack visual-settings">
-        <section className="visual-group">
-          <h3>Тема</h3>
-          <div className="theme-grid">
-            {themes.map((theme) => (
-              <button
-                className={visualSettings.theme === theme.id ? 'theme-card active' : 'theme-card'}
-                key={theme.id}
-                type="button"
-                onClick={() => setVisualSettings({ ...visualSettings, theme: theme.id })}
-              >
-                <span className="theme-swatches">
-                  {theme.swatches.map((swatch) => <i key={swatch} style={{ background: swatch }} />)}
-                </span>
-                <strong>{theme.name}</strong>
-                <small>{theme.description}</small>
-              </button>
-            ))}
+        <details className="visual-group theme-details">
+          <summary>
+            <span className="theme-summary-label">Тема</span>
+            <strong>{activeTheme.name}</strong>
+            <span className="theme-summary-action">Палитры</span>
+          </summary>
+          <div className="theme-columns">
+            <section className="theme-column">
+              <h4>Темные</h4>
+              <div className="theme-grid">
+                {darkThemes.map((theme) => (
+                  <button
+                    className={visualSettings.theme === theme.id ? 'theme-card active' : 'theme-card'}
+                    key={theme.id}
+                    type="button"
+                    onClick={() => setVisualSettings({ ...visualSettings, theme: theme.id })}
+                  >
+                    <span className="theme-swatches">
+                      {theme.swatches.map((swatch) => <i key={swatch} style={{ background: swatch }} />)}
+                    </span>
+                    <strong>{theme.name}</strong>
+                    <small>{theme.description}</small>
+                  </button>
+                ))}
+              </div>
+            </section>
+            <section className="theme-column">
+              <h4>Светлые</h4>
+              <div className="theme-grid">
+                {lightThemes.map((theme) => (
+                  <button
+                    className={visualSettings.theme === theme.id ? 'theme-card active' : 'theme-card'}
+                    key={theme.id}
+                    type="button"
+                    onClick={() => setVisualSettings({ ...visualSettings, theme: theme.id })}
+                  >
+                    <span className="theme-swatches">
+                      {theme.swatches.map((swatch) => <i key={swatch} style={{ background: swatch }} />)}
+                    </span>
+                    <strong>{theme.name}</strong>
+                    <small>{theme.description}</small>
+                  </button>
+                ))}
+              </div>
+            </section>
           </div>
-        </section>
+        </details>
 
         <section className="visual-group">
           <h3>Читаемость</h3>
@@ -3777,7 +5023,17 @@ function SettingsSection({
           <ToggleRow label="Легкие анимации" checked={visualSettings.motion} onChange={(motion) => setVisualSettings({ ...visualSettings, motion })} />
           <ToggleRow label="Высокий контраст" checked={visualSettings.highContrast} onChange={(highContrast) => setVisualSettings({ ...visualSettings, highContrast })} />
           <ToggleRow label="Аватары в списках" checked={visualSettings.showAvatars} onChange={(showAvatars) => setVisualSettings({ ...visualSettings, showAvatars })} />
-          <ToggleRow label="Закрепить поле ввода" checked={visualSettings.stickyComposer} onChange={(stickyComposer) => setVisualSettings({ ...visualSettings, stickyComposer })} />
+          <ToggleRow label="Закрепить окно чата" checked={visualSettings.stickyComposer} onChange={(stickyComposer) => setVisualSettings({ ...visualSettings, stickyComposer })} />
+        </section>
+
+        <section className="visual-group">
+          <h3>Украшения</h3>
+          <ToggleRow label="Декоративные градиенты" checked={visualSettings.gradients} onChange={(gradients) => setVisualSettings({ ...visualSettings, gradients })} />
+          <ToggleRow label="Стеклянные панели" checked={visualSettings.glass} onChange={(glass) => setVisualSettings({ ...visualSettings, glass })} />
+          <ToggleRow label="Легкая текстура фона" checked={visualSettings.texture} onChange={(texture) => setVisualSettings({ ...visualSettings, texture })} />
+          <ToggleRow label="Мягкие тени панелей" checked={visualSettings.panelShadows} onChange={(panelShadows) => setVisualSettings({ ...visualSettings, panelShadows })} />
+          <ToggleRow label="Легкая подсветка сообщений" checked={visualSettings.messageTint} onChange={(messageTint) => setVisualSettings({ ...visualSettings, messageTint })} />
+          <ToggleRow label="Виньетка фона" checked={visualSettings.backgroundVignette} onChange={(backgroundVignette) => setVisualSettings({ ...visualSettings, backgroundVignette })} />
         </section>
 
         <button type="button" onClick={() => setVisualSettings(defaultVisualSettings)}>Сбросить визуал</button>
@@ -3799,6 +5055,7 @@ function SettingsSection({
           <div>
             <span className="eyebrow">SillyTavern World Info</span>
             <h3>Лорбуки</h3>
+            <TokenBadge count={lorebookTokenCount(lorebookEntries)} label="токенов entries" />
           </div>
           <button className="ghost-button" type="button" onClick={() => void exportLorebook()}>Экспорт ST JSON</button>
         </div>
@@ -3841,7 +5098,7 @@ function SettingsSection({
                     <span className="prompt-kind">{disabled ? '×' : '◆'}</span>
                     <div className="prompt-main">
                       <strong>{String(entry.comment || `Entry ${uid}`)}</strong>
-                      <small>uid {uid} · {lorebookPositionLabel(entry.position)} · order {String(entry.order ?? 100)} · {csvFromArray(entry.key).join(', ') || 'без ключей'}</small>
+                      <small>uid {uid} · {lorebookPositionLabel(entry.position)} · order {String(entry.order ?? 100)} · {entryTokenCount(entry)} ток. · {csvFromArray(entry.key).join(', ') || 'без ключей'}</small>
                     </div>
                     <div className="lore-entry-actions">
                       <button className="prompt-icon" type="button" title="Редактировать" onClick={() => setEditingLoreEntryUid(isEditing ? '' : uid)}><Icon name="edit" /></button>
@@ -3854,7 +5111,7 @@ function SettingsSection({
                         <div className="prompt-edit-header">
                           <div>
                             <h4>{String(entry.comment || `Entry ${uid}`)}</h4>
-                            <small>Все поля сохраняются обратно в ST-compatible `entries[uid]`.</small>
+                            <small>Все поля сохраняются обратно в ST-compatible `entries[uid]`. {entryTokenCount(entry)} ток.</small>
                           </div>
                           <button className="ghost-button" type="button" onClick={() => setEditingLoreEntryUid('')}>Закрыть</button>
                         </div>
@@ -3971,6 +5228,11 @@ function SettingsSection({
           <details className="create-card-panel">
             <summary>Новая / импорт</summary>
             <div className="form-stack">
+              <label className="upload-card">
+                <span>Импорт ST PNG / JSON</span>
+                <small>PNG с metadata или JSON character card; JSON будет сохранен как PNG-заглушка с metadata.</small>
+                <input type="file" accept="image/png,application/json,.json" onChange={(event) => { void importCard(event.target.files?.[0] ?? null); event.target.value = ''; }} />
+              </label>
               <TwoColumns
                 left={<EditableField label="Имя" value={cardDraft.name} onChange={(name) => setCardDraft({ ...cardDraft, name })} />}
                 right={<EditableField label="Теги" value={cardDraft.tags} onChange={(tags) => setCardDraft({ ...cardDraft, tags })} />}
@@ -3981,6 +5243,8 @@ function SettingsSection({
                 right={<EditableTextArea label="Scenario" value={cardDraft.scenario} onChange={(scenario) => setCardDraft({ ...cardDraft, scenario })} />}
               />
               <EditableTextArea label="First message" value={cardDraft.firstMessage} onChange={(firstMessage) => setCardDraft({ ...cardDraft, firstMessage })} />
+              <AlternateGreetingsEditor value={cardDraft.alternateGreetings} onChange={(alternateGreetings) => setCardDraft({ ...cardDraft, alternateGreetings })} />
+              <TokenBadge count={cardDraftTokenCount(cardDraft)} label="токенов карточки" />
               <TwoColumns
                 left={<EditableTextArea label="Example dialogue" value={cardDraft.messageExample} onChange={(messageExample) => setCardDraft({ ...cardDraft, messageExample })} />}
                 right={<EditableField label="Creator" value={cardDraft.creator} onChange={(creator) => setCardDraft({ ...cardDraft, creator })} />}
@@ -3995,10 +5259,6 @@ function SettingsSection({
                   </label>
                 )}
               />
-              <label className="upload-card">
-                <span>Импорт ST PNG</span>
-                <input type="file" accept="image/png" onChange={(event) => void importCard(event.target.files?.[0] ?? null)} />
-              </label>
             </div>
           </details>
 
@@ -4017,7 +5277,8 @@ function SettingsSection({
             <button className="avatar-preview-button card-image-button" type="button" onClick={() => openImagePreview(activeCard.image_url, activeCard.name)}><img src={imageSrc(activeCard.image_url)} alt="" loading="lazy" /></button>
             <div>
               <span className="eyebrow">Выбранная карточка</span>
-              <strong>{activeCard.name}</strong>
+                <strong>{activeCard.name}</strong>
+                <TokenBadge count={cardTokenCount(activeCard)} label="токенов" />
               <p>{activeCard.description || activeCard.first_message || 'Описание отсутствует.'}</p>
               <button type="button" onClick={() => void createBotChat()}>Новый чат с этой карточкой</button>
             </div>
@@ -4027,9 +5288,12 @@ function SettingsSection({
         {editingCard ? (
           <section className="card-edit-panel">
             <div className="panel-heading compact-heading">
-              <div>
+              <div className="editing-card-heading">
+                <button className="avatar-preview-button card-image-button" type="button" onClick={() => openImagePreview(editingCard.image_url, editingCard.name)}><img src={imageSrc(editingCard.image_url)} alt="" loading="lazy" /></button>
+                <div>
                 <span className="eyebrow">Редактирование PNG metadata</span>
                 <strong>{editingCard.name}</strong>
+                </div>
               </div>
               <button className="ghost-button" type="button" onClick={() => setEditingCardId('')}>Закрыть</button>
             </div>
@@ -4043,6 +5307,8 @@ function SettingsSection({
               right={<EditableTextArea label="Scenario" value={cardEditDraft.scenario} onChange={(scenario) => setCardEditDraft({ ...cardEditDraft, scenario })} />}
             />
             <EditableTextArea label="First message" value={cardEditDraft.firstMessage} onChange={(firstMessage) => setCardEditDraft({ ...cardEditDraft, firstMessage })} />
+            <AlternateGreetingsEditor value={cardEditDraft.alternateGreetings} onChange={(alternateGreetings) => setCardEditDraft({ ...cardEditDraft, alternateGreetings })} />
+            <TokenBadge count={cardDraftTokenCount(cardEditDraft)} label="токенов карточки" />
             <TwoColumns
               left={<EditableTextArea label="Example dialogue" value={cardEditDraft.messageExample} onChange={(messageExample) => setCardEditDraft({ ...cardEditDraft, messageExample })} />}
               right={<EditableField label="Creator" value={cardEditDraft.creator} onChange={(creator) => setCardEditDraft({ ...cardEditDraft, creator })} />}
@@ -4099,6 +5365,7 @@ function SettingsSection({
             <div className="form-stack">
               <EditableField label="Имя" value={personaDraft.name} onChange={(name) => setPersonaDraft({ ...personaDraft, name })} />
               <EditableTextArea label="Persona prompt" value={personaDraft.description} onChange={(description) => setPersonaDraft({ ...personaDraft, description })} />
+              <TokenBadge count={personaTokenCount(personaDraft)} label="токенов персоны" />
               <button type="button" onClick={() => void createPersona()}>Создать</button>
             </div>
           </details>
@@ -4112,14 +5379,15 @@ function SettingsSection({
                     <div>
                       <strong>{persona.name}</strong>
                       <small>{selectedPersonaId === persona.id ? 'Выбрана здесь' : 'Не выбрана'}</small>
+                      <TokenBadge count={personaTokenCount(persona)} label="токенов" />
                       <p>{persona.description || 'Persona prompt пустой.'}</p>
                     </div>
                   </div>
                 </div>
                 <div className="card-row-actions">
-                  <button type="button" onClick={() => selectLocalPersona(persona.id)}>{selectedPersonaId === persona.id ? 'Выбрана' : 'Выбрать'}</button>
-                  <button className="ghost-button" type="button" onClick={() => setEditingPersonaId(persona.id)}>Править</button>
-                  <DeleteConfirmButton itemKey={`persona:${persona.id}`} locked={deletionLocks.personas.includes(persona.id)} admin={Boolean(authUser?.is_admin)} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={() => void toggleDeletionLock('personas', persona.id)} onConfirm={() => void deletePersona(persona)} />
+                  <button type="button" onClick={() => selectLocalPersona(persona.id)}>{selectedPersonaId === persona.id ? 'Выбрана' : 'Выбр.'}</button>
+                  <button className="ghost-button" type="button" onClick={() => setEditingPersonaId(persona.id)}>Прав.</button>
+                  <DeleteConfirmButton itemKey={`persona:${persona.id}`} label="Удал." locked={deletionLocks.personas.includes(persona.id)} admin={Boolean(authUser?.is_admin)} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={() => void toggleDeletionLock('personas', persona.id)} onConfirm={() => void deletePersona(persona)} />
                 </div>
               </article>
             )) : <EmptyLibrary text="Персон пока нет. Создай профиль игрока для prompt-а." />}
@@ -4136,13 +5404,14 @@ function SettingsSection({
                 <div>
                   <input aria-label="Имя персоны" value={editingPersona.name} onChange={(event) => editPersona(editingPersona.id, { name: event.target.value })} />
                   <small>{selectedPersonaId === editingPersona.id ? 'Локально выбрана в этом браузере' : 'Не выбрана локально'}</small>
+                  <TokenBadge count={personaTokenCount(editingPersona)} label="токенов" />
                 </div>
               </div>
               <EditableTextArea label="Описание / persona prompt" value={editingPersona.description} onChange={(description) => editPersona(editingPersona.id, { description })} />
               <div className="persona-actions">
                 <button type="button" onClick={() => void updatePersona(editingPersona)}>Сохранить</button>
-                <button className="ghost-button" type="button" onClick={() => selectLocalPersona(editingPersona.id)}>{selectedPersonaId === editingPersona.id ? 'Выбрана' : 'Выбрать'}</button>
-                <DeleteConfirmButton itemKey={`persona:${editingPersona.id}:edit`} locked={deletionLocks.personas.includes(editingPersona.id)} admin={Boolean(authUser?.is_admin)} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={() => void toggleDeletionLock('personas', editingPersona.id)} onConfirm={() => void deletePersona(editingPersona)} />
+                <button className="ghost-button" type="button" onClick={() => selectLocalPersona(editingPersona.id)}>{selectedPersonaId === editingPersona.id ? 'Выбрана' : 'Выбр.'}</button>
+                <DeleteConfirmButton itemKey={`persona:${editingPersona.id}:edit`} label="Удал." locked={deletionLocks.personas.includes(editingPersona.id)} admin={Boolean(authUser?.is_admin)} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={() => void toggleDeletionLock('personas', editingPersona.id)} onConfirm={() => void deletePersona(editingPersona)} />
                 <label className="avatar-upload">
                   <span>Аватарка</span>
                   <input type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => void uploadPersonaAvatar(editingPersona.id, event.target.files?.[0] ?? null)} />
@@ -4173,8 +5442,9 @@ function SettingsSection({
             />
             <div className="preset-actions">
               <button type="button" onClick={() => void login()}>Войти</button>
-              <button className="ghost-button" type="button" onClick={() => void register()}>Регистрация</button>
+              {registrationAllowed ? <button className="ghost-button" type="button" onClick={() => void register()}>Регистрация</button> : null}
             </div>
+            {!registrationAllowed ? <p className="helper-text">Регистрация на сервере отключена администратором.</p> : null}
           </div>
         ) : (
           <div className="form-stack">
@@ -4193,14 +5463,27 @@ function SettingsSection({
       <section className="preset-card-section">
         <div className="preset-title-row">
           <div>
+            <span className="eyebrow">Ключи</span>
+            <h3>Менеджер ключей</h3>
+          </div>
+        </div>
+        <KeyManager />
+      </section>
+
+      <section className="preset-card-section">
+        <div className="preset-title-row">
+          <div>
             <span className="eyebrow">Разрешения</span>
             <h3>Кто может менять данные</h3>
           </div>
           <button type="button" onClick={() => void saveSecurityPermissions()}>Сохранить права</button>
         </div>
         <ToggleRow label="Требовать вход для просмотра контента" checked={authRequired} onChange={setAuthRequired} />
+        <ToggleRow label="Разрешить регистрацию" checked={registrationAllowed} onChange={setRegistrationAllowed} />
+        <ToggleRow label="Разрешить кнопку Ответ бота" checked={botReplyAllowed} onChange={setBotReplyAllowed} />
         <p className="helper-text">Если включено, карточки, персоны, чаты, аватарки и пресеты не отдаются гостям. Для тонкой настройки используй права просмотра ниже.</p>
-        <ToggleRow label="Требовать отдельный пароль доступа к DoubleTrouble" checked={accessPasswordRequired} onChange={setAccessPasswordRequired} />
+        <ToggleRow label="Требовать отдельный пароль доступа к DoubleTrouble" checked={securityAccessPasswordRequiredDraft} onChange={setSecurityAccessPasswordRequiredDraft} />
+        {accessPasswordRequired !== securityAccessPasswordRequiredDraft ? <p className="helper-text">Изменение пароля доступа применится только после сохранения прав.</p> : null}
         <TwoColumns
           left={<EditableField label={accessPasswordConfigured ? 'Новый пароль доступа (оставь пустым, чтобы не менять)' : 'Пароль доступа'} type="password" value={securityAccessPasswordDraft} onChange={setSecurityAccessPasswordDraft} />}
           right={<p className="helper-text">Этот пароль вводится до регистрации/логина и действует поверх аккаунтов. Смена пароля сбрасывает старые access-сессии.</p>}
@@ -4341,18 +5624,20 @@ function ReasoningPresetPanel({ settings, assistantPrefill, update, updateAssist
   );
 }
 
-function MessageContent({ content, reasoning }: { content: string; reasoning: ReasoningDisplaySettings }) {
-  const parsed = reasoning.autoParse ? splitReasoning(content, reasoning) : { reasoning: '', visible: content };
+function MessageContent({ content, reasoning, imagePending = false, renderPendingMarkersAsSpinner = false, isStreaming = false }: { content: string; reasoning: ReasoningDisplaySettings; imagePending?: boolean; renderPendingMarkersAsSpinner?: boolean; isStreaming?: boolean }) {
+  const parsed = reasoning.autoParse ? splitReasoning(content, reasoning) : { reasoning: '', visible: content, complete: false };
+  const formatOptions: ExtensionMessageFormatOptions = { forceImagePending: imagePending, renderPendingMarkersAsSpinner, reasoning };
+  const reasoningOpen = isStreaming ? Boolean(parsed.reasoning && !parsed.complete) : reasoning.autoExpand;
   return (
     <div className="message-content mes_text">
       {parsed.reasoning && !reasoning.showHidden ? (
-        <details className="reasoning-block" open={reasoning.autoExpand}>
+        <details className="reasoning-block" open={reasoningOpen}>
           <summary>Какое-то время заняли размышления</summary>
           <pre>{parsed.reasoning}</pre>
         </details>
       ) : null}
       {parsed.reasoning && reasoning.showHidden ? <pre className="reasoning-visible">{parsed.reasoning}</pre> : null}
-      {formatMessageText(parsed.visible)}
+      {formatMessageText(parsed.visible, formatOptions)}
     </div>
   );
 }
@@ -4372,8 +5657,8 @@ function reasoningSettingsFromPreset(preset: RawPreset | null): ReasoningDisplay
     showHidden: Boolean(preset?.reasoning_show_hidden),
     addToPrompts: preset?.reasoning_add_to_prompts !== false,
     maxAdditions: numberField(preset?.reasoning_max_additions, 1),
-    prefix: String(preset?.reasoning_prefix ?? '<think>'),
-    suffix: String(preset?.reasoning_suffix ?? '</think>'),
+    prefix: String(preset?.reasoning_prefix ?? ''),
+    suffix: String(preset?.reasoning_suffix ?? ''),
     separator: String(preset?.reasoning_separator ?? '\n'),
   };
 }
@@ -4391,41 +5676,57 @@ function reasoningTemplateName(settings: ReasoningDisplaySettings): string {
   return 'Custom';
 }
 
-function splitReasoning(content: string, settings: ReasoningDisplaySettings): { reasoning: string; visible: string } {
+function splitReasoning(content: string, settings: ReasoningDisplaySettings): { reasoning: string; visible: string; complete: boolean } {
   if (!settings.prefix || !settings.suffix) {
-    return { reasoning: '', visible: content };
+    return { reasoning: '', visible: content, complete: false };
   }
-  const start = content.indexOf(settings.prefix);
+  const prefix = findReasoningMarker(content, [settings.prefix, settings.prefix.trim()], 0);
+  const start = prefix.index;
   if (start < 0) {
-    return { reasoning: '', visible: content };
+    return { reasoning: '', visible: content, complete: false };
   }
-  const bodyStart = start + settings.prefix.length;
-  const end = content.indexOf(settings.suffix, bodyStart);
+  const bodyStart = start + prefix.marker.length;
+  const suffix = findReasoningMarker(content, [settings.suffix, settings.suffix.trim()], bodyStart);
+  const end = suffix.index;
   if (end < 0) {
-    return { reasoning: '', visible: content };
+    return { reasoning: content.slice(bodyStart), visible: content.slice(0, start).trim(), complete: false };
   }
   const reasoning = content.slice(bodyStart, end);
-  const visible = `${content.slice(0, start)}${content.slice(end + settings.suffix.length)}`.trim();
-  return { reasoning, visible };
+  const visible = `${content.slice(0, start)}${content.slice(end + suffix.marker.length)}`.trim();
+  return { reasoning, visible, complete: true };
 }
 
-function formatMessageText(content: string): ReactNode {
-  if (/◈NORICORE◈/i.test(content)) {
-    return formatNoricoreMessageText(content);
+function findReasoningMarker(content: string, markers: string[], fromIndex: number): { index: number; marker: string } {
+  return Array.from(new Set(markers.filter(Boolean))).reduce((best, marker) => {
+    const index = content.indexOf(marker, fromIndex);
+    if (index < 0 || (best.index >= 0 && best.index <= index)) {
+      return best;
+    }
+    return { index, marker };
+  }, { index: -1, marker: '' });
+}
+
+function formatMessageText(content: string, options: ExtensionMessageFormatOptions = {}): ReactNode {
+  if (loadBuiltInExtensionSettings().noriMynInfoblock && /◈NORICORE◈/i.test(content)) {
+    return formatNoricoreMessageText(content, options);
   }
-  if (/<(?:div|img|video|span|label|input|details|summary)\b|data-iig-instruction=/i.test(content)) {
-    return <div className="extension-html-block" dangerouslySetInnerHTML={{ __html: formatExtensionMessageHtml(content) }} />;
-  }
-  const mediaPattern = /<img\b[^>]*>|<video\b[\s\S]*?<\/video>|<video\b[^>]*>/gi;
+  return formatMessageSegmentText(content, options);
+}
+
+function formatMessageSegmentText(content: string, options: ExtensionMessageFormatOptions = {}): ReactNode {
   const nodes: ReactNode[] = [];
   let lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = mediaPattern.exec(content)) !== null) {
-    if (match.index > lastIndex) {
-      nodes.push(<p key={`text-${lastIndex}`}>{formatInlineMessageText(content.slice(lastIndex, match.index))}</p>);
+  for (const range of collectMessageSpecialRanges(content)) {
+    if (range.start > lastIndex) {
+      nodes.push(<p key={`text-${lastIndex}`}>{formatInlineMessageText(content.slice(lastIndex, range.start))}</p>);
     }
-    nodes.push(<span className="extension-media-html" dangerouslySetInnerHTML={{ __html: formatExtensionMessageHtml(match[0]) }} key={`media-${match.index}`} />);
-    lastIndex = match.index + match[0].length;
+    const token = content.slice(range.start, range.end);
+    if (token.startsWith('```') || token.startsWith('~~~')) {
+      nodes.push(<pre key={`code-${range.start}`}><code>{token.slice(3, -3).replace(/^\w+\n/, '')}</code></pre>);
+    } else if (token.startsWith('<')) {
+      nodes.push(<span className="extension-media-html" dangerouslySetInnerHTML={{ __html: formatExtensionMessageHtml(token, options) }} key={`media-${range.start}`} />);
+    }
+    lastIndex = range.end;
   }
   if (lastIndex < content.length || nodes.length === 0) {
     nodes.push(<p key={`text-${lastIndex}`}>{formatInlineMessageText(content.slice(lastIndex))}</p>);
@@ -4433,21 +5734,90 @@ function formatMessageText(content: string): ReactNode {
   return <>{nodes}</>;
 }
 
-function formatNoricoreMessageText(content: string): ReactNode {
+function collectMessageSpecialRanges(content: string): Array<{ start: number; end: number }> {
+  const ranges: Array<{ start: number; end: number }> = [];
+  const codePattern = /```[\s\S]*?```|~~~[\s\S]*?~~~/g;
+  let codeMatch: RegExpExecArray | null;
+  while ((codeMatch = codePattern.exec(content)) !== null) {
+    ranges.push({ start: codeMatch.index, end: codeMatch.index + codeMatch[0].length });
+  }
+
+  const markerPattern = /data-iig-instruction\b|iig-loading-placeholder\b|iig-error-image\b|iig-pending-media-shell\b/gi;
+  let markerMatch: RegExpExecArray | null;
+  while ((markerMatch = markerPattern.exec(content)) !== null) {
+    const range = findExtensionHtmlRange(content, markerMatch.index);
+    if (range) {
+      ranges.push(range);
+    }
+  }
+
+  return ranges
+    .sort((left, right) => left.start - right.start || right.end - left.end)
+    .reduce<Array<{ start: number; end: number }>>((merged, range) => {
+      const last = merged[merged.length - 1];
+      if (!last || range.start >= last.end) {
+        merged.push(range);
+      } else if (range.end > last.end) {
+        last.end = range.end;
+      }
+      return merged;
+    }, []);
+}
+
+function findExtensionHtmlRange(content: string, markerIndex: number): { start: number; end: number } | null {
+  const containers = ['div', 'span', 'video']
+    .map((tag) => {
+      const index = content.lastIndexOf(`<${tag}`, markerIndex);
+      const end = index >= 0 ? findMatchingHtmlTagEnd(content, tag, index) : -1;
+      return { tag, index, end };
+    })
+    .filter((item) => item.index >= 0 && item.end > markerIndex && markerIndex - item.index < 3000)
+    .sort((left, right) => left.index - right.index);
+  if (containers[0]) {
+    return { start: containers[0].index, end: containers[0].end };
+  }
+
+  const imageStart = content.lastIndexOf('<img', markerIndex);
+  if (imageStart < 0) {
+    return null;
+  }
+  const tagEnd = content.indexOf('>', imageStart);
+  if (tagEnd < 0) {
+    return null;
+  }
+  return { start: imageStart, end: tagEnd + 1 };
+}
+
+function findMatchingHtmlTagEnd(content: string, tagName: string, startIndex: number) {
+  const tagPattern = new RegExp(`<\\/?${tagName}\\b[^>]*>`, 'gi');
+  tagPattern.lastIndex = startIndex;
+  let depth = 0;
+  let match: RegExpExecArray | null;
+  while ((match = tagPattern.exec(content)) !== null) {
+    const isClosing = /^<\//.test(match[0]);
+    depth += isClosing ? -1 : 1;
+    if (depth === 0) {
+      return match.index + match[0].length;
+    }
+  }
+  return -1;
+}
+
+function formatNoricoreMessageText(content: string, options: ExtensionMessageFormatOptions = {}): ReactNode {
   const nodes: ReactNode[] = [];
   const pattern = /◈NORICORE◈([\s\S]*?)◈\/NORICORE◈/gi;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(content)) !== null) {
     if (match.index > lastIndex) {
-      nodes.push(<p key={`noricore-text-${lastIndex}`}>{formatInlineMessageText(content.slice(lastIndex, match.index).trim())}</p>);
+      nodes.push(<Fragment key={`noricore-text-${lastIndex}`}>{formatMessageSegmentText(content.slice(lastIndex, match.index).trim(), options)}</Fragment>);
     }
     const data = parseNoricoreBlock(match[1]);
     nodes.push(data.scene && data.characters.length ? <NoricoreBlock data={data} key={`noricore-${match.index}`} /> : <p className="message-tag" key={`noricore-raw-${match.index}`}>{match[0]}</p>);
     lastIndex = match.index + match[0].length;
   }
   if (lastIndex < content.length) {
-    nodes.push(<p key={`noricore-text-${lastIndex}`}>{formatInlineMessageText(content.slice(lastIndex).trim())}</p>);
+    nodes.push(<Fragment key={`noricore-text-${lastIndex}`}>{formatMessageSegmentText(content.slice(lastIndex).trim(), options)}</Fragment>);
   }
   return <>{nodes.filter(Boolean)}</>;
 }
@@ -4488,14 +5858,14 @@ function NoricoreBlock({ data }: { data: NoricoreData }) {
   return (
     <section className="noricore-block">
       <header className="noricore-header">
-        <strong><span>📍</span>{scene.location}</strong>
+        <strong><span className="noricore-pin">📍</span><span className="noricore-location">{scene.location}</span></strong>
         <div className="noricore-meta">
           <span>🌤️ {scene.weather}</span>
           <span>📅 {scene.date}</span>
           <span>🕘 {scene.time}</span>
         </div>
       </header>
-      <details className="noricore-section" open>
+      <details className="noricore-section">
         <summary><span>👥 ПЕРСОНАЖИ ({data.characters.length})</span></summary>
         <div className="noricore-character-list">
           {data.characters.map((character, index) => <NoricoreCharacterCard character={character} key={`${character.name}-${index}`} />)}
@@ -4512,7 +5882,7 @@ function NoricoreCharacterCard({ character }: { character: NoricoreCharacter }) 
   return (
     <article className={`noricore-character${away ? ' away' : nearby ? ' nearby' : ''}`}>
       <header>
-        <strong><span>{noricoreStatusIcon(character.status)}</span>{character.name}</strong>
+        <strong><span>{noricoreStatusIcon(character.status)}</span><span className="noricore-character-name">{character.name}</span></strong>
         <small>{character.status}</small>
       </header>
       <div className="noricore-grid">
@@ -4562,7 +5932,8 @@ function noricoreHealthTone(health: string) {
 
 function formatInlineMessageText(content: string): ReactNode[] {
   const nodes: ReactNode[] = [];
-  const pattern = /("[^"\n]+"|\*'[^']+'\*|'[^'\n]+'|<\/?[a-zA-Z_][^>\n]{0,80}>|◈[^\n]+◈|⟪[^\n]+⟫)/g;
+  const pattern = /(``[^`\n]+``|`[^`\n]+`|"[^"\n]+"|“[^”\n]+”|«[^»\n]+»|「[^」\n]+」|『[^』\n]+』|＂[^＂\n]+＂|\*\*[^*\n][^\n]*?\*\*|\*(?!\*)[^*\n]+?\*(?!\*)|<\/?[a-zA-Z_][^>\n]{0,80}>|◈[^\n]+◈|⟪[^\n]+⟫)/g;
+  const quotePattern = /^("[^"\n]+"|“[^”\n]+”|«[^»\n]+»|「[^」\n]+」|『[^』\n]+』|＂[^＂\n]+＂)$/;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(content)) !== null) {
@@ -4570,8 +5941,20 @@ function formatInlineMessageText(content: string): ReactNode[] {
       nodes.push(<span key={`t-${lastIndex}`}>{content.slice(lastIndex, match.index)}</span>);
     }
     const token = match[0];
-    const className = token.startsWith('"') ? 'message-dialogue' : token.startsWith("*'") || token.startsWith("'") ? 'message-thought' : 'message-tag';
-    nodes.push(<span className={className} key={`m-${match.index}`}>{token}</span>);
+    if (token.startsWith('``')) {
+      nodes.push(<code key={`m-${match.index}`}>{token.slice(2, -2)}</code>);
+    } else if (token.startsWith('`')) {
+      nodes.push(<code key={`m-${match.index}`}>{token.slice(1, -1)}</code>);
+    } else if (quotePattern.test(token)) {
+      nodes.push(<q key={`m-${match.index}`}>{token}</q>);
+    } else if (token.startsWith('**')) {
+      nodes.push(<strong key={`m-${match.index}`}>{token.slice(2, -2)}</strong>);
+    } else if (token.startsWith('*')) {
+      const inner = token.slice(1, -1);
+      nodes.push(<em key={`m-${match.index}`}>{quotePattern.test(inner) ? <q>{inner}</q> : inner}</em>);
+    } else {
+      nodes.push(<span className="message-tag" key={`m-${match.index}`}>{token}</span>);
+    }
     lastIndex = match.index + token.length;
   }
   if (lastIndex < content.length) {
@@ -4584,10 +5967,19 @@ function extractModelNames(rawModels: unknown): string[] {
   if (!rawModels || typeof rawModels !== 'object') {
     return [];
   }
-  const maybeData = rawModels as { data?: unknown };
-  const list = Array.isArray(maybeData.data) ? maybeData.data : Array.isArray(rawModels) ? rawModels : [];
+  const maybeData = rawModels as { data?: unknown; models?: unknown };
+  const list = Array.isArray(maybeData.data) ? maybeData.data : Array.isArray(maybeData.models) ? maybeData.models : Array.isArray(rawModels) ? rawModels : [];
   return list
-    .map((item) => typeof item === 'string' ? item : typeof item === 'object' && item && 'id' in item ? String((item as { id: unknown }).id) : '')
+    .map((item) => {
+      const value = typeof item === 'string'
+        ? item
+        : typeof item === 'object' && item && 'id' in item
+          ? String((item as { id: unknown }).id)
+          : typeof item === 'object' && item && 'name' in item
+            ? String((item as { name: unknown }).name)
+            : '';
+      return value.replace(/^models\//, '');
+    })
     .filter(Boolean);
 }
 
@@ -4968,6 +6360,14 @@ function Icon({ name }: { name: IconName }) {
         <path d="M12 14v2" />
       </>
     ),
+    key: (
+      <>
+        <circle cx="7.5" cy="14.5" r="3.5" />
+        <path d="M10 12 20 2" />
+        <path d="M16 6h4v4" />
+        <path d="M14 8h3" />
+      </>
+    ),
     menu: (
       <>
         <path d="M5 7h14" />
@@ -5070,6 +6470,57 @@ function TwoColumns({ left, right }: { left: ReactNode; right: ReactNode }) {
   return <div className="two-columns">{left}{right}</div>;
 }
 
+function TokenBadge({ count, label = 'токенов' }: { count: number; label?: string }) {
+  return <small className="token-badge">{count} {label}</small>;
+}
+
+function cardDraftTokenCount(card: CardDraft) {
+  return tokenCountForParts([card.name, card.description, card.personality, card.scenario, card.firstMessage, ...card.alternateGreetings, card.messageExample]);
+}
+
+function cardTokenCount(card: CharacterCard) {
+  return tokenCountForParts([card.name, card.description, card.personality, card.scenario, card.first_message, ...(card.alternate_greetings || []), card.message_example]);
+}
+
+function personaTokenCount(persona: Pick<Persona, 'name' | 'description'> | { name: string; description: string }) {
+  return tokenCountForParts([persona.name, persona.description]);
+}
+
+function entryTokenCount(entry: RawPreset) {
+  return tokenCountForParts([String(entry.comment || ''), String(entry.content || ''), csvFromArray(entry.key).join('\n'), csvFromArray(entry.keysecondary).join('\n')]);
+}
+
+function lorebookTokenCount(entries: RawPreset[]) {
+  return entries.reduce((sum, entry) => sum + entryTokenCount(entry), 0);
+}
+
+function tokenCountForParts(parts: string[]) {
+  return approxTokens(parts.filter((part) => part.trim()).join('\n'));
+}
+
+function AlternateGreetingsEditor({ value, onChange }: { value: string[]; onChange: (value: string[]) => void }) {
+  const updateGreeting = (index: number, nextValue: string) => onChange(value.map((item, itemIndex) => itemIndex === index ? nextValue : item));
+  const removeGreeting = (index: number) => onChange(value.filter((_, itemIndex) => itemIndex !== index));
+  return (
+    <section className="alternate-greetings-editor">
+      <div className="alternate-greetings-header">
+        <div>
+          <strong>Alternate greetings</strong>
+          <TokenBadge count={tokenCountForParts(value)} label="токенов" />
+        </div>
+        <button className="ghost-button" type="button" onClick={() => onChange([...value, ''])}>Добавить greeting</button>
+      </div>
+      {value.length ? value.map((greeting, index) => (
+        <label className="field-preview" key={index}>
+          <span>Greeting #{index + 2}</span>
+          <textarea value={greeting} onChange={(event) => updateGreeting(index, event.target.value)} />
+          <button className="ghost-button danger-button" type="button" onClick={() => removeGreeting(index)}>Удалить greeting</button>
+        </label>
+      )) : <p className="helper-text">Как в SillyTavern: основной First message остается первым swipe, эти приветствия станут следующими swipes нового чата.</p>}
+    </section>
+  );
+}
+
 function DeleteConfirmButton({
   itemKey,
   label = 'Удалить',
@@ -5114,18 +6565,21 @@ function Option({ title, text, active = false }: { title: string; text: string; 
 }
 
 function CharacterCardView({ active = false, editing = false, card, onSelect, onEdit, onDelete, openImagePreview, imageSrc = (src) => src, deleteLocked = false, admin = false, pendingDeleteKey = '', setPendingDeleteKey = () => undefined, toggleDeleteLock }: { active?: boolean; editing?: boolean; card: CharacterCard; onSelect?: (card: CharacterCard) => Promise<void>; onEdit?: (card: CharacterCard) => void; onDelete?: (card: CharacterCard) => Promise<void>; openImagePreview?: (src: string, title: string) => void; imageSrc?: (src: string) => string; deleteLocked?: boolean; admin?: boolean; pendingDeleteKey?: string; setPendingDeleteKey?: (key: string) => void; toggleDeleteLock?: () => void }) {
+  const tags = card.tags.slice(0, 4);
   return (
     <article className={`${active ? 'character-card-view active' : 'character-card-view'}${editing ? ' editing' : ''}`}>
       <button className="avatar-preview-button card-image-button" type="button" onClick={() => openImagePreview?.(card.image_url, card.name)}><img src={imageSrc(card.image_url)} alt="" loading="lazy" /></button>
-      <div>
-        <strong>{card.name}</strong>
-        <small>{card.spec || 'legacy'} {card.spec_version}</small>
+      <div className="character-card-copy">
+        <div className="card-title-row">
+          <strong>{card.name}</strong>
+          {tags.length ? <div className="card-tag-list card-title-tags">{tags.map((tag) => <span key={tag}>{tag}</span>)}</div> : null}
+        </div>
+        <TokenBadge count={cardTokenCount(card)} label="токенов" />
         <p>{card.description || card.first_message || 'Описание отсутствует.'}</p>
-        {card.tags.length ? <span>{card.tags.slice(0, 4).join(', ')}</span> : null}
         <div className="card-row-actions">
-          {onSelect ? <button type="button" onClick={() => void onSelect(card)}>{active ? 'Открыта' : 'Открыть'}</button> : null}
-          {onEdit ? <button className="ghost-button" type="button" onClick={() => onEdit(card)}>{editing ? 'Правится' : 'Править'}</button> : null}
-          {onDelete ? <DeleteConfirmButton itemKey={`card:${card.id}`} locked={deleteLocked} admin={admin} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={toggleDeleteLock} onConfirm={() => void onDelete(card)} /> : null}
+          {onSelect ? <button type="button" onClick={() => void onSelect(card)}>{active ? 'Открыта' : 'Откр.'}</button> : null}
+          {onEdit ? <button className="ghost-button" type="button" onClick={() => onEdit(card)}>{editing ? 'Правится' : 'Прав.'}</button> : null}
+          {onDelete ? <DeleteConfirmButton itemKey={`card:${card.id}`} label="Удал." locked={deleteLocked} admin={admin} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={toggleDeleteLock} onConfirm={() => void onDelete(card)} /> : null}
         </div>
       </div>
     </article>

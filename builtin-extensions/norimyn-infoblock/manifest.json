@@ -1,0 +1,9 @@
+{
+    "display_name": "NoriMyn Infoblock",
+    "loading_order": 10,
+    "requires": [],
+    "optional": [],
+    "author": "DoubleTrouble",
+    "version": "1.0-builtin",
+    "auto_update": false
+}

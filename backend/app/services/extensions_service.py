@@ -44,13 +44,22 @@ class ExtensionSummary(BaseModel):
 
 
 class ExtensionsService:
-    def __init__(self, extensions_root: Path, registry_path: Path) -> None:
+    def __init__(self, extensions_root: Path, registry_path: Path, built_in_root: Path | None = None) -> None:
         self.extensions_root = extensions_root
         self.registry_path = registry_path
+        self.built_in_root = built_in_root
 
     def list_extensions(self) -> list[ExtensionSummary]:
         records = self._load_registry()
-        return [self._summary(record) for record in sorted(records, key=lambda item: item.name.lower()) if self.extension_dir(record.name).exists()]
+        records_by_name = {record.name: record for record in records}
+        built_in_names = self._built_in_names()
+        built_in = [self._built_in_summary(name, records_by_name.get(name)) for name in sorted(built_in_names)]
+        user = [
+            self._summary(record)
+            for record in sorted(records, key=lambda item: item.name.lower())
+            if record.name not in built_in_names and self.extension_dir(record.name).exists()
+        ]
+        return built_in + user
 
     def discover_enabled(self) -> list[dict[str, str]]:
         return [
@@ -94,6 +103,17 @@ class ExtensionsService:
     def set_enabled(self, name: str, enabled: bool) -> ExtensionSummary:
         safe_name = self._safe_name(name)
         records = self._load_registry()
+        if safe_name in self._built_in_names():
+            record = next((item for item in records if item.name == safe_name), None)
+            if record is None:
+                record = ExtensionRecord(name=safe_name, type="system", enabled=enabled, source="built-in")
+                records.append(record)
+            record.type = "system"
+            record.enabled = enabled
+            record.source = "built-in"
+            record.updated_at = utc_now()
+            self._save_registry(records)
+            return self._built_in_summary(safe_name, record)
         for record in records:
             if record.name == safe_name:
                 record.enabled = enabled
@@ -114,18 +134,32 @@ class ExtensionsService:
     def extension_dir(self, name: str) -> Path:
         return self.extensions_root / "third-party" / self._safe_name(name)
 
+    def built_in_extension_dir(self, name: str) -> Path:
+        if self.built_in_root is None:
+            raise FileNotFoundError(name)
+        return self.built_in_root / self._safe_name(name)
+
     def file_path(self, external_path: str) -> Path:
         parts = [part for part in Path(external_path.replace("\\", "/")).parts if part not in {"/", "..", "."}]
-        if len(parts) >= 2 and parts[0] == "third-party":
+        if len(parts) >= 2 and parts[0] == "built-in":
+            base = self.built_in_extension_dir(parts[1])
+            path = base.joinpath(*parts[2:])
+            root = self.built_in_root.resolve() if self.built_in_root is not None else base.resolve()
+        elif len(parts) >= 2 and parts[0] == "third-party":
             base = self.extension_dir(parts[1])
             path = base.joinpath(*parts[2:])
+            root = self.extensions_root.resolve()
         elif parts:
-            base = self.extension_dir(parts[0])
+            if parts[0] in self._built_in_names():
+                base = self.built_in_extension_dir(parts[0])
+                root = self.built_in_root.resolve() if self.built_in_root is not None else base.resolve()
+            else:
+                base = self.extension_dir(parts[0])
+                root = self.extensions_root.resolve()
             path = base.joinpath(*parts[1:])
         else:
             raise FileNotFoundError(external_path)
         resolved = path.resolve()
-        root = self.extensions_root.resolve()
         if root not in resolved.parents and resolved != root:
             raise FileNotFoundError(external_path)
         if not resolved.exists() or not resolved.is_file():
@@ -144,6 +178,18 @@ class ExtensionsService:
             updated_at=record.updated_at,
         )
 
+    def _built_in_summary(self, name: str, status: ExtensionRecord | None = None) -> ExtensionSummary:
+        return ExtensionSummary(
+            name=name,
+            external_name=f"built-in/{name}",
+            type="system",
+            enabled=status.enabled if status else True,
+            source="built-in",
+            manifest=self._built_in_manifest(name),
+            installed_at=status.installed_at if status else "built-in",
+            updated_at=status.updated_at if status else "built-in",
+        )
+
     def _manifest(self, name: str) -> dict[str, Any]:
         path = self.extension_dir(name) / "manifest.json"
         if not path.exists():
@@ -153,6 +199,24 @@ class ExtensionsService:
         except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
         return parsed if isinstance(parsed, dict) else {}
+
+    def _built_in_manifest(self, name: str) -> dict[str, Any]:
+        try:
+            path = self.built_in_extension_dir(name) / "manifest.json"
+        except FileNotFoundError:
+            return {}
+        if not path.exists():
+            return {}
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _built_in_names(self) -> set[str]:
+        if self.built_in_root is None or not self.built_in_root.exists():
+            return set()
+        return {path.name for path in self.built_in_root.iterdir() if path.is_dir() and (path / "manifest.json").exists()}
 
     def _load_registry(self) -> list[ExtensionRecord]:
         if not self.registry_path.exists():

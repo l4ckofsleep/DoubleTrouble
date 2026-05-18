@@ -62,11 +62,14 @@ class SecurityPermissions(BaseModel):
     manage_presets: PermissionRule = Field(default_factory=PermissionRule)
     manage_lorebooks: PermissionRule = Field(default_factory=PermissionRule)
     manage_extensions: PermissionRule = Field(default_factory=PermissionRule)
+    manage_keys: PermissionRule = Field(default_factory=lambda: PermissionRule(mode="admins"))
     manage_security: PermissionRule = Field(default_factory=lambda: PermissionRule(mode="admins"))
 
 
 class SecuritySettingsPayload(BaseModel):
     auth_required: bool = False
+    registration_allowed: bool = True
+    bot_reply_allowed: bool = True
     access_password_required: bool = False
     access_password: str = ""
     access_password_configured: bool = False
@@ -85,6 +88,8 @@ class UserSettings(BaseModel):
     active_generation_preset: str = ""
     active_presets: dict[str, str] = Field(default_factory=dict)
     auth_required: bool = False
+    registration_allowed: bool = True
+    bot_reply_allowed: bool = True
     access_password_required: bool = False
     access_password_salt: str = ""
     access_password_hash: str = ""
@@ -191,6 +196,12 @@ class SettingsService:
     def auth_required(self) -> bool:
         return self.settings.auth_required
 
+    def registration_allowed(self) -> bool:
+        return self.settings.registration_allowed
+
+    def bot_reply_allowed(self) -> bool:
+        return self.settings.bot_reply_allowed
+
     def access_password_required(self) -> bool:
         return self.settings.access_password_required and bool(self.settings.access_password_hash)
 
@@ -217,6 +228,8 @@ class SettingsService:
 
     def update_security_settings(self, payload: SecuritySettingsPayload) -> SecuritySettingsPayload:
         self.settings.auth_required = payload.auth_required
+        self.settings.registration_allowed = payload.registration_allowed
+        self.settings.bot_reply_allowed = payload.bot_reply_allowed
         next_password = payload.access_password.strip()
         if next_password:
             if len(next_password) < 4:
@@ -231,6 +244,8 @@ class SettingsService:
         self._save_settings()
         return SecuritySettingsPayload(
             auth_required=self.settings.auth_required,
+            registration_allowed=self.settings.registration_allowed,
+            bot_reply_allowed=self.settings.bot_reply_allowed,
             access_password_required=self.settings.access_password_required,
             access_password_configured=self.access_password_configured(),
             permissions=self.settings.security_permissions,
@@ -239,6 +254,8 @@ class SettingsService:
     def security_settings_payload(self) -> SecuritySettingsPayload:
         return SecuritySettingsPayload(
             auth_required=self.settings.auth_required,
+            registration_allowed=self.settings.registration_allowed,
+            bot_reply_allowed=self.settings.bot_reply_allowed,
             access_password_required=self.settings.access_password_required,
             access_password_configured=self.access_password_configured(),
             permissions=self.settings.security_permissions,

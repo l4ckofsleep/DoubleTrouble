@@ -218,8 +218,38 @@ class BotChatsService:
         self._save(chat)
         return chat
 
-    def add_bot_message(self, card_id: str, chat_id: str, author: str, content: str, avatar_url: str = "") -> BotChat:
-        return self.add_message(card_id, chat_id, ChatMessageCreate(author=author, avatar_url=avatar_url, role="assistant", content=content))
+    def add_bot_message(self, card_id: str, chat_id: str, author: str, content: str, avatar_url: str = "", swipes: list[str] | None = None) -> BotChat:
+        chat = self.get_chat(card_id, chat_id)
+        cleaned_swipes = [swipe.strip() for swipe in (swipes or []) if swipe.strip()]
+        first_content = content.strip() or (cleaned_swipes[0] if cleaned_swipes else "")
+        if not first_content:
+            raise ValueError("Message content is required")
+        if not cleaned_swipes:
+            cleaned_swipes = [first_content]
+        chat.messages.append(BotChatMessage(role="assistant", author=author.strip() or "Bot", avatar_url=avatar_url.strip(), content=first_content, swipes=cleaned_swipes, active_swipe_index=0))
+        chat.updated_at = utc_now()
+        self._save(chat)
+        return chat
+
+    def sync_first_assistant_swipes(self, card_id: str, chat_id: str, swipes: list[str]) -> BotChat:
+        chat = self.get_chat(card_id, chat_id)
+        if any(message.role == "user" for message in chat.messages):
+            return chat
+        first_assistant = next((message for message in chat.messages if message.role == "assistant"), None)
+        cleaned_swipes = [swipe.strip() for swipe in swipes if swipe.strip()]
+        if first_assistant is None or not cleaned_swipes:
+            return chat
+        current_content = first_assistant.content.strip()
+        active_index = cleaned_swipes.index(current_content) if current_content in cleaned_swipes else 0
+        if first_assistant.swipes == cleaned_swipes and first_assistant.active_swipe_index == active_index:
+            return chat
+        first_assistant.swipes = cleaned_swipes
+        first_assistant.active_swipe_index = active_index
+        first_assistant.content = cleaned_swipes[active_index]
+        first_assistant.updated_at = utc_now()
+        chat.updated_at = utc_now()
+        self._save(chat)
+        return chat
 
     def replace_bot_message(self, card_id: str, chat_id: str, message_id: str, author: str, content: str, avatar_url: str = "", reset_swipes: bool = False) -> BotChat:
         chat = self.get_chat(card_id, chat_id)

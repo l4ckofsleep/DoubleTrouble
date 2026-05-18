@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -33,26 +35,8 @@ class OpenAICompatibleProvider:
         if not request.model:
             raise RuntimeError("LLM model is not configured")
 
-        parameters = dict(request.parameters)
-        excluded_body_keys = {str(key) for key in parameters.pop("__exclude_body_keys", [])}
-        body: dict[str, Any] = {
-            "model": request.model,
-            "messages": [self._message_to_dict(message) for message in request.messages],
-            "temperature": request.temperature,
-            "max_tokens": request.max_tokens,
-            "stream": False,
-        }
-        body.update(parameters)
-        for key in excluded_body_keys:
-            body.pop(key, None)
-
-        timeout = httpx.Timeout(
-            connect=self.timeout_seconds,
-            write=self.timeout_seconds,
-            read=max(self.timeout_seconds, 300.0),
-            pool=self.timeout_seconds,
-        )
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        body = self._request_body(request, stream=False)
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
             response = await client.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=body)
             response.raise_for_status()
             data = response.json()
@@ -63,6 +47,183 @@ class OpenAICompatibleProvider:
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("LLM provider returned an empty response")
         return content.strip()
+
+    async def generate_stream(self, request: GenerationRequest) -> AsyncIterator[str]:
+        if not self.base_url:
+            raise RuntimeError("LLM provider base_url is not configured")
+        if not request.model:
+            raise RuntimeError("LLM model is not configured")
+
+        body = self._request_body(request, stream=True)
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
+            async with client.stream("POST", f"{self.base_url}/chat/completions", headers=self._headers(), json=body) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                response.raise_for_status()
+                emitted = False
+                buffered_text = ""
+                async for chunk in response.aiter_text():
+                    buffered_text += chunk
+                    events, buffered_text = self._split_sse_events(buffered_text)
+                    line_events, buffered_text = self._split_line_events(buffered_text)
+                    events.extend(line_events)
+                    for event in events:
+                        token = self._stream_token(event)
+                        if token:
+                            emitted = True
+                            yield token
+                for event in self._remaining_stream_events(buffered_text):
+                    token = self._stream_token(event)
+                    if token:
+                        emitted = True
+                        yield token
+                if not emitted and buffered_text:
+                    content = self._content_from_non_stream_payload(buffered_text)
+                    if content:
+                        yield content
+
+    def _request_body(self, request: GenerationRequest, stream: bool) -> dict[str, Any]:
+        parameters = dict(request.parameters)
+        excluded_body_keys = {str(key) for key in parameters.pop("__exclude_body_keys", [])}
+        body: dict[str, Any] = {
+            "model": request.model,
+            "messages": [self._message_to_dict(message) for message in request.messages],
+            "temperature": request.temperature,
+            "max_tokens": request.max_tokens,
+        }
+        body.update(parameters)
+        body["stream"] = stream
+        for key in excluded_body_keys:
+            body.pop(key, None)
+        return body
+
+    def _timeout(self) -> httpx.Timeout:
+        return httpx.Timeout(
+            connect=self.timeout_seconds,
+            write=self.timeout_seconds,
+            read=max(self.timeout_seconds, 300.0),
+            pool=self.timeout_seconds,
+        )
+
+    def _split_sse_events(self, text: str) -> tuple[list[str], str]:
+        events: list[str] = []
+        start = 0
+        index = 0
+        while index < len(text):
+            separator_length = 0
+            if text.startswith("\r\n\r\n", index):
+                separator_length = 4
+            elif text.startswith("\n\n", index) or text.startswith("\r\r", index):
+                separator_length = 2
+            if separator_length:
+                events.append(text[start:index])
+                index += separator_length
+                start = index
+                continue
+            index += 1
+        return events, text[start:]
+
+    def _split_line_events(self, text: str) -> tuple[list[str], str]:
+        if not text:
+            return [], text
+
+        events: list[str] = []
+        lines = text.splitlines(keepends=True)
+        complete_count = len(lines)
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            complete_count -= 1
+        for index, line in enumerate(lines[:complete_count]):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if self._is_complete_stream_event(stripped):
+                events.append(stripped)
+                continue
+            return events, "".join(lines[index:])
+        return events, "".join(lines[complete_count:])
+
+    def _is_complete_stream_event(self, event: str) -> bool:
+        payload = self._event_data(event)
+        if not payload or payload == "[DONE]":
+            return True
+        try:
+            json.loads(payload)
+        except json.JSONDecodeError:
+            return False
+        return True
+
+    def _remaining_stream_events(self, text: str) -> list[str]:
+        stripped = text.strip()
+        if not stripped:
+            return []
+        if "data:" in stripped or stripped.startswith("event:"):
+            return [stripped]
+        return stripped.splitlines()
+
+    def _stream_token(self, event: str) -> str:
+        payload = self._event_data(event)
+        if not payload or payload == "[DONE]":
+            return ""
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return ""
+        return self._stream_content(data)
+
+    def _event_data(self, event: str) -> str:
+        data_lines: list[str] = []
+        raw_lines = event.splitlines()
+        for line in raw_lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith(":"):
+                continue
+            if stripped.startswith("data:"):
+                data_lines.append(stripped[5:].strip())
+        if data_lines:
+            return "\n".join(data_lines).strip()
+        return event.strip()
+
+    def _stream_content(self, data: dict[str, Any]) -> str:
+        choice = (data.get("choices") or [{}])[0]
+        choice = choice if isinstance(choice, dict) else {}
+        delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+        root_delta = data.get("delta") if isinstance(data.get("delta"), dict) else {}
+        delta_message = root_delta.get("message") if isinstance(root_delta.get("message"), dict) else {}
+        delta_message_content = delta_message.get("content") if isinstance(delta_message.get("content"), dict) else {}
+        content = (
+            delta.get("content")
+            or delta.get("text")
+            or root_delta.get("text")
+            or delta_message_content.get("text")
+            or delta_message.get("tool_plan")
+            or choice.get("message", {}).get("content")
+            or choice.get("text")
+            or data.get("text")
+            or self._candidate_text(data)
+            or ""
+        )
+        if isinstance(content, list):
+            return "".join(str(item.get("text") or "") if isinstance(item, dict) else str(item) for item in content)
+        return content if isinstance(content, str) else ""
+
+    def _candidate_text(self, data: dict[str, Any]) -> str:
+        parts = (((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
+        return "".join(str(part.get("text") or "") for part in parts if isinstance(part, dict) and not part.get("thought"))
+
+    def _content_from_non_stream_payload(self, text: str) -> str:
+        payload = text.strip()
+        if not payload:
+            return ""
+        if payload.startswith("data:"):
+            payload = "\n".join(line[5:].strip() for line in payload.splitlines() if line.startswith("data:") and line[5:].strip() != "[DONE]")
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return ""
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content = message.get("content") or choice.get("text") or data.get("text") or self._candidate_text(data)
+        return content if isinstance(content, str) else ""
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}

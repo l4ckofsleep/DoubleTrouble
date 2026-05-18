@@ -1,0 +1,12 @@
+{
+    "display_name": "SillyImages",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "local & astera",
+    "version": "1.2-builtin",
+    "homePage": "https://github.com/0xl0cal/sillyimages/",
+    "auto_update": false
+}
