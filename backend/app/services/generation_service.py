@@ -202,24 +202,50 @@ class GenerationService:
     def _build_bot_chat_messages(self, character_name: str, history: list[BotChatMessage], openai_preset: dict[str, Any] | None = None, character_data: dict[str, Any] | None = None, persona_name: str | None = None, persona_description: str | None = None, world_info: dict[str, Any] | None = None, multi_user_mode: bool = False) -> list[ChatMessage]:
         visible_history = [message for message in history if not message.hidden]
         persona_name = persona_name or next((message.author for message in reversed(visible_history) if message.role == "user" and message.author), "User")
-        history_messages = self._history_messages(visible_history, openai_preset, multi_user_mode)
+        history_messages = self._history_messages(visible_history, openai_preset, multi_user_mode, character_name, persona_name)
         messages = self._tavern_openai_messages(openai_preset, character_name, persona_name, persona_description or "", character_data or {}, history_messages, world_info or {})
         if not messages:
-            system_prompt = self.config.system_prompt or f"You are {character_name}. Continue the roleplay naturally."
-            messages = [ChatMessage(role="system", content=system_prompt)]
-            messages.extend(history_messages)
+            messages = self._default_prompt_assembly(character_name, persona_name, persona_description or "", character_data or {}, history_messages, world_info or {})
         if len(messages) == 1 and not history_messages:
             messages.append(ChatMessage(role="user", content="Begin the scene."))
         if isinstance(openai_preset, dict) and bool(openai_preset.get("squash_system_messages")):
             messages = self._squash_system_messages(messages)
         return self._pack_tavern_messages(messages)
 
-    def _history_messages(self, history: list[BotChatMessage], preset: dict[str, Any] | None = None, force_user_names: bool = False) -> list[ChatMessage]:
+    def _default_prompt_assembly(self, character_name: str, persona_name: str, persona_description: str, character_data: dict[str, Any], history_messages: list[ChatMessage], world_info: dict[str, Any]) -> list[ChatMessage]:
+        result: list[ChatMessage] = []
+        parts: list[str] = []
+        description = self._substitute_prompt(str(character_data.get("description") or "").strip(), character_name, persona_name)
+        personality = self._substitute_prompt(str(character_data.get("personality") or "").strip(), character_name, persona_name)
+        scenario = self._substitute_prompt(str(character_data.get("scenario") or "").strip(), character_name, persona_name)
+        substituted_persona = self._substitute_prompt(persona_description, character_name, persona_name)
+        if description:
+            parts.append(description)
+        if personality:
+            parts.append(personality)
+        if scenario:
+            parts.append(scenario)
+        if substituted_persona:
+            parts.append(substituted_persona)
+        world_before = self._substitute_prompt(str(world_info.get("worldInfoBefore") or "").strip(), character_name, persona_name)
+        if world_before:
+            parts.append(world_before)
+        if parts:
+            result.append(ChatMessage(role="system", content="\n\n".join(parts)))
+        examples = self._dialogue_example_messages(character_data, {}, character_name, persona_name)
+        result.extend(examples)
+        result.extend(history_messages)
+        world_after = self._substitute_prompt(str(world_info.get("worldInfoAfter") or "").strip(), character_name, persona_name)
+        if world_after:
+            result.append(ChatMessage(role="system", content=world_after))
+        return result
+
+    def _history_messages(self, history: list[BotChatMessage], preset: dict[str, Any] | None = None, force_user_names: bool = False, character_name: str = "", persona_name: str = "") -> list[ChatMessage]:
         messages: list[ChatMessage] = []
         names_behavior = self._int_from_preset(preset, "names_behavior", 0)
         for message in history[-40:]:
             role = "assistant" if message.role == "assistant" else "user"
-            content = message.content
+            content = self._substitute_prompt(message.content, character_name, persona_name)
             name = None
             if (force_user_names or names_behavior == 2) and role == "user" and message.author:
                 content = f"{message.author}: {content}"
@@ -296,11 +322,14 @@ class GenerationService:
             "personaDescription": persona_description,
             "worldInfoBefore": "",
             "worldInfoAfter": "",
+            "dialogueExamples": str(character_data.get("mes_example") or ""),
         }
         existing_ids = {str(prompt.get("identifier") or "") for prompt in collection}
         for identifier, content in known_markers.items():
-            if identifier not in existing_ids and content:
-                collection.append({"identifier": identifier, "role": "system", "content": content, "system_prompt": True})
+            if identifier not in existing_ids:
+                collection.append({"identifier": identifier, "role": "system", "content": content, "system_prompt": True, "marker": True})
+        if "chatHistory" not in existing_ids:
+            collection.append({"identifier": "chatHistory", "role": "system", "content": "", "system_prompt": True, "marker": True})
         return collection
 
     def _should_trigger(self, prompt: dict[str, Any]) -> bool:

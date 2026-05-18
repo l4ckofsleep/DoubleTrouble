@@ -4728,16 +4728,18 @@ function SettingsSection({
             <div className="preset-select-save-row">
               <label className="field-preview">
                 <span>Пресет</span>
-                <select value={selectedPresetName} onChange={(event) => void selectPreset(event.target.value)}>
-                  <option value="">Выбрать пресет</option>
-                  {presets.map((preset) => <option value={preset.name} key={preset.filename}>{preset.name}{activePresets[preset.type] === preset.name ? ' · active' : ''}</option>)}
-                </select>
+                <div className="preset-select-with-button">
+                  <select value={selectedPresetName} onChange={(event) => void selectPreset(event.target.value)}>
+                    <option value="">Выбрать пресет</option>
+                    {presets.map((preset) => <option value={preset.name} key={preset.filename}>{preset.name}{activePresets[preset.type] === preset.name ? ' · active' : ''}</option>)}
+                  </select>
+                  <button className="preset-save-icon-button" type="button" title="Сохранить текущий пресет" onClick={() => void savePreset()} aria-label="Сохранить текущий пресет">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M4 3h13.2L20 5.8V21H4V3Zm2 2v14h12V6.7L16.3 5H16v5H8V5H6Zm4 0v3h4V5h-4Zm-1 9h6v2H9v-2Z" />
+                    </svg>
+                  </button>
+                </div>
               </label>
-              <button className="preset-save-icon-button" type="button" title="Сохранить текущий пресет" onClick={() => void savePreset()} aria-label="Сохранить текущий пресет">
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M4 3h13.2L20 5.8V21H4V3Zm2 2v14h12V6.7L16.3 5H16v5H8V5H6Zm4 0v3h4V5h-4Zm-1 9h6v2H9v-2Z" />
-                </svg>
-              </button>
             </div>
           )}
           right={<EditableField label="Имя для сохранения" value={presetNameDraft} onChange={setPresetNameDraft} />}

@@ -2753,15 +2753,22 @@ textarea {
 }
 
 .preset-select-save-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 0.45rem;
-  align-items: end;
   min-width: 0;
 }
 
 .preset-select-save-row select {
   min-height: 2.55rem;
+}
+
+.preset-select-with-button {
+  display: flex;
+  gap: 0.45rem;
+  align-items: flex-end;
+}
+
+.preset-select-with-button select {
+  flex: 1;
+  min-width: 0;
 }
 
 .preset-save-icon-button {
