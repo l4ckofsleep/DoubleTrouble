@@ -414,6 +414,14 @@ async def on_startup() -> None:
     storage.ensure_layout()
     session_service.get_or_create_session(DEFAULT_SESSION_ID)
 
+    # Bootstrap built-in default presets on first run (only if user has none yet)
+    if not any(presets_service.list_presets("openai")):
+        presets_service.import_directory(PROJECT_ROOT)
+
+    # Activate the built-in Default OpenAI preset if no active preset is set
+    if not settings_service.active_preset_settings().get("openai"):
+        settings_service.set_active_preset("openai", "Default")
+
 
 @app.get("/api/health")
 async def health() -> dict[str, str]:
