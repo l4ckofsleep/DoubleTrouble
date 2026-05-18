@@ -391,7 +391,6 @@ app = FastAPI(title="DoubleTrouble", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1144,7 +1143,8 @@ async def generation_settings() -> dict[str, object]:
 
 
 @app.put("/api/generation/settings")
-async def update_generation_settings(request: GenerationSettingsUpdate) -> dict[str, object]:
+async def update_generation_settings(request: GenerationSettingsUpdate, http_request: Request) -> dict[str, object]:
+    _require_permission(http_request, "manage_presets")
     generation = settings_service.update_generation_settings(request)
     generation_service.update_config(generation)
     await _broadcast_shared_settings("generation")
@@ -1192,9 +1192,13 @@ async def delete_generation_preset(name: str, request: Request) -> dict[str, obj
 
 
 @app.post("/api/generation/models")
-async def generation_models(request: GenerationSettingsUpdate) -> dict[str, object]:
+async def generation_models(request: GenerationSettingsUpdate, http_request: Request) -> dict[str, object]:
+    _require_permission(http_request, "manage_keys")
     if request.provider == "disabled":
         return {"ok": False, "error": "generation provider is disabled"}
+    base_url = request.base_url.strip()
+    if base_url and not base_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="base_url must be http or https")
     api_key = request.api_key.strip() or secret_store.read(settings_service.generation_config().api_key_secret, settings_service.generation_config().api_key_env)
     provider = OpenAICompatibleProvider(request.base_url, api_key, request.timeout_seconds)
     return await provider.status()
@@ -1683,7 +1687,8 @@ async def export_bot_chat_sillytavern(card_id: str, chat_id: str, request: Reque
 
 
 @app.post("/api/cards/{card_id}/chats/{chat_id}/messages")
-async def add_bot_chat_message(card_id: str, chat_id: str, request: ChatMessageCreate) -> dict[str, object]:
+async def add_bot_chat_message(card_id: str, chat_id: str, request: ChatMessageCreate, http_request: Request) -> dict[str, object]:
+    _require_permission(http_request, "edit_messages")
     try:
         chat = bot_chats_service.add_message(card_id, chat_id, request)
     except FileNotFoundError as error:
@@ -1723,7 +1728,8 @@ async def delete_bot_chat_message(card_id: str, chat_id: str, message_id: str, r
 
 
 @app.post("/api/cards/{card_id}/chats/{chat_id}/messages/{message_id}/swipe")
-async def swipe_bot_chat_message(card_id: str, chat_id: str, message_id: str, request: ChatSwipeRequest) -> dict[str, object]:
+async def swipe_bot_chat_message(card_id: str, chat_id: str, message_id: str, request: ChatSwipeRequest, http_request: Request) -> dict[str, object]:
+    _require_permission(http_request, "edit_messages")
     try:
         chat = bot_chats_service.swipe_bot_message(card_id, chat_id, message_id, request.direction)
     except FileNotFoundError as error:
@@ -1928,9 +1934,33 @@ async def request_bot_reply(session_id: str) -> dict[str, object]:
     return {"message": message.model_dump(mode="json")}
 
 
+def _token_from_websocket(websocket: WebSocket) -> str:
+    authorization = websocket.headers.get("authorization", "")
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return str(websocket.query_params.get("auth") or "").strip()
+
+
+def _require_websocket_auth(websocket: WebSocket) -> None:
+    token = _token_from_websocket(websocket)
+    user = auth_service.user_by_token(token)
+    if settings_service.access_password_required():
+        access_token = websocket.headers.get("x-doubletrouble-access", "").strip() or str(websocket.cookies.get("doubletrouble_access") or "").strip()
+        if not settings_service.verify_access_token(access_token):
+            raise HTTPException(status_code=403, detail="Access password required")
+    if settings_service.auth_required() and not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+
 @app.websocket("/ws/sessions/{session_id}")
 async def session_websocket(websocket: WebSocket, session_id: str) -> None:
     await connection_manager.connect(session_id, websocket)
+    try:
+        _require_websocket_auth(websocket)
+    except HTTPException:
+        await websocket.close(code=1008)
+        connection_manager.disconnect(session_id, websocket)
+        return
     participant_id: str | None = None
     try:
         await websocket.send_json({"type": "session.snapshot", "session": session_service.snapshot(session_id)})

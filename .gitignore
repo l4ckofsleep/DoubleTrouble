@@ -21,6 +21,7 @@ data/**/*.webp
 config/*.yaml
 config/*.yml
 TODO.md
+SECURITY_AUDIT.md
 *.env
 .env*
 secrets.yaml
