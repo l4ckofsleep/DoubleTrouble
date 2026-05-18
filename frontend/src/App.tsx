@@ -5415,7 +5415,6 @@ function SettingsSection({
                 <button className="ghost-button" type="button" onClick={() => selectLocalPersona(editingPersona.id)}>{selectedPersonaId === editingPersona.id ? 'Выбрана' : 'Выбр.'}</button>
                 <DeleteConfirmButton itemKey={`persona:${editingPersona.id}:edit`} label="Удал." locked={deletionLocks.personas.includes(editingPersona.id)} admin={Boolean(authUser?.is_admin)} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={() => void toggleDeletionLock('personas', editingPersona.id)} onConfirm={() => void deletePersona(editingPersona)} />
                 <label className="avatar-upload">
-                  <span>Аватарка</span>
                   <input type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => void uploadPersonaAvatar(editingPersona.id, event.target.files?.[0] ?? null)} />
                 </label>
               </div>
