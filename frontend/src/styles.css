@@ -1,32 +1,41 @@
 :root {
-  --bg: #0f1418;
-  --surface: #161d23;
-  --surface-2: #1d2630;
-  --surface-3: #222c36;
-  --border: #2a3642;
-  --border-strong: #405162;
-  --text: #f2eadc;
-  --muted: #9fb0bc;
-  --accent: #d8a75f;
-  --accent-hover: #e4b76f;
-  --accent-bg: #2b2a24;
-  --accent-muted-bg: #2a261f;
-  --accent-muted-border: #6f5a35;
-  --accent-ink: #1b1309;
-  --teal: #73b7a7;
-  --teal-ink: #071410;
-  --teal-bg: #17251f;
-  --teal-border: #2f5a4d;
-  --scrim: rgba(6, 9, 12, 0.56);
-  --shadow-soft: 0 0.85rem 2rem color-mix(in srgb, var(--bg) 58%, transparent);
-  --shadow-strong: 0 1.5rem 4rem color-mix(in srgb, var(--bg) 68%, transparent);
-  --ui-gap: 0.9rem;
-  --panel-pad: 0.85rem;
-  --card-pad: 0.75rem;
+  --bg: #0a0d12;
+  --surface: #11161f;
+  --surface-2: #161c28;
+  --surface-3: #1f2734;
+  --border: #232c3b;
+  --border-strong: #3a4659;
+  --border-soft: color-mix(in srgb, var(--text) 9%, transparent);
+  --inset-highlight: color-mix(in srgb, var(--text) 7%, transparent);
+  --inset-shadow: color-mix(in srgb, var(--bg) 32%, transparent);
+  --text: #ecf1f8;
+  --muted: #97a5ba;
+  --accent: #f4b860;
+  --accent-hover: #ffcb7a;
+  --accent-bg: color-mix(in srgb, var(--accent) 14%, transparent);
+  --accent-muted-bg: color-mix(in srgb, var(--accent) 9%, transparent);
+  --accent-muted-border: color-mix(in srgb, var(--accent) 36%, transparent);
+  --accent-ink: #1a1206;
+  --accent-glow: color-mix(in srgb, var(--accent) 32%, transparent);
+  --teal: #6fdcbc;
+  --teal-ink: #052017;
+  --teal-bg: color-mix(in srgb, var(--teal) 11%, transparent);
+  --teal-border: color-mix(in srgb, var(--teal) 34%, transparent);
+  --danger: #ff7a7a;
+  --danger-ink: #1c0808;
+  --danger-bg: color-mix(in srgb, var(--danger) 12%, transparent);
+  --danger-border: color-mix(in srgb, var(--danger) 36%, transparent);
+  --scrim: rgba(3, 6, 11, 0.62);
+  --shadow-soft: 0 8px 22px rgba(0, 0, 0, 0.38), 0 2px 6px rgba(0, 0, 0, 0.22);
+  --shadow-strong: 0 24px 60px rgba(0, 0, 0, 0.58), 0 8px 18px rgba(0, 0, 0, 0.32);
+  --shadow-glow: 0 0 0 4px var(--accent-glow);
+  --ui-gap: 0.85rem;
+  --panel-pad: 0.95rem;
+  --card-pad: 0.8rem;
   --message-max: none;
-  --radius-panel: 1.2rem;
-  --radius-card: 1rem;
-  --radius-control: 0.85rem;
+  --radius-panel: 1rem;
+  --radius-card: 0.7rem;
+  --radius-control: 0.55rem;
   --SmartThemeBodyColor: var(--text);
   --SmartThemeBorderColor: var(--border);
   --SmartThemeQuoteColor: var(--accent);
@@ -38,6 +47,8 @@
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 :root[data-theme="parchment"] {
@@ -4845,4 +4856,450 @@ textarea {
     animation: none !important;
     transition: none !important;
   }
+}
+
+/* ============================================================ */
+/* === REDESIGN LAYER ("Eclipse") ============================== */
+/* Polished overlay applied on top of the existing system.      */
+/* Refines depth, hover/focus states, and rhythm across all     */
+/* themes without touching markup. Uses theme-aware vars so it  */
+/* gracefully adapts from dark to light palettes.               */
+/* ============================================================ */
+
+/* --- Ambient page backlight when gradients are on --- */
+:root[data-gradients="true"] body {
+  --dt-gradient-layer:
+    radial-gradient(1200px 700px at 50% -10%, color-mix(in srgb, var(--accent) 12%, transparent) 0%, transparent 60%),
+    radial-gradient(900px 600px at 100% 110%, color-mix(in srgb, var(--teal) 9%, transparent) 0%, transparent 60%),
+    linear-gradient(180deg, color-mix(in srgb, var(--bg) 94%, var(--accent) 6%) 0%, var(--bg) 70%);
+}
+
+/* --- Panel surfaces: soft border + inset highlight --- */
+.topbar,
+.bot-rail,
+.chat-stage,
+.scene-rail,
+.settings-drawer,
+.section-preview,
+.composer,
+.character-card-view,
+.persona-card {
+  border-color: var(--border-soft);
+}
+
+.app-shell[data-panel-shadows="true"] .topbar,
+.app-shell[data-panel-shadows="true"] .chat-stage,
+.app-shell[data-panel-shadows="true"] .settings-drawer,
+.app-shell[data-panel-shadows="true"] .section-preview,
+.app-shell[data-panel-shadows="true"] .composer,
+.app-shell[data-panel-shadows="true"] .character-card-view,
+.app-shell[data-panel-shadows="true"] .persona-card {
+  box-shadow: var(--shadow-soft), inset 0 1px 0 var(--inset-highlight);
+}
+
+.app-shell[data-panel-shadows="false"] .topbar,
+.app-shell[data-panel-shadows="false"] .chat-stage,
+.app-shell[data-panel-shadows="false"] .settings-drawer,
+.app-shell[data-panel-shadows="false"] .section-preview,
+.app-shell[data-panel-shadows="false"] .composer {
+  box-shadow: inset 0 1px 0 var(--inset-highlight);
+}
+
+/* --- Topbar: subtle vertical wash --- */
+.topbar {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--surface) 92%, var(--accent) 8%) 0%, var(--surface) 100%);
+}
+
+:root[data-glass="true"] .topbar,
+:root[data-glass="true"] .chat-stage,
+:root[data-glass="true"] .settings-drawer,
+:root[data-glass="true"] .composer {
+  background: color-mix(in srgb, var(--surface) 70%, transparent);
+  backdrop-filter: blur(16px) saturate(140%);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+}
+
+/* --- Brand mark: gradient + glow --- */
+.brand-mark {
+  background: linear-gradient(135deg, var(--accent-hover) 0%, var(--accent) 70%, color-mix(in srgb, var(--accent) 60%, var(--bg)) 100%);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #ffffff 30%, transparent),
+    0 4px 12px var(--accent-glow);
+  letter-spacing: 0.04em;
+}
+
+/* --- Filled (primary) buttons: gradient + glow on hover --- */
+button {
+  background: linear-gradient(180deg, var(--accent-hover) 0%, var(--accent) 100%);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #ffffff 24%, transparent),
+    0 4px 12px color-mix(in srgb, var(--accent) 18%, transparent);
+  transition: background-color 140ms ease, color 140ms ease, transform 120ms ease,
+    opacity 120ms ease, box-shadow 160ms ease, border-color 160ms ease;
+}
+
+button:hover {
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #ffffff 30%, transparent),
+    0 8px 20px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+button:focus-visible {
+  outline: none;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #ffffff 26%, transparent),
+    0 0 0 3px var(--accent-glow),
+    0 6px 16px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+button:disabled {
+  box-shadow: none;
+}
+
+/* --- Ghost / menu trigger / close button: refined neutral --- */
+.menu-trigger,
+.ghost-button,
+.close-button {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--surface-3) 96%, var(--text) 4%) 0%, var(--surface-2) 100%);
+  border: 1px solid var(--border);
+  color: var(--text);
+  box-shadow: inset 0 1px 0 var(--inset-highlight);
+}
+
+.menu-trigger:hover,
+.ghost-button:hover,
+.close-button:hover {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--surface-3) 80%, var(--accent) 14%) 0%, var(--surface-3) 100%);
+  border-color: var(--accent-muted-border);
+  color: var(--accent-hover);
+  box-shadow:
+    inset 0 1px 0 var(--inset-highlight),
+    0 4px 14px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.menu-trigger:focus-visible,
+.ghost-button:focus-visible,
+.close-button:focus-visible {
+  outline: none;
+  border-color: var(--accent-muted-border);
+  box-shadow:
+    inset 0 1px 0 var(--inset-highlight),
+    0 0 0 3px var(--accent-glow);
+}
+
+/* --- Inputs, selects, textareas: subtle inset + glow on focus --- */
+input,
+select,
+textarea {
+  background: color-mix(in srgb, var(--surface-2) 92%, var(--bg) 8%);
+  box-shadow: inset 0 1px 0 var(--inset-shadow);
+  transition: border-color 140ms ease, box-shadow 160ms ease, background-color 140ms ease;
+}
+
+input:hover:not(:focus):not(:disabled),
+textarea:hover:not(:focus):not(:disabled),
+select:hover:not(:focus):not(:disabled) {
+  border-color: var(--border-strong);
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  border-color: var(--accent-muted-border);
+  box-shadow:
+    inset 0 1px 0 var(--inset-shadow),
+    0 0 0 3px var(--accent-glow);
+}
+
+/* --- Composer: refined pill with internal contrast --- */
+.composer {
+  background: linear-gradient(180deg, var(--surface-2) 0%, var(--surface) 100%);
+}
+
+.composer textarea {
+  background: color-mix(in srgb, var(--surface) 60%, var(--bg) 40%);
+  border-color: var(--border-soft);
+}
+
+.composer textarea:focus {
+  border-color: var(--accent-muted-border);
+  background: color-mix(in srgb, var(--surface) 80%, var(--bg) 20%);
+}
+
+/* --- Composer +/send buttons: refined gradient --- */
+.composer-menu-button,
+.send-button {
+  background: linear-gradient(180deg, var(--accent-hover) 0%, var(--accent) 100%);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #ffffff 28%, transparent),
+    0 4px 12px var(--accent-glow);
+}
+
+.composer-menu-button:hover,
+.send-button:hover {
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #ffffff 34%, transparent),
+    0 8px 22px color-mix(in srgb, var(--accent) 38%, transparent);
+}
+
+/* --- Menu cards (left side nav of drawer): active state with accent bar --- */
+.menu-card {
+  position: relative;
+  background: linear-gradient(180deg, var(--surface-2) 0%, var(--surface) 100%);
+  box-shadow: inset 0 1px 0 var(--inset-highlight);
+  overflow: hidden;
+  transition: border-color 160ms ease, background-color 160ms ease,
+    box-shadow 200ms ease, transform 160ms ease, color 140ms ease;
+}
+
+.menu-card::before {
+  content: "";
+  position: absolute;
+  inset: 0.55rem auto 0.55rem 0;
+  width: 3px;
+  border-radius: 999px;
+  background: transparent;
+  transition: background-color 180ms ease, transform 180ms ease, opacity 180ms ease;
+  transform: scaleY(0.4);
+  opacity: 0;
+}
+
+.menu-card:hover::before {
+  background: color-mix(in srgb, var(--accent) 36%, transparent);
+  transform: scaleY(0.8);
+  opacity: 1;
+}
+
+.menu-card.active,
+.menu-card[aria-selected="true"],
+.menu-card[aria-pressed="true"] {
+  border-color: var(--accent-muted-border);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--surface-2) 78%, var(--accent) 14%) 0%, var(--surface-2) 100%);
+  box-shadow:
+    inset 0 1px 0 var(--inset-highlight),
+    0 6px 18px color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.menu-card.active::before,
+.menu-card[aria-selected="true"]::before,
+.menu-card[aria-pressed="true"]::before {
+  background: linear-gradient(180deg, var(--accent) 0%, var(--accent-hover) 100%);
+  transform: scaleY(1);
+  opacity: 1;
+}
+
+/* --- Bot card active state polished --- */
+.bot-card.active {
+  border-color: var(--accent-muted-border);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--surface-2) 70%, var(--accent) 14%) 0%, var(--surface-2) 100%);
+  box-shadow:
+    inset 0 1px 0 var(--inset-highlight),
+    0 4px 14px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+/* --- Bot/info/option/menu hover lift --- */
+.bot-card:hover,
+.info-tile:hover,
+.option-card:hover,
+.menu-card:not(.active):not([aria-selected="true"]):not([aria-pressed="true"]):hover {
+  border-color: var(--border-strong);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--surface-3) 96%, var(--accent) 4%) 0%, var(--surface-2) 100%);
+}
+
+/* --- Danger button: refined red treatment --- */
+.danger-button {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--danger) 28%, var(--surface-2)) 0%, color-mix(in srgb, var(--danger) 18%, var(--surface)) 100%);
+  border: 1px solid var(--danger-border);
+  color: #ffe2dc;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #ffffff 8%, transparent),
+    0 4px 12px color-mix(in srgb, var(--danger) 18%, transparent);
+}
+
+.danger-button:hover {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--danger) 44%, var(--surface-2)) 0%, color-mix(in srgb, var(--danger) 32%, var(--surface)) 100%);
+  color: #fff5f3;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #ffffff 12%, transparent),
+    0 6px 18px color-mix(in srgb, var(--danger) 30%, transparent);
+}
+
+.danger-button:focus-visible {
+  outline: none;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #ffffff 10%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--danger) 28%, transparent);
+}
+
+/* --- Range slider polish (cross-browser) --- */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 1.4rem;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 0.32rem;
+  border-radius: 999px;
+  background: linear-gradient(90deg,
+    var(--accent) 0%,
+    var(--accent) var(--range-progress, 50%),
+    color-mix(in srgb, var(--surface-3) 92%, var(--bg)) var(--range-progress, 50%),
+    color-mix(in srgb, var(--surface-3) 92%, var(--bg)) 100%);
+  box-shadow: inset 0 1px 2px var(--inset-shadow);
+}
+
+input[type="range"]::-moz-range-track {
+  height: 0.32rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface-3) 92%, var(--bg));
+  box-shadow: inset 0 1px 2px var(--inset-shadow);
+}
+
+input[type="range"]::-moz-range-progress {
+  height: 0.32rem;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 1.05rem;
+  height: 1.05rem;
+  margin-top: -0.36rem;
+  border-radius: 999px;
+  background: linear-gradient(180deg, var(--accent-hover) 0%, var(--accent) 100%);
+  border: 0;
+  box-shadow:
+    0 0 0 3px var(--surface),
+    inset 0 1px 0 color-mix(in srgb, #ffffff 30%, transparent),
+    0 4px 10px var(--accent-glow);
+  cursor: pointer;
+  transition: transform 120ms ease, box-shadow 160ms ease;
+}
+
+input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.08);
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 1.05rem;
+  height: 1.05rem;
+  border-radius: 999px;
+  background: linear-gradient(180deg, var(--accent-hover) 0%, var(--accent) 100%);
+  border: 0;
+  box-shadow:
+    0 0 0 3px var(--surface),
+    inset 0 1px 0 color-mix(in srgb, #ffffff 30%, transparent),
+    0 4px 10px var(--accent-glow);
+  cursor: pointer;
+}
+
+input[type="range"]:focus {
+  outline: none;
+}
+
+input[type="range"]:focus::-webkit-slider-thumb {
+  box-shadow:
+    0 0 0 3px var(--surface),
+    0 0 0 6px var(--accent-glow),
+    inset 0 1px 0 color-mix(in srgb, #ffffff 30%, transparent);
+}
+
+/* --- Native checkbox/radio: subtle accent + inset --- */
+input[type="checkbox"],
+input[type="radio"] {
+  width: auto;
+  accent-color: var(--accent);
+}
+
+/* --- Refined scrollbar --- */
+*::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--border-strong) 65%, transparent);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--accent) 60%, var(--border-strong));
+}
+
+/* --- Bot avatar gets gradient feel --- */
+.bot-avatar {
+  background: linear-gradient(135deg, var(--teal) 0%, color-mix(in srgb, var(--teal) 65%, var(--accent)) 100%);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #ffffff 24%, transparent),
+    0 4px 10px color-mix(in srgb, var(--teal) 24%, transparent);
+}
+
+/* --- Player pill avatar gets gradient too --- */
+.turn-strip .player-pill img,
+.turn-strip .player-pill i {
+  background: linear-gradient(135deg, var(--teal) 0%, color-mix(in srgb, var(--teal) 70%, var(--accent)) 100%);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, #ffffff 24%, transparent);
+}
+
+/* --- Status strip eyebrow refinement --- */
+.topbar .turn-strip span,
+.drawer-header .eyebrow {
+  color: color-mix(in srgb, var(--muted) 88%, var(--accent) 12%);
+}
+
+/* --- Heading typography polish --- */
+.panel-heading strong,
+.drawer-header strong {
+  letter-spacing: -0.01em;
+}
+
+/* --- Modal / overlay scrim with refined blur --- */
+.image-preview-overlay {
+  background: var(--scrim);
+  backdrop-filter: blur(10px) saturate(120%);
+  -webkit-backdrop-filter: blur(10px) saturate(120%);
+}
+
+/* --- Subtle selection color --- */
+::selection {
+  background: color-mix(in srgb, var(--accent) 38%, transparent);
+  color: var(--text);
+}
+
+/* --- Refined focus ring for keyboard nav on non-button elements --- */
+a:focus-visible,
+[role="button"]:focus-visible,
+[tabindex="0"]:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-glow);
+  border-radius: var(--radius-control);
+}
+
+/* --- Light-theme bg-only adjustments (Inset shadow shouldn't be too dark) --- */
+:root[data-theme="parchment"],
+:root[data-theme="porcelain"],
+:root[data-theme="mint"],
+:root[data-theme="lavender"],
+:root[data-theme="rose-tea"],
+:root[data-theme="solar"],
+:root[data-theme="sand"],
+:root[data-theme="linen"],
+:root[data-theme="cloud"],
+:root[data-theme="buttercream"],
+:root[data-theme="seashell"],
+:root[data-theme="morning"],
+:root[data-theme="paper"] {
+  --inset-shadow: color-mix(in srgb, var(--text) 8%, transparent);
+  --shadow-soft: 0 6px 18px rgba(0, 0, 0, 0.08), 0 2px 4px rgba(0, 0, 0, 0.05);
+  --shadow-strong: 0 24px 56px rgba(0, 0, 0, 0.16), 0 8px 18px rgba(0, 0, 0, 0.08);
 }
