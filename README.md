@@ -742,6 +742,12 @@ curl http://127.0.0.1:8017/api/health
 
 ---
 
+## Контакты
+
+- **Telegram:** [@roflenskoy](https://t.me/roflenskoy) — по всем вопросам, багам и идеям.
+
+---
+
 ---
 
 <a id="english"></a>
@@ -1452,3 +1458,9 @@ Invoke-RestMethod http://127.0.0.1:8017/api/health
 # Linux/macOS/Termux:
 curl http://127.0.0.1:8017/api/health
 ```
+
+---
+
+## Contacts
+
+- **Telegram:** [@roflenskoy](https://t.me/roflenskoy) — questions, bugs, and ideas.
