@@ -4,6 +4,7 @@ import base64
 import json
 import asyncio
 import re
+import time
 
 import httpx
 from pathlib import Path
@@ -174,7 +175,7 @@ def _token_from_request(request: Request) -> str:
     authorization = request.headers.get("authorization", "")
     if authorization.lower().startswith("bearer "):
         return authorization[7:].strip()
-    return str(request.query_params.get("auth") or "").strip()
+    return request.cookies.get("doubletrouble_auth_token", "").strip() or str(request.query_params.get("auth") or "").strip()
 
 
 def _auth_user_from_request(request: Request) -> AuthUser | None:
@@ -387,6 +388,45 @@ def _provider_key_payloads() -> list[dict[str, object]]:
         for entry in _provider_key_registry()
     ]
 
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024
+RATE_LIMIT_MAX = 30
+RATE_LIMIT_WINDOW = 60.0
+_rate_limit_store: dict[str, list[float]] = {}
+
+
+class UploadSizeLimitMiddleware:
+    def __init__(self, app, **kwargs) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["method"] in ("POST", "PUT", "PATCH"):
+            for name, value in scope.get("headers", []):
+                if name.lower() == b"content-length":
+                    if int(value.decode()) > MAX_UPLOAD_SIZE:
+                        await send({"type": "http.response.start", "status": 413, "headers": [[b"content-type", b"text/plain"]]})
+                        await send({"type": "http.response.body", "body": b"Request too large", "more_body": False})
+                        return
+        await self.app(scope, receive, send)
+
+
+class RateLimitMiddleware:
+    def __init__(self, app, **kwargs) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["method"] in ("POST", "PUT", "DELETE", "PATCH"):
+            client = scope.get("client")
+            client_ip = client[0] if client else "unknown"
+            now = time.time()
+            _rate_limit_store.setdefault(client_ip, [t for t in _rate_limit_store.get(client_ip, []) if now - t < RATE_LIMIT_WINDOW])
+            if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_MAX:
+                await send({"type": "http.response.start", "status": 429, "headers": [[b"content-type", b"text/plain"]]})
+                await send({"type": "http.response.body", "body": b"Rate limit exceeded", "more_body": False})
+                return
+            _rate_limit_store[client_ip].append(now)
+        await self.app(scope, receive, send)
+
+
 app = FastAPI(title="DoubleTrouble", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -394,6 +434,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(UploadSizeLimitMiddleware)
+app.add_middleware(RateLimitMiddleware)
 
 def _safe_media_part(value: str, fallback: str = "generated") -> str:
     safe = re.sub(r"[^\w\-. ]+", "_", value, flags=re.UNICODE).strip(" .")
@@ -484,7 +526,8 @@ async def delete_extension(name: str, request: Request) -> dict[str, object]:
 
 @app.get("/scripts/extensions/{extension_path:path}")
 @app.head("/scripts/extensions/{extension_path:path}")
-async def extension_asset(extension_path: str) -> Response:
+async def extension_asset(extension_path: str, request: Request) -> Response:
+    _require_permission(request, "manage_extensions")
     if extension_path == "extensions.js":
         return await extension_compat_module()
     if extension_path == "regex/engine.js":
@@ -887,11 +930,7 @@ async def extension_user_avatar(filename: str, request: Request) -> Response:
 @app.get("/api/config/public")
 async def public_config() -> dict[str, object]:
     return {
-        "server": {
-            "listen_ip": config.server.listen_ip,
-            "listen_port": config.server.listen_port,
-            "public_url": config.server.public_url,
-        },
+        "server": {"public_url": config.server.public_url},
         "auth": {"mode": config.auth.mode, "required": settings_service.auth_required()},
         "registration_allowed": settings_service.registration_allowed(),
         "access_password_required": settings_service.access_password_required(),
@@ -900,7 +939,7 @@ async def public_config() -> dict[str, object]:
 
 
 @app.post("/api/auth/register")
-async def auth_register(payload: AuthRequest, request: Request) -> dict[str, object]:
+async def auth_register(payload: AuthRequest, request: Request, response: Response) -> dict[str, object]:
     _require_access_password(request)
     if not settings_service.registration_allowed():
         raise HTTPException(status_code=403, detail="Registration is disabled")
@@ -908,16 +947,18 @@ async def auth_register(payload: AuthRequest, request: Request) -> dict[str, obj
         user, token = auth_service.register(payload.username, payload.password)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    response.set_cookie("doubletrouble_auth_token", token, httponly=True, samesite="lax", path="/")
     return {"token": token, "user": auth_service.public_user(user)}
 
 
 @app.post("/api/auth/login")
-async def auth_login(payload: AuthRequest, request: Request) -> dict[str, object]:
+async def auth_login(payload: AuthRequest, request: Request, response: Response) -> dict[str, object]:
     _require_access_password(request)
     try:
         user, token = auth_service.login(payload.username, payload.password)
     except ValueError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
+    response.set_cookie("doubletrouble_auth_token", token, httponly=True, samesite="lax", path="/")
     return {"token": token, "user": auth_service.public_user(user)}
 
 
@@ -928,9 +969,11 @@ async def auth_me(request: Request) -> dict[str, object]:
 
 
 @app.post("/api/auth/logout")
-async def auth_logout(request: Request) -> dict[str, object]:
+async def auth_logout(request: Request, response: Response) -> dict[str, object]:
     _require_access_password(request)
     auth_service.logout(_token_from_request(request))
+    response.delete_cookie("doubletrouble_auth_token", path="/")
+    response.delete_cookie("doubletrouble_access", path="/")
     return {"ok": True}
 
 
@@ -966,11 +1009,12 @@ async def get_access_password_status(request: Request) -> dict[str, object]:
 
 
 @app.post("/api/security/access")
-async def unlock_access_password(payload: AccessPasswordRequest) -> dict[str, object]:
+async def unlock_access_password(payload: AccessPasswordRequest, response: Response) -> dict[str, object]:
     try:
         token = settings_service.verify_access_password(payload.password)
     except ValueError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
+    response.set_cookie("doubletrouble_access", token, httponly=True, samesite="lax", path="/")
     return {"ok": True, "required": settings_service.access_password_required(), "token": token}
 
 
@@ -1111,19 +1155,22 @@ async def update_delete_lock(payload: DeleteLockUpdate, request: Request) -> dic
 
 
 @app.get("/api/sessions/{session_id}")
-async def get_session(session_id: str) -> dict[str, object]:
+async def get_session(session_id: str, request: Request) -> dict[str, object]:
+    _require_permission(request, "view_chats")
     return session_service.snapshot(session_id)
 
 
 @app.post("/api/sessions/{session_id}/join")
-async def join_session(session_id: str, request: JoinSessionRequest) -> dict[str, object]:
+async def join_session(session_id: str, request: JoinSessionRequest, http_request: Request) -> dict[str, object]:
+    _require_permission(http_request, "edit_messages")
     participant = session_service.join_session(session_id, request.name, request.participant_id)
     await _broadcast_presence(session_id)
     return {"participant": participant.model_dump(mode="json"), "session": session_service.snapshot(session_id)}
 
 
 @app.post("/api/sessions/{session_id}/messages")
-async def send_message(session_id: str, request: SendMessageRequest) -> dict[str, object]:
+async def send_message(session_id: str, request: SendMessageRequest, http_request: Request) -> dict[str, object]:
+    _require_permission(http_request, "edit_messages")
     message = session_service.add_message(session_id, request)
     await connection_manager.broadcast(
         session_id,
@@ -1918,7 +1965,8 @@ async def persona_avatar(filename: str, request: Request) -> FileResponse:
 
 
 @app.post("/api/sessions/{session_id}/bot/reply")
-async def request_bot_reply(session_id: str) -> dict[str, object]:
+async def request_bot_reply(session_id: str, request: Request) -> dict[str, object]:
+    _require_permission(request, "generate")
     try:
         message = await generation_service.generate_reply(session_id)
     except httpx.HTTPStatusError as error:
@@ -1938,14 +1986,18 @@ def _token_from_websocket(websocket: WebSocket) -> str:
     authorization = websocket.headers.get("authorization", "")
     if authorization.lower().startswith("bearer "):
         return authorization[7:].strip()
-    return str(websocket.query_params.get("auth") or "").strip()
+    return str(websocket.cookies.get("doubletrouble_auth_token") or "").strip() or str(websocket.query_params.get("auth") or "").strip()
 
 
 def _require_websocket_auth(websocket: WebSocket) -> None:
     token = _token_from_websocket(websocket)
     user = auth_service.user_by_token(token)
     if settings_service.access_password_required():
-        access_token = websocket.headers.get("x-doubletrouble-access", "").strip() or str(websocket.cookies.get("doubletrouble_access") or "").strip()
+        access_token = (
+            websocket.headers.get("x-doubletrouble-access", "").strip()
+            or str(websocket.query_params.get("access_token") or "").strip()
+            or str(websocket.cookies.get("doubletrouble_access") or "").strip()
+        )
         if not settings_service.verify_access_token(access_token):
             raise HTTPException(status_code=403, detail="Access password required")
     if settings_service.auth_required() and not user:

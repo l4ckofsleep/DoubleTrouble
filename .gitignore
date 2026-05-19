@@ -100,3 +100,9 @@ SillyTavern*.json
 *.tar
 *.gz
 exports/
+
+# Devin / runtime temp files
+Activating
+Installing
+Starting
+frontend/Building

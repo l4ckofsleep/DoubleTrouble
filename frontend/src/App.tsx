@@ -273,6 +273,7 @@ const LAST_CARD_STORAGE_KEY = 'doubletrouble.lastCardId';
 const LAST_CHAT_BY_CARD_STORAGE_KEY = 'doubletrouble.lastChatByCard';
 const AUTH_TOKEN_STORAGE_KEY = 'doubletrouble.authToken';
 const ACCESS_TOKEN_STORAGE_KEY = 'doubletrouble.accessToken';
+const AUTH_USERNAME_STORAGE_KEY = 'doubletrouble.lastUsername';
 const OPENAI_PROMPT_ORDER_CHARACTER_ID = 100001;
 
 const permissionLabels: Record<string, string> = {
@@ -632,7 +633,7 @@ export default function App() {
   const [registrationAllowed, setRegistrationAllowed] = useState(true);
   const [botReplyAllowed, setBotReplyAllowed] = useState(true);
   const [authChecked, setAuthChecked] = useState(false);
-  const [accessToken, setAccessToken] = useState(() => window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || '');
+  const [accessToken, setAccessToken] = useState('');
   const [accessPasswordRequired, setAccessPasswordRequired] = useState(false);
   const [accessPasswordConfigured, setAccessPasswordConfigured] = useState(false);
   const [accessUnlocked, setAccessUnlocked] = useState(false);
@@ -672,6 +673,7 @@ export default function App() {
   })();
   const connectedCount = participants.filter((participant) => participant.connected).length;
   const websocketRef = useRef<WebSocket | null>(null);
+  const pendingRealtimeEventsRef = useRef<Record<string, unknown>[]>([]);
   const participantIdRef = useRef(participantId());
   const imageEventSourceIdRef = useRef(window.crypto?.randomUUID?.() || `image_source_${Date.now()}_${Math.random().toString(36).slice(2)}`);
   const authTokenRef = useRef(authToken);
@@ -732,6 +734,14 @@ export default function App() {
   }, [authToken]);
 
   useEffect(() => {
+    if (authToken) {
+      window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, authToken);
+    } else {
+      window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    }
+  }, [authToken]);
+
+  useEffect(() => {
     window.localStorage.setItem(VISUAL_STORAGE_KEY, JSON.stringify(visualSettings));
     document.documentElement.dataset.theme = visualSettings.theme;
     document.documentElement.dataset.textScale = visualSettings.textScale;
@@ -759,23 +769,20 @@ export default function App() {
 
   useEffect(() => {
     if (authToken) {
-      window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, authToken);
-      void loadCurrentUser(authToken);
-      void loadDeleteLocks(authToken);
+      void (async () => {
+        await loadCurrentUser();
+        sendPresence(selectedPersona);
+      })();
+      void loadDeleteLocks();
     } else {
-      window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
       setAuthUser(null);
     }
   }, [authToken]);
 
   useEffect(() => {
     if (accessToken) {
-      window.localStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, accessToken);
-      document.cookie = `doubletrouble_access=${encodeURIComponent(accessToken)}; path=/; SameSite=Lax`;
       void verifyAccessPasswordToken(accessToken);
     } else {
-      window.localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
-      document.cookie = 'doubletrouble_access=; path=/; max-age=0; SameSite=Lax';
       setAccessUnlocked(!accessPasswordRequired);
     }
   }, [accessToken, accessPasswordRequired]);
@@ -891,7 +898,16 @@ export default function App() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const socket = new WebSocket(`${protocol}//${window.location.host}/ws/sessions/default`);
     websocketRef.current = socket;
-    socket.onopen = () => sendPresence(selectedPersona);
+    socket.onopen = () => {
+      const currentPersona = personasRef.current.find((p) => p.id === selectedPersonaIdRef.current) || personasRef.current[0] || null;
+      sendPresence(currentPersona);
+      while (pendingRealtimeEventsRef.current.length) {
+        const ev = pendingRealtimeEventsRef.current.shift();
+        if (ev) {
+          sendRealtimeEvent(ev);
+        }
+      }
+    };
     socket.onmessage = (event) => {
       const payload = JSON.parse(event.data) as RealtimePayload;
       if (payload.type === 'chat.updated' && payload.chat) {
@@ -1003,7 +1019,14 @@ export default function App() {
 
   const sendRealtimeEvent = (event: Record<string, unknown>) => {
     const socket = websocketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
+    if (!socket) {
+      return;
+    }
+    if (socket.readyState === WebSocket.CONNECTING) {
+      pendingRealtimeEventsRef.current.push(event);
+      return;
+    }
+    if (socket.readyState !== WebSocket.OPEN) {
       return;
     }
     socket.send(JSON.stringify({ username: authUserRef.current?.username || '', is_admin: Boolean(authUserRef.current?.is_admin), ...event }));
@@ -1043,17 +1066,15 @@ export default function App() {
     }
   };
 
-  const actorHeaders = (token = authToken) => ({
+  const actorHeaders = () => ({
     'X-DoubleTrouble-Actor': authUserRef.current?.username || selectedPersona?.name || 'Player',
-    ...(accessToken ? { 'X-DoubleTrouble-Access': accessToken } : {}),
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
   });
 
   const sendPresence = (persona: Persona | null) => {
     if (!persona && !personasLoadedRef.current) {
       return;
     }
-    if (persona && !selectedPersonaIdRef.current && !sessionSnapshotReceivedRef.current) {
+    if (persona && !selectedPersonaIdRef.current && !sessionSnapshotReceivedRef.current && !personasLoadedRef.current) {
       return;
     }
     sendRealtimeEvent({
@@ -1215,9 +1236,9 @@ export default function App() {
     return Array.from(byKey.values());
   };
 
-  const authJsonHeaders = (token = authToken) => ({ 'Content-Type': 'application/json', ...actorHeaders(token) });
-  const authedFetch = (url: string, init: RequestInit = {}, token = authToken) => fetch(url, { ...init, headers: { ...(init.headers || {}), ...actorHeaders(token) } });
-  const imageSrc = (url: string) => authToken && url.startsWith('/api/') ? `${url}${url.includes('?') ? '&' : '?'}auth=${encodeURIComponent(authToken)}` : url;
+  const authJsonHeaders = () => ({ 'Content-Type': 'application/json', ...actorHeaders() });
+  const authedFetch = (url: string, init: RequestInit = {}) => fetch(url, { ...init, headers: { ...(init.headers || {}), ...actorHeaders() } });
+  const imageSrc = (url: string) => url;
   const deniedResponse = (response: Response) => response.status === 401 || response.status === 403;
   const markAccessDenied = (section: keyof AccessDeniedState, denied: boolean) => setAccessDenied((current) => ({ ...current, [section]: denied }));
 
@@ -1239,7 +1260,7 @@ export default function App() {
     activePresetDraftSignatureRef.current = signature;
     const response = await fetch(`/api/presets/${encodeURIComponent(selectedPresetType)}/active-draft`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json', ...actorHeaders(token) },
+      headers: { 'Content-Type': 'application/json', ...actorHeaders() },
       body: JSON.stringify({ name, preset: parsed }),
     });
     if (!response.ok) {
@@ -1319,8 +1340,8 @@ export default function App() {
   const chatDeleteLockId = (cardId: string, chatId: string) => `${cardId}:${chatId}`;
   const isDeleteLocked = (category: keyof DeletionLocks, itemId: string) => deletionLocks[category].includes(itemId);
 
-  const loadDeleteLocks = async (token = authToken) => {
-    const response = await fetch('/api/delete-locks', { headers: actorHeaders(token) });
+  const loadDeleteLocks = async () => {
+    const response = await fetch('/api/delete-locks', { headers: actorHeaders() });
     if (!response.ok) {
       return;
     }
@@ -1328,11 +1349,10 @@ export default function App() {
     setDeletionLocks({ ...defaultDeletionLocks, ...data.delete_locks });
   };
 
-  const loadCurrentUser = async (token = authToken) => {
-    if (!token) {
-      return;
-    }
-    const response = await fetch('/api/auth/me', { headers: actorHeaders(token) });
+  const loadCurrentUser = async () => {
+    const response = await fetch('/api/auth/me', {
+      headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+    });
     if (!response.ok) {
       setAuthToken('');
       return;
@@ -1344,7 +1364,7 @@ export default function App() {
   const submitAuth = async (mode: 'login' | 'register') => {
     const response = await fetch(`/api/auth/${mode}`, {
       method: 'POST',
-      headers: authJsonHeaders(''),
+      headers: authJsonHeaders(),
       body: JSON.stringify({ username: authDraft.username, password: authDraft.password }),
     });
     const data = await response.json().catch(() => null) as { token?: string; user?: AuthUser; detail?: string } | null;
@@ -1355,19 +1375,20 @@ export default function App() {
     setAuthToken(data.token);
     setAuthUser(data.user || null);
     setAuthDraft({ ...authDraft, password: '' });
+    window.localStorage.setItem(AUTH_USERNAME_STORAGE_KEY, authDraft.username);
     setAuthMessage(mode === 'login' ? 'Вход выполнен' : 'Пользователь создан');
-    await Promise.all([refreshLibrary(data.token), loadGenerationSettings(data.token), loadConnectionPresets(data.token), loadPresetTypes(data.token), loadLorebooks(data.token)]);
+    await Promise.all([refreshLibrary(), loadGenerationSettings(), loadConnectionPresets(), loadPresetTypes(), loadLorebooks()]);
     sendPresence(selectedPersona);
   };
 
   const logout = async () => {
     if (authToken) {
-      await fetch('/api/auth/logout', { method: 'POST', headers: actorHeaders(authToken) });
+      await fetch('/api/auth/logout', { method: 'POST', headers: actorHeaders() });
     }
     setAuthToken('');
     setAuthUser(null);
     setAuthMessage('Вы вышли');
-    await Promise.all([refreshLibrary(''), loadGenerationSettings(''), loadConnectionPresets(''), loadPresetTypes(''), loadLorebooks('')]);
+    await Promise.all([refreshLibrary(), loadGenerationSettings(), loadConnectionPresets(), loadPresetTypes(), loadLorebooks()]);
     sendPresence(selectedPersona);
   };
 
@@ -1482,8 +1503,8 @@ export default function App() {
     setAuthMessage('Права сохранены');
   };
 
-  const refreshLibrary = async (token = authToken) => {
-    const [cardsResponse, personasResponse] = await Promise.all([authedFetch('/api/cards', {}, token), authedFetch('/api/personas', {}, token)]);
+  const refreshLibrary = async () => {
+    const [cardsResponse, personasResponse] = await Promise.all([authedFetch('/api/cards'), authedFetch('/api/personas')]);
     if (cardsResponse.ok) {
       const data = await cardsResponse.json() as { cards: CharacterCard[] };
       markAccessDenied('cards', false);
@@ -1522,8 +1543,8 @@ export default function App() {
     }
   };
 
-  const loadGenerationSettings = async (token = authToken) => {
-    const response = await authedFetch('/api/generation/settings', {}, token);
+  const loadGenerationSettings = async () => {
+    const response = await authedFetch('/api/generation/settings');
     if (!response.ok) {
       return;
     }
@@ -1534,8 +1555,8 @@ export default function App() {
     setGenerationSettings(nextSettings);
   };
 
-  const loadConnectionPresets = async (token = authToken) => {
-    const response = await authedFetch('/api/generation/presets', {}, token);
+  const loadConnectionPresets = async () => {
+    const response = await authedFetch('/api/generation/presets');
     if (!response.ok) {
       if (deniedResponse(response)) {
         markAccessDenied('presets', true);
@@ -1550,8 +1571,8 @@ export default function App() {
     setActiveConnectionPresetName(data.active || '');
   };
 
-  const loadPresetTypes = async (token = authToken, openActivePreset = true) => {
-    const [typesResponse, activeResponse] = await Promise.all([authedFetch('/api/presets/types', {}, token), authedFetch('/api/presets/active', {}, token)]);
+  const loadPresetTypes = async (openActivePreset = true) => {
+    const [typesResponse, activeResponse] = await Promise.all([authedFetch('/api/presets/types'), authedFetch('/api/presets/active')]);
     let active: Record<string, string> = {};
     if (typesResponse.ok) {
       const data = await typesResponse.json() as { types: PresetTypeInfo[] };
@@ -1577,12 +1598,12 @@ export default function App() {
     if (!openActivePreset) {
       return;
     }
-    await loadPresets(currentPresetType, active[currentPresetType], token);
+    await loadPresets(currentPresetType, active[currentPresetType]);
   };
 
-  const loadActivePresetDraft = async (token = authToken) => {
+  const loadActivePresetDraft = async () => {
     const presetType = selectedPresetTypeRef.current || selectedPresetType;
-    const response = await authedFetch(`/api/presets/${encodeURIComponent(presetType)}/active-draft`, {}, token);
+    const response = await authedFetch(`/api/presets/${encodeURIComponent(presetType)}/active-draft`);
     if (!response.ok) {
       return;
     }
@@ -1601,8 +1622,8 @@ export default function App() {
     setPresetJsonDraft(draft);
   };
 
-  const loadPresets = async (presetType: string, presetToOpen = '', token = authToken) => {
-    const response = await authedFetch(`/api/presets/${encodeURIComponent(presetType)}`, {}, token);
+  const loadPresets = async (presetType: string, presetToOpen = '') => {
+    const response = await authedFetch(`/api/presets/${encodeURIComponent(presetType)}`);
     if (!response.ok) {
       if (deniedResponse(response)) {
         markAccessDenied('presets', true);
@@ -1618,7 +1639,7 @@ export default function App() {
     markAccessDenied('presets', false);
     setPresets(data.presets);
     if (presetToOpen && data.presets.some((preset) => preset.name === presetToOpen)) {
-      await openPreset(presetType, presetToOpen, false, token);
+      await openPreset(presetType, presetToOpen, false);
     }
   };
 
@@ -1634,7 +1655,7 @@ export default function App() {
     if (!name) {
       return;
     }
-    const response = await authedFetch(`/api/presets/${encodeURIComponent(presetType)}/${encodeURIComponent(name)}`, {}, token);
+    const response = await authedFetch(`/api/presets/${encodeURIComponent(presetType)}/${encodeURIComponent(name)}`);
     if (!response.ok) {
       if (deniedResponse(response)) {
         markAccessDenied('presets', true);
@@ -1767,8 +1788,8 @@ export default function App() {
     setPresetMessage('Экспорт пресета готов');
   };
 
-  const loadLorebooks = async (token = authToken) => {
-    const response = await authedFetch('/api/lorebooks', {}, token);
+  const loadLorebooks = async () => {
+    const response = await authedFetch('/api/lorebooks');
     if (!response.ok) {
       if (deniedResponse(response)) {
         markAccessDenied('lorebooks', true);
@@ -1783,12 +1804,12 @@ export default function App() {
     setLorebookBindings(data.bindings);
   };
 
-  const reloadSelectedLorebook = async (token = authTokenRef.current) => {
+  const reloadSelectedLorebook = async () => {
     const name = selectedLorebookNameRef.current;
     if (!name) {
       return;
     }
-    const response = await authedFetch(`/api/lorebooks/${encodeURIComponent(name)}`, {}, token);
+    const response = await authedFetch(`/api/lorebooks/${encodeURIComponent(name)}`);
     if (response.ok) {
       const data = await response.json() as { book: unknown };
       setLorebookNameDraft(name);
@@ -1804,30 +1825,29 @@ export default function App() {
   };
 
   const refreshSharedSettings = async (section = '') => {
-    const token = authTokenRef.current;
     if (section === 'generation') {
-      await Promise.all([loadGenerationSettings(token), loadConnectionPresets(token)]);
+      await Promise.all([loadGenerationSettings(), loadConnectionPresets()]);
       return;
     }
     if (section === 'presets') {
-      await Promise.all([loadGenerationSettings(token), loadConnectionPresets(token), loadPresetTypes(token, false)]);
-      await loadActivePresetDraft(token);
+      await Promise.all([loadGenerationSettings(), loadConnectionPresets(), loadPresetTypes(false)]);
+      await loadActivePresetDraft();
       return;
     }
     if (section === 'lorebooks') {
-      await loadLorebooks(token);
-      await reloadSelectedLorebook(token);
+      await loadLorebooks();
+      await reloadSelectedLorebook();
       return;
     }
     if (section === 'keys') {
-      await loadGenerationSettings(token);
+      await loadGenerationSettings();
       return;
     }
     if (section === 'extensions') {
       return;
     }
-    await Promise.all([loadGenerationSettings(token), loadConnectionPresets(token), loadPresetTypes(token), loadLorebooks(token)]);
-    await reloadSelectedLorebook(token);
+    await Promise.all([loadGenerationSettings(), loadConnectionPresets(), loadPresetTypes(), loadLorebooks()]);
+    await reloadSelectedLorebook();
   };
 
   const openLorebook = async (name: string) => {
@@ -1966,8 +1986,8 @@ export default function App() {
     }
   };
 
-  const openChatForCard = async (card: CharacterCard, chatId: string, token = authToken) => {
-    const response = await authedFetch(`/api/cards/${encodeURIComponent(card.id)}/chats/${encodeURIComponent(chatId)}`, {}, token);
+  const openChatForCard = async (card: CharacterCard, chatId: string) => {
+    const response = await authedFetch(`/api/cards/${encodeURIComponent(card.id)}/chats/${encodeURIComponent(chatId)}`);
     if (!response.ok) {
       if (deniedResponse(response)) {
         markAccessDenied('chats', true);
@@ -1983,20 +2003,19 @@ export default function App() {
     setActiveChat(data.chat);
     setChatPickerOpen(false);
     rememberChatSelection(card.id, data.chat.id);
-    await refreshCardChats(card.id, token);
+    await refreshCardChats(card.id);
     return true;
   };
 
   const refreshAccessControlledData = async () => {
-    const token = authTokenRef.current;
-    await Promise.all([refreshLibrary(token), loadConnectionPresets(token), loadPresetTypes(token), loadLorebooks(token)]);
+    await Promise.all([refreshLibrary(), loadConnectionPresets(), loadPresetTypes(), loadLorebooks()]);
     const card = activeCardRef.current;
     const chat = activeChatRef.current;
     if (card) {
-      await refreshCardChats(card.id, token);
+      await refreshCardChats(card.id);
     }
     if (card && chat) {
-      await openChatForCard(card, chat.id, token);
+      await openChatForCard(card, chat.id);
     }
   };
 
@@ -2083,8 +2102,8 @@ export default function App() {
     setConnectionMessage(modelNames.length ? `Найдено моделей: ${modelNames.length}` : 'Подключение работает, но список моделей пуст');
   };
 
-  const refreshCardChats = async (cardId: string, token = authToken) => {
-    const response = await authedFetch(`/api/cards/${encodeURIComponent(cardId)}/chats`, {}, token);
+  const refreshCardChats = async (cardId: string) => {
+    const response = await authedFetch(`/api/cards/${encodeURIComponent(cardId)}/chats`);
     if (response.ok) {
       const data = await response.json() as { chats: BotChatSummary[] };
       markAccessDenied('chats', false);
@@ -2849,7 +2868,7 @@ export default function App() {
             <strong>DoubleTrouble</strong>
             <small>default session · 127.0.0.1:8017</small>
           </div>
-          <span className="brand-mark">DT</span>
+          <img className="brand-mark" src="/favicon.png" alt="DT" />
         </div>
       </header>
 
@@ -3555,6 +3574,12 @@ function MenuOverlay({
 }
 
 function AuthGate({ authDraft, setAuthDraft, authMessage, registrationAllowed, login, register }: { authDraft: { username: string; password: string; adminCode: string }; setAuthDraft: (draft: { username: string; password: string; adminCode: string }) => void; authMessage: string; registrationAllowed: boolean; login: () => Promise<void>; register: () => Promise<void> }) {
+  useEffect(() => {
+    const saved = window.localStorage.getItem(AUTH_USERNAME_STORAGE_KEY);
+    if (saved) {
+      setAuthDraft({ ...authDraft, username: saved });
+    }
+  }, []);
   return (
     <main className="auth-gate-shell">
       <section className="auth-gate-card">
@@ -3563,16 +3588,16 @@ function AuthGate({ authDraft, setAuthDraft, authMessage, registrationAllowed, l
           <h1>Вход закрыт</h1>
           <p>Этот сервер требует аккаунт для просмотра карточек, персон, чатов и аватарок.</p>
         </div>
-        <div className="form-stack">
+        <form className="form-stack" onSubmit={(event) => { event.preventDefault(); void login(); }}>
           <EditableField label="Ник" value={authDraft.username} onChange={(username) => setAuthDraft({ ...authDraft, username })} />
           <EditableField label="Пароль" type="password" value={authDraft.password} onChange={(password) => setAuthDraft({ ...authDraft, password })} />
           <div className="preset-actions">
-            <button type="button" onClick={() => void login()}>Войти</button>
+            <button type="submit">Войти</button>
             {registrationAllowed ? <button className="ghost-button" type="button" onClick={() => void register()}>Регистрация</button> : null}
           </div>
           {!registrationAllowed ? <p className="helper-text">Регистрация на сервере отключена администратором.</p> : null}
           {authMessage ? <p className="library-message">{authMessage}</p> : null}
-        </div>
+        </form>
       </section>
     </main>
   );
@@ -6544,14 +6569,18 @@ function DeleteConfirmButton({
   const pending = pendingDeleteKey === itemKey;
   return (
     <span className="delete-confirm-group">
-      {admin && toggleLock ? <button className={locked ? 'ghost-button lock-button locked' : 'ghost-button lock-button'} type="button" title={locked ? 'Разблокировать удаление' : 'Заблокировать удаление'} onClick={toggleLock}>{locked ? '🔒' : '🔓'}</button> : null}
       {pending ? (
         <>
           <span className="delete-confirm-label">Точно?</span>
           <button className="danger-button" type="button" onClick={() => { setPendingDeleteKey(''); onConfirm(); }}>Да</button>
           <button className="ghost-button" type="button" onClick={() => setPendingDeleteKey('')}>Нет</button>
         </>
-      ) : <button className="ghost-button danger-button" type="button" disabled={locked} title={locked ? 'Удаление заблокировано админом' : label} onClick={() => setPendingDeleteKey(itemKey)}>{label}</button>}
+      ) : (
+        <span className="delete-confirm-main">
+          {admin && toggleLock ? <button className={locked ? 'ghost-button lock-button locked' : 'ghost-button lock-button'} type="button" title={locked ? 'Разблокировать удаление' : 'Заблокировать удаление'} onClick={toggleLock}>{locked ? '🔒' : '🔓'}</button> : null}
+          <button className="ghost-button danger-button" type="button" disabled={locked} title={locked ? 'Удаление заблокировано админом' : label} onClick={() => setPendingDeleteKey(itemKey)}>{label}</button>
+        </span>
+      )}
     </span>
   );
 }
