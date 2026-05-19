@@ -60,7 +60,7 @@
 
 ```bash
 # 1. Клонировать
-git clone <repo-url>
+git clone https://github.com/l4ckofsleep/DoubleTrouble.git
 cd DoubleTrouble
 
 # 2. Бэкенд
@@ -92,7 +92,7 @@ python run.py
 #### Вариант А — Скрипт в один клик (PowerShell)
 
 ```powershell
-git clone <repo-url>
+git clone https://github.com/l4ckofsleep/DoubleTrouble.git
 cd DoubleTrouble
 .\start.ps1
 ```
@@ -103,7 +103,7 @@ cd DoubleTrouble
 
 ```powershell
 # 1. Клонировать
-git clone <repo-url>
+git clone https://github.com/l4ckofsleep/DoubleTrouble.git
 cd DoubleTrouble
 
 # 2. Бэкенд
@@ -130,7 +130,7 @@ python run.py
 #### Вариант А — Скрипт в один клик (Bash)
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/l4ckofsleep/DoubleTrouble.git
 cd DoubleTrouble
 chmod +x start.sh
 ./start.sh
@@ -140,7 +140,7 @@ chmod +x start.sh
 
 ```bash
 # 1. Клонировать
-git clone <repo-url>
+git clone https://github.com/l4ckofsleep/DoubleTrouble.git
 cd DoubleTrouble
 
 # 2. Бэкенд
@@ -178,7 +178,7 @@ pkg install git python nodejs-lts
 3. Клонируй и установи:
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/l4ckofsleep/DoubleTrouble.git
 cd DoubleTrouble
 python -m venv .venv
 source .venv/bin/activate
@@ -800,7 +800,7 @@ You also need an OpenAI-compatible API endpoint if you want bot replies (local L
 
 ```bash
 # 1. Clone
-git clone <repo-url>
+git clone https://github.com/l4ckofsleep/DoubleTrouble.git
 cd DoubleTrouble
 
 # 2. Backend
@@ -834,7 +834,7 @@ Then open `http://127.0.0.1:8017`.
 #### Option A — One-click script (PowerShell)
 
 ```powershell
-git clone <repo-url>
+git clone https://github.com/l4ckofsleep/DoubleTrouble.git
 cd DoubleTrouble
 .\start.ps1
 ```
@@ -842,7 +842,7 @@ cd DoubleTrouble
 #### Option B — Manual
 
 ```powershell
-git clone <repo-url>
+git clone https://github.com/l4ckofsleep/DoubleTrouble.git
 cd DoubleTrouble
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -862,7 +862,7 @@ python run.py
 #### Option A — One-click script (Bash)
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/l4ckofsleep/DoubleTrouble.git
 cd DoubleTrouble
 chmod +x start.sh
 ./start.sh
@@ -871,7 +871,7 @@ chmod +x start.sh
 #### Option B — Manual
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/l4ckofsleep/DoubleTrouble.git
 cd DoubleTrouble
 python3 -m venv .venv
 source .venv/bin/activate
@@ -900,7 +900,7 @@ pkg install git python nodejs-lts
 3. Clone and install:
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/l4ckofsleep/DoubleTrouble.git
 cd DoubleTrouble
 python -m venv .venv
 source .venv/bin/activate
