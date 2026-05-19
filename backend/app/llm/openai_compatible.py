@@ -10,10 +10,32 @@ from backend.app.llm.base import GenerationRequest
 
 
 class OpenAICompatibleProvider:
-    def __init__(self, base_url: str, api_key: str = "", timeout_seconds: float = 60.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "",
+        timeout_seconds: float = 60.0,
+        *,
+        chat_path: str = "/chat/completions",
+        models_path: str = "/models",
+        extra_headers: dict[str, str] | None = None,
+        extra_query: dict[str, str] | None = None,
+        extra_body: dict[str, Any] | None = None,
+        auth_header: str = "Authorization",
+        auth_format: str = "Bearer {api_key}",
+        send_auth: bool = True,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
+        self.chat_path = chat_path if chat_path.startswith("/") else f"/{chat_path}"
+        self.models_path = models_path if models_path.startswith("/") else f"/{models_path}"
+        self.extra_headers = dict(extra_headers or {})
+        self.extra_query = dict(extra_query or {})
+        self.extra_body = dict(extra_body or {})
+        self.auth_header = auth_header
+        self.auth_format = auth_format
+        self.send_auth = send_auth
 
     async def status(self) -> dict[str, Any]:
         if not self.base_url:
@@ -22,7 +44,7 @@ class OpenAICompatibleProvider:
         headers = self._headers()
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             try:
-                response = await client.get(f"{self.base_url}/models", headers=headers)
+                response = await client.get(f"{self.base_url}{self.models_path}", headers=headers, params=self.extra_query or None)
             except httpx.HTTPError as error:
                 return {"ok": False, "error": str(error)}
             if response.status_code >= 400:
@@ -37,7 +59,12 @@ class OpenAICompatibleProvider:
 
         body = self._request_body(request, stream=False)
         async with httpx.AsyncClient(timeout=self._timeout()) as client:
-            response = await client.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=body)
+            response = await client.post(
+                f"{self.base_url}{self.chat_path}",
+                headers=self._headers(),
+                json=body,
+                params=self.extra_query or None,
+            )
             response.raise_for_status()
             data = response.json()
 
@@ -56,7 +83,13 @@ class OpenAICompatibleProvider:
 
         body = self._request_body(request, stream=True)
         async with httpx.AsyncClient(timeout=self._timeout()) as client:
-            async with client.stream("POST", f"{self.base_url}/chat/completions", headers=self._headers(), json=body) as response:
+            async with client.stream(
+                "POST",
+                f"{self.base_url}{self.chat_path}",
+                headers=self._headers(),
+                json=body,
+                params=self.extra_query or None,
+            ) as response:
                 if response.status_code >= 400:
                     await response.aread()
                 response.raise_for_status()
@@ -92,6 +125,8 @@ class OpenAICompatibleProvider:
             "max_tokens": request.max_tokens,
         }
         body.update(parameters)
+        for key, value in self.extra_body.items():
+            body[key] = value
         body["stream"] = stream
         for key in excluded_body_keys:
             body.pop(key, None)
@@ -226,9 +261,11 @@ class OpenAICompatibleProvider:
         return content if isinstance(content, str) else ""
 
     def _headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self.send_auth and self.api_key:
+            headers[self.auth_header] = self.auth_format.format(api_key=self.api_key)
+        for key, value in self.extra_headers.items():
+            headers[key] = value
         return headers
 
     def _message_to_dict(self, message: Any) -> dict[str, str]:

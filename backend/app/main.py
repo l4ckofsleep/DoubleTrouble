@@ -26,6 +26,7 @@ from backend.app.secrets import SecretStore
 from backend.app.services.generation_service import GenerationService
 from backend.app.services.lorebooks_service import LorebookBindingPayload, LorebookPayload, LorebooksService
 from backend.app.services.extensions_service import ExtensionInstallRequest, ExtensionsService
+from backend.app.llm.chat_completion_sources import build_provider, get_source, list_sources_payload, resolve_source_id
 from backend.app.llm.openai_compatible import OpenAICompatibleProvider
 from backend.app.services.personas_service import PersonaCreate, PersonasService, PersonaUpdate
 from backend.app.services.auth_service import AuthService, AuthUser
@@ -1238,6 +1239,11 @@ async def delete_generation_preset(name: str, request: Request) -> dict[str, obj
     return {"ok": True, "active": settings_service.active_generation_preset()}
 
 
+@app.get("/api/generation/sources")
+async def generation_sources() -> dict[str, object]:
+    return {"sources": list_sources_payload()}
+
+
 @app.post("/api/generation/models")
 async def generation_models(request: GenerationSettingsUpdate, http_request: Request) -> dict[str, object]:
     _require_permission(http_request, "manage_keys")
@@ -1246,9 +1252,37 @@ async def generation_models(request: GenerationSettingsUpdate, http_request: Req
     base_url = request.base_url.strip()
     if base_url and not base_url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="base_url must be http or https")
-    api_key = request.api_key.strip() or secret_store.read(settings_service.generation_config().api_key_secret, settings_service.generation_config().api_key_env)
-    provider = OpenAICompatibleProvider(request.base_url, api_key, request.timeout_seconds)
+    source_id = request.chat_completion_source or resolve_source_id(request.provider)
+    current = settings_service.generation_config()
+    source = get_source(source_id)
+    api_key = request.api_key.strip()
+    if not api_key and source and source.secret_key_name:
+        api_key = secret_store.read(source.secret_key_name, source.api_key_env)
+    if not api_key:
+        api_key = secret_store.read(current.api_key_secret, current.api_key_env)
+    proxy_password = ""
+    if request.reverse_proxy.strip():
+        proxy_password = request.proxy_password.strip() or secret_store.read(current.proxy_password_secret, "")
+    extra_settings = (request.source_settings or {}).get(source_id, {})
+    provider = build_provider(
+        source_id,
+        base_url=request.base_url,
+        api_key=api_key,
+        timeout_seconds=request.timeout_seconds,
+        extra_settings=extra_settings,
+        reverse_proxy=request.reverse_proxy,
+        proxy_password=proxy_password,
+    )
     return await provider.status()
+
+
+@app.post("/api/generation/test")
+async def generation_test(request: GenerationSettingsUpdate, http_request: Request) -> dict[str, object]:
+    """Quick connectivity check that exercises the same provider plumbing as live generation."""
+    _require_permission(http_request, "manage_keys")
+    if request.provider == "disabled":
+        return {"ok": False, "error": "generation provider is disabled"}
+    return await generation_models(request, http_request)
 
 
 @app.post("/api/image-generation/models")

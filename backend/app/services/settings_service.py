@@ -4,15 +4,18 @@ import hashlib
 import hmac
 import secrets
 from pathlib import Path
+from typing import Any
 from pydantic import BaseModel, Field
 import yaml
 
 from backend.app.config import GenerationConfig
+from backend.app.llm.chat_completion_sources import resolve_source_id, get_source
 from backend.app.secrets import SecretStore
 
 
 class GenerationSettingsUpdate(BaseModel):
     provider: str = "disabled"
+    chat_completion_source: str = ""
     base_url: str = ""
     model: str = ""
     bot_name: str = "Bot"
@@ -22,17 +25,26 @@ class GenerationSettingsUpdate(BaseModel):
     timeout_seconds: float = Field(default=60, ge=1, le=600)
     api_key: str = ""
     clear_api_key: bool = False
+    reverse_proxy: str = ""
+    proxy_password: str = ""
+    clear_proxy_password: bool = False
+    source_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    parameters: dict[str, Any] = Field(default_factory=dict)
 
 
 class GenerationConnectionPreset(BaseModel):
     name: str
     provider: str = "disabled"
+    chat_completion_source: str = ""
     base_url: str = ""
     model: str = ""
     system_prompt: str = "You are a collaborative roleplay assistant. Continue the scene naturally."
     temperature: float = Field(default=0.8, ge=0, le=2)
     max_tokens: int = Field(default=350, ge=1, le=32000)
     timeout_seconds: float = Field(default=60, ge=1, le=600)
+    reverse_proxy: str = ""
+    source_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    parameters: dict[str, Any] = Field(default_factory=dict)
 
 
 class GenerationPresetSave(BaseModel):
@@ -109,8 +121,12 @@ class SettingsService:
 
     def generation_settings(self) -> dict[str, object]:
         generation = self.settings.generation
+        source_id = self._effective_source_id(generation)
+        source_api_key_secret = self._source_api_key_secret(source_id) or generation.api_key_secret
+        source_api_key_env = self._source_api_key_env(source_id) or generation.api_key_env
         return {
             "provider": generation.provider,
+            "chat_completion_source": source_id,
             "base_url": generation.base_url,
             "model": generation.model,
             "bot_name": generation.bot_name,
@@ -118,9 +134,32 @@ class SettingsService:
             "temperature": generation.temperature,
             "max_tokens": generation.max_tokens,
             "timeout_seconds": generation.timeout_seconds,
-            "api_key_configured": self.secret_store.exists(generation.api_key_secret, generation.api_key_env),
-            "api_key_env": generation.api_key_env,
+            "api_key_configured": self.secret_store.exists(generation.api_key_secret, generation.api_key_env)
+            or self.secret_store.exists(source_api_key_secret, source_api_key_env),
+            "api_key_env": source_api_key_env,
+            "reverse_proxy": generation.reverse_proxy,
+            "proxy_password_configured": self.secret_store.exists(generation.proxy_password_secret, ""),
+            "source_settings": dict(generation.source_settings),
+            "parameters": dict(generation.parameters),
         }
+
+    @staticmethod
+    def _effective_source_id(generation: GenerationConfig) -> str:
+        if generation.chat_completion_source:
+            return generation.chat_completion_source
+        if generation.provider in ("", "disabled"):
+            return generation.provider or ""
+        return resolve_source_id(generation.provider)
+
+    @staticmethod
+    def _source_api_key_secret(source_id: str) -> str:
+        source = get_source(source_id)
+        return source.secret_key_name if source else ""
+
+    @staticmethod
+    def _source_api_key_env(source_id: str) -> str:
+        source = get_source(source_id)
+        return source.api_key_env if source else ""
 
     def generation_presets(self) -> list[GenerationConnectionPreset]:
         return sorted(self.settings.generation_presets, key=lambda preset: preset.name.lower())
@@ -138,12 +177,16 @@ class SettingsService:
         preset = GenerationConnectionPreset(
             name=name,
             provider=request.settings.provider,
+            chat_completion_source=request.settings.chat_completion_source,
             base_url=request.settings.base_url.strip().rstrip("/"),
             model=request.settings.model.strip(),
             system_prompt=request.settings.system_prompt.strip(),
             temperature=request.settings.temperature,
             max_tokens=request.settings.max_tokens,
             timeout_seconds=request.settings.timeout_seconds,
+            reverse_proxy=request.settings.reverse_proxy.strip(),
+            source_settings=dict(request.settings.source_settings),
+            parameters=dict(request.settings.parameters),
         )
         self.settings.generation_presets = [existing for existing in self.settings.generation_presets if existing.name.lower() != name.lower()]
         self.settings.generation_presets.append(preset)
@@ -158,6 +201,7 @@ class SettingsService:
         current = self.settings.generation
         self.settings.generation = GenerationConfig(
             provider=preset.provider,
+            chat_completion_source=preset.chat_completion_source or resolve_source_id(preset.provider),
             base_url=preset.base_url.strip().rstrip("/"),
             model=preset.model.strip(),
             api_key_secret=current.api_key_secret,
@@ -167,7 +211,10 @@ class SettingsService:
             temperature=preset.temperature,
             max_tokens=preset.max_tokens,
             timeout_seconds=preset.timeout_seconds,
-            parameters=current.parameters,
+            parameters=dict(preset.parameters) or current.parameters,
+            reverse_proxy=preset.reverse_proxy.strip(),
+            proxy_password_secret=current.proxy_password_secret,
+            source_settings=dict(preset.source_settings),
         )
         self.settings.active_generation_preset = name
         self._save_settings()
@@ -293,8 +340,14 @@ class SettingsService:
 
     def update_generation_settings(self, request: GenerationSettingsUpdate) -> GenerationConfig:
         current = self.settings.generation
+        new_source = request.chat_completion_source or resolve_source_id(request.provider)
+        merged_source_settings = dict(current.source_settings)
+        for key, value in (request.source_settings or {}).items():
+            if isinstance(value, dict):
+                merged_source_settings[key] = dict(value)
         self.settings.generation = GenerationConfig(
             provider=request.provider,
+            chat_completion_source=new_source,
             base_url=request.base_url.strip().rstrip("/"),
             model=request.model.strip(),
             api_key_secret=current.api_key_secret,
@@ -304,13 +357,28 @@ class SettingsService:
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             timeout_seconds=request.timeout_seconds,
-            parameters=current.parameters,
+            parameters=dict(request.parameters) if request.parameters else current.parameters,
+            reverse_proxy=request.reverse_proxy.strip(),
+            proxy_password_secret=current.proxy_password_secret,
+            source_settings=merged_source_settings,
         )
 
+        # General API key (legacy + active source).
         if request.clear_api_key:
             self.secret_store.delete(current.api_key_secret)
+            source_secret = self._source_api_key_secret(new_source)
+            if source_secret:
+                self.secret_store.delete(source_secret)
         elif request.api_key.strip():
             self.secret_store.write(current.api_key_secret, request.api_key.strip())
+            source_secret = self._source_api_key_secret(new_source)
+            if source_secret and source_secret != current.api_key_secret:
+                self.secret_store.write(source_secret, request.api_key.strip())
+
+        if request.clear_proxy_password:
+            self.secret_store.delete(current.proxy_password_secret)
+        elif request.proxy_password.strip():
+            self.secret_store.write(current.proxy_password_secret, request.proxy_password.strip())
 
         self._save_settings()
         return self.settings.generation

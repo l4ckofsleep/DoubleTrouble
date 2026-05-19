@@ -31,6 +31,7 @@ class AuthConfig(BaseModel):
 
 class GenerationConfig(BaseModel):
     provider: str = "disabled"
+    chat_completion_source: str = ""
     base_url: str = ""
     model: str = ""
     api_key_secret: str = "provider_api_key"
@@ -41,6 +42,9 @@ class GenerationConfig(BaseModel):
     max_tokens: int = 350
     timeout_seconds: float = 60.0
     parameters: dict[str, Any] = Field(default_factory=dict)
+    reverse_proxy: str = ""
+    proxy_password_secret: str = "provider_proxy_password"
+    source_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class SecurityConfig(BaseModel):
