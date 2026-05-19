@@ -275,6 +275,163 @@ http://<IP-ПК>:8017
 
 ---
 
+## Способы подключения через интернет
+
+Если у вас и ваших друзей нет общей Wi-Fi-сети, используйте один из методов ниже. Все они работают с DoubleTrouble.
+
+> **Важно:** перед началом убедитесь, что в `config/config.yaml` указано `listen_ip: 0.0.0.0` и `allow_external_connections: true`.
+
+---
+
+### 1. Открытие портов на роутере (Port Forwarding)
+
+Самый быстрый способ, но требует доступа к настройкам роутера.
+
+**Шаги:**
+1. Узнай локальный IP ПК: `ipconfig` (Windows) или `ip addr` (Linux).
+2. Открой настройки роутера в браузере (обычно `192.168.1.1` или `192.168.0.1`).
+3. Найди раздел **Port Forwarding / Virtual Servers / NAT**.
+4. Добавь правило:
+   - **External port:** `8017`
+   - **Internal IP:** IP твоего ПК (например, `192.168.1.25`)
+   - **Internal port:** `8017`
+   - **Protocol:** `TCP`
+5. Узнай внешний IP роутера: [2ip.ru](https://2ip.ru) или [ifconfig.me](https://ifconfig.me).
+6. Друзья подключаются по адресу:
+
+```text
+http://<ВНЕШНИЙ-IP>:8017
+```
+
+> ⚠️ Внешний IP может меняться. Если у провайдера динамический IP — используй DDNS (No-IP, Duck DNS) или один из VPN-способов ниже.
+
+---
+
+### 2. Radmin VPN
+
+Бесплатный VPN, простой как Hamachi. Не требует регистрации.
+
+1. **Все участники** скачивают и устанавливают [Radmin VPN](https://www.radmin-vpn.com/).
+2. **Хост** (тот, у кого запущен сервер):
+   - Создаёт сеть: `Network → Create Network`
+   - Запоминает **Network name** и **Password**.
+3. **Гости**:
+   - `Network → Join Network` → вводят имя и пароль сети.
+4. **Хост** узнаёт свой VPN-IP в Radmin VPN (обычно `26.x.x.x`).
+5. **Все** открывают в браузере:
+
+```text
+http://<VPN-IP-ХОСТА>:8017
+```
+
+> ✅ Скорость до 100 Мбит/с, бесплатно, без лимита участников.
+
+---
+
+### 3. Tailscale
+
+Современная mesh-VPN на базе WireGuard. Надёжная и безопасная.
+
+1. **Все участники** регистрируются на [tailscale.com](https://tailscale.com/) и устанавливают клиент.
+2. Авторизуют устройства под одним аккаунтом (или приглашают друг друга в сеть).
+3. **Хост** запускает DoubleTrouble (`python run.py`).
+4. **Хост** находит свой Tailscale-IP в приложении (начинается на `100.x.x.x`).
+5. **Все** открывают:
+
+```text
+http://<TAILSCALE-IP-ХОСТА>:8017
+```
+
+> ✅ Бесплатно до 3 пользователей и 100 устройств. Работает через NAT и firewall без настройки.
+
+---
+
+### 4. ZeroTier
+
+Альтернатива Tailscale. Создаёт виртуальную LAN без открытия портов.
+
+1. **Хост** регистрируется на [my.zerotier.com](https://my.zerotier.com/), создаёт сеть и копирует **Network ID**.
+2. **Все участники** устанавливают ZeroTier и присоединяются к сети по **Network ID**.
+3. **Хост** в веб-панели ZeroTier одобряет новые устройства (Auth).
+4. **Хост** запускает DoubleTrouble.
+5. **Хост** смотрит свой ZeroTier IP в веб-панели (например, `192.168.192.x`).
+6. **Все** открывают:
+
+```text
+http://<ZEROTIER-IP-ХОСТА>:8017
+```
+
+> ✅ Бесплатно до 25 устройств. Не требует регистрации у гостей.
+
+---
+
+### 5. ngrok
+
+Мгновенный доступ без роутера и VPN. Подходит для быстрых тестов.
+
+1. **Хост** регистрируется на [ngrok.com](https://ngrok.com/), скачивает и устанавливает ngrok.
+2. Авторизует ngrok по токену (один раз):
+
+```bash
+ngrok config add-authtoken <ТВОЙ-ТОКЕН>
+```
+
+3. Запускает туннель:
+
+```bash
+ngrok http 8017
+```
+
+4. В терминале появится временный URL:
+
+```text
+Forwarding  https://abc123.ngrok-free.app -> http://localhost:8017
+```
+
+5. **Все** открывают этот URL в браузере.
+
+> ⚠️ Бесплатный тариф: URL меняется при каждом запуске. Для постоянного URL нужен платный тариф.
+
+---
+
+### 6. Cloudflare Tunnel (быстрый туннель)
+
+Бесплатный туннель без регистрации (для тестов).
+
+1. **Хост** скачивает [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-local-tunnel/).
+2. Запускает быстрый туннель:
+
+```bash
+cloudflared tunnel --url http://localhost:8017
+```
+
+3. В терминале появится временный URL на `trycloudflare.com`:
+
+```text
+https://random-name.trycloudflare.com
+```
+
+4. **Все** открывают этот URL.
+
+> ⚠️ Бесплатный quick tunnel: URL случайный, ограничение 200 одновременных запросов. Для постоянного URL нужен аккаунт Cloudflare и настройка туннеля.
+
+---
+
+### Сравнение способов
+
+| Способ | Сложность | Скорость | Постоянный URL | Бесплатно |
+|--------|-----------|----------|----------------|-----------|
+| Port Forwarding | Средняя | Максимальная | Да (с DDNS) | Да |
+| Radmin VPN | Легкая | Хорошая | Да (внутри VPN) | Да |
+| Tailscale | Легкая | Отличная | Да (внутри VPN) | Да (до 3 чел.) |
+| ZeroTier | Средняя | Хорошая | Да (внутри VPN) | Да (до 25 устр.) |
+| ngrok | Легкая | Хорошая | Нет | Да (URL меняется) |
+| Cloudflare Tunnel | Легкая | Хорошая | Нет | Да (URL меняется) |
+
+> **Рекомендация:** для регулярной игры с друзьями — **Tailscale** или **Radmin VPN**. Для разового теста — **Cloudflare quick tunnel** или **ngrok**.
+
+---
+
 ## Первая настройка
 
 После запуска приложения:
@@ -590,6 +747,164 @@ http://<PC-LAN-IP>:8017
 ```
 
 > **Windows:** Allow Python through Windows Firewall for **private** networks.
+
+---
+
+<a id="internet-connection-en"></a>
+## Internet Connection Methods
+
+If you and your friends don't share a Wi-Fi network, use one of the methods below. All of them work with DoubleTrouble.
+
+> **Important:** before starting, make sure `config/config.yaml` has `listen_ip: 0.0.0.0` and `allow_external_connections: true`.
+
+---
+
+### 1. Port Forwarding
+
+The fastest method, but requires access to your router settings.
+
+**Steps:**
+1. Find your PC's local IP: `ipconfig` (Windows) or `ip addr` (Linux).
+2. Open your router settings in a browser (usually `192.168.1.1` or `192.168.0.1`).
+3. Find the **Port Forwarding / Virtual Servers / NAT** section.
+4. Add a rule:
+   - **External port:** `8017`
+   - **Internal IP:** your PC's IP (e.g., `192.168.1.25`)
+   - **Internal port:** `8017`
+   - **Protocol:** `TCP`
+5. Find your router's public IP: [2ip.ru](https://2ip.ru) or [ifconfig.me](https://ifconfig.me).
+6. Friends connect to:
+
+```text
+http://<PUBLIC-IP>:8017
+```
+
+> ⚠️ Public IP may change. If your ISP uses dynamic IP, use DDNS (No-IP, Duck DNS) or one of the VPN methods below.
+
+---
+
+### 2. Radmin VPN
+
+Free VPN, as simple as Hamachi. No registration required.
+
+1. **All participants** download and install [Radmin VPN](https://www.radmin-vpn.com/).
+2. **Host** (the one running the server):
+   - Creates a network: `Network → Create Network`
+   - Notes the **Network name** and **Password**.
+3. **Guests**:
+   - `Network → Join Network` → enter the network name and password.
+4. **Host** checks their VPN IP in Radmin VPN (usually `26.x.x.x`).
+5. **Everyone** opens in their browser:
+
+```text
+http://<HOST-VPN-IP>:8017
+```
+
+> ✅ Speed up to 100 Mbps, free, unlimited participants.
+
+---
+
+### 3. Tailscale
+
+Modern mesh VPN based on WireGuard. Reliable and secure.
+
+1. **All participants** sign up at [tailscale.com](https://tailscale.com/) and install the client.
+2. Authorize devices under one account (or invite each other to the network).
+3. **Host** starts DoubleTrouble (`python run.py`).
+4. **Host** finds their Tailscale IP in the app (starts with `100.x.x.x`).
+5. **Everyone** opens:
+
+```text
+http://<HOST-TAILSCALE-IP>:8017
+```
+
+> ✅ Free for up to 3 users and 100 devices. Works through NAT and firewall without setup.
+
+---
+
+### 4. ZeroTier
+
+Alternative to Tailscale. Creates a virtual LAN without opening ports.
+
+1. **Host** signs up at [my.zerotier.com](https://my.zerotier.com/), creates a network, and copies the **Network ID**.
+2. **All participants** install ZeroTier and join the network using the **Network ID**.
+3. **Host** approves new devices in the ZeroTier web panel (Auth).
+4. **Host** starts DoubleTrouble.
+5. **Host** checks their ZeroTier IP in the web panel (e.g., `192.168.192.x`).
+6. **Everyone** opens:
+
+```text
+http://<HOST-ZEROTIER-IP>:8017
+```
+
+> ✅ Free for up to 25 devices. Guests don't need to register.
+
+---
+
+### 5. ngrok
+
+Instant access without router or VPN. Good for quick tests.
+
+1. **Host** signs up at [ngrok.com](https://ngrok.com/), downloads and installs ngrok.
+2. Authorize ngrok with a token (one time):
+
+```bash
+ngrok config add-authtoken <YOUR-TOKEN>
+```
+
+3. Start the tunnel:
+
+```bash
+ngrok http 8017
+```
+
+4. A temporary URL appears in the terminal:
+
+```text
+Forwarding  https://abc123.ngrok-free.app -> http://localhost:8017
+```
+
+5. **Everyone** opens that URL in their browser.
+
+> ⚠️ Free tier: URL changes on every launch. Paid plan required for a permanent URL.
+
+---
+
+### 6. Cloudflare Tunnel (Quick Tunnel)
+
+Free tunnel without registration (for testing).
+
+1. **Host** downloads [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-local-tunnel/).
+2. Start the quick tunnel:
+
+```bash
+cloudflared tunnel --url http://localhost:8017
+```
+
+3. A temporary URL on `trycloudflare.com` appears in the terminal:
+
+```text
+https://random-name.trycloudflare.com
+```
+
+4. **Everyone** opens that URL.
+
+> ⚠️ Free quick tunnel: random URL, 200 concurrent request limit. Permanent URL requires a Cloudflare account and tunnel setup.
+
+---
+
+### Method Comparison
+
+| Method | Difficulty | Speed | Permanent URL | Free |
+|--------|-----------|-------|---------------|------|
+| Port Forwarding | Medium | Maximum | Yes (with DDNS) | Yes |
+| Radmin VPN | Easy | Good | Yes (inside VPN) | Yes |
+| Tailscale | Easy | Excellent | Yes (inside VPN) | Yes (up to 3 users) |
+| ZeroTier | Medium | Good | Yes (inside VPN) | Yes (up to 25 devices) |
+| ngrok | Easy | Good | No | Yes (URL changes) |
+| Cloudflare Tunnel | Easy | Good | No | Yes (URL changes) |
+
+> **Recommendation:** for regular sessions with friends — **Tailscale** or **Radmin VPN**. For a one-time test — **Cloudflare quick tunnel** or **ngrok**.
 
 ---
 
