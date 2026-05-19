@@ -4392,6 +4392,32 @@ textarea {
   margin: 0.15rem 0 0;
 }
 
+.connection-source-extras {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.connection-proxy-section,
+.connection-params-section {
+  border: 1px solid var(--border-soft, rgba(255, 255, 255, 0.08));
+  border-radius: 0.6rem;
+  padding: 0.6rem 0.8rem;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.connection-proxy-section > summary,
+.connection-params-section > summary {
+  cursor: pointer;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+}
+
+.connection-proxy-section > *:not(summary),
+.connection-params-section > *:not(summary) {
+  margin-top: 0.4rem;
+}
+
 @media (max-width: 900px) {
   .extension-settings-host {
     inset: 4.5rem 0.75rem 1rem 0.75rem;

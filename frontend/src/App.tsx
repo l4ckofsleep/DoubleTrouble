@@ -94,6 +94,7 @@ type BotChat = BotChatSummary & {
 
 type GenerationSettings = {
   provider: string;
+  chat_completion_source: string;
   base_url: string;
   model: string;
   bot_name: string;
@@ -104,10 +105,30 @@ type GenerationSettings = {
   api_key: string;
   clear_api_key: boolean;
   api_key_configured?: boolean;
+  reverse_proxy: string;
+  proxy_password: string;
+  clear_proxy_password: boolean;
+  proxy_password_configured?: boolean;
+  source_settings: Record<string, Record<string, unknown>>;
+  parameters: Record<string, unknown>;
 };
 
-type ConnectionPreset = Omit<GenerationSettings, 'api_key' | 'clear_api_key' | 'api_key_configured' | 'bot_name'> & {
+type ConnectionPreset = Omit<GenerationSettings, 'api_key' | 'clear_api_key' | 'api_key_configured' | 'proxy_password' | 'clear_proxy_password' | 'proxy_password_configured' | 'bot_name'> & {
   name: string;
+};
+
+type ChatCompletionSourceMeta = {
+  id: string;
+  label: string;
+  default_base_url: string;
+  adapter: 'openai' | 'anthropic' | 'google_ai_studio';
+  requires_api_key: boolean;
+  supports_reverse_proxy: boolean;
+  custom_url_field: boolean;
+  extra_field_keys: string[];
+  extra_param_keys: string[];
+  secret_key_name: string;
+  api_key_env: string;
 };
 
 type PresetTypeInfo = {
@@ -308,24 +329,84 @@ const IMAGE_KEYS_STORAGE_KEY = 'doubletrouble.imageKeys';
 
 const emptyCardDraft: CardDraft = { name: '', description: '', personality: '', scenario: '', firstMessage: '', alternateGreetings: [], messageExample: '', creator: '', tags: '' };
 
-const connectionMethods = [
+const chatCompletionSources: ChatCompletionSourceMeta[] = [
+  { id: 'openai', label: 'OpenAI', default_base_url: 'https://api.openai.com/v1', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: true, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p', 'frequency_penalty', 'presence_penalty', 'seed', 'reasoning_effort', 'verbosity'], secret_key_name: 'provider_api_key_openai', api_key_env: 'OPENAI_API_KEY' },
+  { id: 'claude', label: 'Claude (Anthropic)', default_base_url: 'https://api.anthropic.com/v1', adapter: 'anthropic', requires_api_key: true, supports_reverse_proxy: true, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p', 'top_k'], secret_key_name: 'provider_api_key_claude', api_key_env: 'ANTHROPIC_API_KEY' },
+  { id: 'openrouter', label: 'OpenRouter', default_base_url: 'https://openrouter.ai/api/v1', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: ['openrouter_providers', 'openrouter_quantizations', 'openrouter_middleout', 'openrouter_use_fallback'], extra_param_keys: ['top_p', 'top_k', 'min_p', 'top_a', 'repetition_penalty', 'frequency_penalty', 'presence_penalty'], secret_key_name: 'provider_api_key_openrouter', api_key_env: 'OPENROUTER_API_KEY' },
+  { id: 'ai21', label: 'AI21', default_base_url: 'https://api.ai21.com/studio/v1', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p'], secret_key_name: 'provider_api_key_ai21', api_key_env: 'AI21_API_KEY' },
+  { id: 'makersuite', label: 'Google AI Studio (Gemini)', default_base_url: 'https://generativelanguage.googleapis.com', adapter: 'google_ai_studio', requires_api_key: true, supports_reverse_proxy: true, custom_url_field: false, extra_field_keys: ['google_safety_off', 'google_use_sysprompt'], extra_param_keys: ['top_p', 'top_k', 'thinking_budget'], secret_key_name: 'provider_api_key_makersuite', api_key_env: 'GOOGLE_API_KEY' },
+  { id: 'vertexai', label: 'Google Vertex AI', default_base_url: 'https://us-central1-aiplatform.googleapis.com', adapter: 'google_ai_studio', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: ['vertexai_region', 'vertexai_express_project_id', 'vertexai_auth_mode'], extra_param_keys: ['top_p', 'top_k', 'thinking_budget'], secret_key_name: 'provider_api_key_vertexai', api_key_env: 'GOOGLE_API_KEY' },
+  { id: 'mistralai', label: 'MistralAI', default_base_url: 'https://api.mistral.ai/v1', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: true, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p'], secret_key_name: 'provider_api_key_mistralai', api_key_env: 'MISTRAL_API_KEY' },
+  { id: 'custom', label: 'Custom (OpenAI-compatible)', default_base_url: '', adapter: 'openai', requires_api_key: false, supports_reverse_proxy: false, custom_url_field: true, extra_field_keys: ['custom_include_headers', 'custom_include_body', 'custom_exclude_body'], extra_param_keys: ['top_p', 'top_k', 'min_p', 'top_a', 'repetition_penalty', 'frequency_penalty', 'presence_penalty', 'seed'], secret_key_name: 'provider_api_key_custom', api_key_env: 'DOUBLE_TROUBLE_API_KEY' },
+  { id: 'cohere', label: 'Cohere', default_base_url: 'https://api.cohere.ai/v2', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p', 'top_k', 'frequency_penalty', 'presence_penalty'], secret_key_name: 'provider_api_key_cohere', api_key_env: 'COHERE_API_KEY' },
+  { id: 'perplexity', label: 'Perplexity', default_base_url: 'https://api.perplexity.ai', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p', 'top_k', 'frequency_penalty', 'presence_penalty'], secret_key_name: 'provider_api_key_perplexity', api_key_env: 'PERPLEXITY_API_KEY' },
+  { id: 'groq', label: 'Groq', default_base_url: 'https://api.groq.com/openai/v1', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p', 'frequency_penalty', 'presence_penalty'], secret_key_name: 'provider_api_key_groq', api_key_env: 'GROQ_API_KEY' },
+  { id: 'electronhub', label: 'Electron Hub', default_base_url: 'https://api.electronhub.ai/v1', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p', 'frequency_penalty', 'presence_penalty'], secret_key_name: 'provider_api_key_electronhub', api_key_env: 'ELECTRONHUB_API_KEY' },
+  { id: 'chutes', label: 'Chutes', default_base_url: 'https://llm.chutes.ai/v1', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p', 'top_k', 'min_p', 'repetition_penalty'], secret_key_name: 'provider_api_key_chutes', api_key_env: 'CHUTES_API_KEY' },
+  { id: 'nanogpt', label: 'NanoGPT', default_base_url: 'https://nano-gpt.com/api/v1', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p', 'top_k', 'min_p', 'repetition_penalty'], secret_key_name: 'provider_api_key_nanogpt', api_key_env: 'NANOGPT_API_KEY' },
+  { id: 'deepseek', label: 'DeepSeek', default_base_url: 'https://api.deepseek.com', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: true, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p', 'frequency_penalty', 'presence_penalty'], secret_key_name: 'provider_api_key_deepseek', api_key_env: 'DEEPSEEK_API_KEY' },
+  { id: 'aimlapi', label: 'AI/ML API', default_base_url: 'https://api.aimlapi.com/v1', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p', 'top_k', 'min_p', 'frequency_penalty', 'presence_penalty'], secret_key_name: 'provider_api_key_aimlapi', api_key_env: 'AIMLAPI_API_KEY' },
+  { id: 'xai', label: 'xAI (Grok)', default_base_url: 'https://api.x.ai/v1', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: true, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p', 'frequency_penalty', 'presence_penalty', 'reasoning_effort'], secret_key_name: 'provider_api_key_xai', api_key_env: 'XAI_API_KEY' },
+  { id: 'pollinations', label: 'Pollinations', default_base_url: 'https://gen.pollinations.ai/v1', adapter: 'openai', requires_api_key: false, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p', 'frequency_penalty', 'presence_penalty'], secret_key_name: 'provider_api_key_pollinations', api_key_env: 'POLLINATIONS_API_KEY' },
+  { id: 'moonshot', label: 'Moonshot AI', default_base_url: 'https://api.moonshot.ai/v1', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: true, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p', 'frequency_penalty', 'presence_penalty'], secret_key_name: 'provider_api_key_moonshot', api_key_env: 'MOONSHOT_API_KEY' },
+  { id: 'fireworks', label: 'Fireworks AI', default_base_url: 'https://api.fireworks.ai/inference/v1', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p', 'top_k', 'min_p', 'frequency_penalty', 'presence_penalty'], secret_key_name: 'provider_api_key_fireworks', api_key_env: 'FIREWORKS_API_KEY' },
+  { id: 'cometapi', label: 'CometAPI', default_base_url: 'https://api.cometapi.com/v1', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: [], extra_param_keys: ['top_p', 'frequency_penalty', 'presence_penalty'], secret_key_name: 'provider_api_key_cometapi', api_key_env: 'COMETAPI_API_KEY' },
+  { id: 'azure_openai', label: 'Azure OpenAI', default_base_url: '', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: ['azure_base_url', 'azure_deployment_name', 'azure_api_version'], extra_param_keys: ['top_p', 'frequency_penalty', 'presence_penalty'], secret_key_name: 'provider_api_key_azure_openai', api_key_env: 'AZURE_OPENAI_API_KEY' },
+  { id: 'zai', label: 'Z.AI (GLM)', default_base_url: 'https://api.z.ai/api/paas/v4', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: ['zai_endpoint'], extra_param_keys: ['top_p', 'top_k'], secret_key_name: 'provider_api_key_zai', api_key_env: 'ZAI_API_KEY' },
+  { id: 'siliconflow', label: 'SiliconFlow', default_base_url: 'https://api.siliconflow.com/v1', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: ['siliconflow_endpoint'], extra_param_keys: ['top_p', 'top_k', 'frequency_penalty'], secret_key_name: 'provider_api_key_siliconflow', api_key_env: 'SILICONFLOW_API_KEY' },
+  { id: 'workers_ai', label: 'Cloudflare Workers AI', default_base_url: 'https://api.cloudflare.com/client/v4/accounts', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: ['workers_ai_account_id'], extra_param_keys: ['top_p', 'top_k', 'frequency_penalty', 'presence_penalty'], secret_key_name: 'provider_api_key_workers_ai', api_key_env: 'CLOUDFLARE_API_KEY' },
+  { id: 'minimax', label: 'MiniMax', default_base_url: 'https://api.minimax.io/v1', adapter: 'openai', requires_api_key: true, supports_reverse_proxy: false, custom_url_field: false, extra_field_keys: ['minimax_endpoint'], extra_param_keys: ['top_p', 'top_k', 'frequency_penalty', 'presence_penalty'], secret_key_name: 'provider_api_key_minimax', api_key_env: 'MINIMAX_API_KEY' },
+];
+
+const sourceById = (id: string): ChatCompletionSourceMeta | undefined => chatCompletionSources.find((source) => source.id === id);
+
+const chatCompletionSourceOptions: Array<[string, string]> = [
   ['disabled', 'Отключено'],
-  ['openai_compatible', 'OpenAI-compatible / Custom proxy'],
-  ['openrouter', 'OpenRouter'],
-  ['lm_studio', 'LM Studio'],
-  ['ollama_openai', 'Ollama OpenAI'],
-  ['vllm', 'vLLM'],
-  ['tabby', 'TabbyAPI'],
-  ['aphrodite', 'Aphrodite'],
-  ['textgen_webui', 'Text generation web UI'],
-  ['koboldcpp', 'KoboldCpp OpenAI'],
-  ['mistral_proxy', 'Mistral-compatible proxy'],
-  ['claude_proxy', 'Claude-compatible proxy'],
-  ['google_proxy', 'Google-compatible proxy'],
-] as const;
+  ...chatCompletionSources.map((source): [string, string] => [source.id, source.label]),
+];
+
+const extraFieldLabels: Record<string, string> = {
+  openrouter_providers: 'OpenRouter providers (через запятую)',
+  openrouter_quantizations: 'OpenRouter quantizations (через запятую)',
+  openrouter_middleout: 'OpenRouter middle-out (auto / on / off)',
+  openrouter_use_fallback: 'OpenRouter использовать fallback',
+  azure_base_url: 'Azure base URL',
+  azure_deployment_name: 'Azure deployment name',
+  azure_api_version: 'Azure API version',
+  vertexai_region: 'Vertex AI region',
+  vertexai_express_project_id: 'Vertex AI Express project ID',
+  vertexai_auth_mode: 'Vertex AI auth mode (express / service_account)',
+  zai_endpoint: 'Z.AI endpoint (common / coding)',
+  siliconflow_endpoint: 'SiliconFlow endpoint (global / cn)',
+  minimax_endpoint: 'MiniMax endpoint (global / cn)',
+  workers_ai_account_id: 'Cloudflare Account ID',
+  custom_include_headers: 'Включить заголовки (YAML)',
+  custom_include_body: 'Включить поля тела (YAML)',
+  custom_exclude_body: 'Исключить поля тела (по строкам)',
+  google_safety_off: 'Отключить safety filters',
+  google_use_sysprompt: 'Использовать system prompt',
+};
+
+const extraParamLabels: Record<string, string> = {
+  top_p: 'top_p',
+  top_k: 'top_k',
+  min_p: 'min_p',
+  top_a: 'top_a',
+  repetition_penalty: 'repetition_penalty',
+  frequency_penalty: 'frequency_penalty',
+  presence_penalty: 'presence_penalty',
+  seed: 'seed',
+  reasoning_effort: 'reasoning_effort (auto/low/medium/high/min/max)',
+  verbosity: 'verbosity (auto/low/medium/high)',
+  thinking_budget: 'thinking_budget (Gemini)',
+};
+
+const booleanExtraFields = new Set(['openrouter_use_fallback', 'google_safety_off', 'google_use_sysprompt']);
+const longTextExtraFields = new Set(['custom_include_headers', 'custom_include_body', 'custom_exclude_body']);
 
 const defaultGenerationSettings: GenerationSettings = {
   provider: 'disabled',
+  chat_completion_source: 'disabled',
   base_url: '',
   model: '',
   bot_name: 'Bot',
@@ -335,6 +416,11 @@ const defaultGenerationSettings: GenerationSettings = {
   timeout_seconds: 60,
   api_key: '',
   clear_api_key: false,
+  reverse_proxy: '',
+  proxy_password: '',
+  clear_proxy_password: false,
+  source_settings: {},
+  parameters: {},
 };
 
 function draftFromCard(card: CharacterCard): CardDraft {
@@ -1270,7 +1356,7 @@ export default function App() {
     }
     const data = await response.json() as { active: Record<string, string>; settings: Partial<GenerationSettings> };
     setActivePresets(data.active);
-    setGenerationSettings((current) => ({ ...current, ...data.settings, api_key: '', clear_api_key: false }));
+    setGenerationSettings((current) => ({ ...current, ...data.settings, api_key: '', clear_api_key: false, proxy_password: '', clear_proxy_password: false }));
   };
 
   useEffect(() => {
@@ -1297,7 +1383,7 @@ export default function App() {
         return;
       }
       const data = await response.json() as Partial<GenerationSettings>;
-      const nextSettings = { ...generationSettings, ...data, api_key: '', clear_api_key: false };
+      const nextSettings = { ...generationSettings, ...data, api_key: '', clear_api_key: false, proxy_password: '', clear_proxy_password: false };
       generationSettingsSaveSignatureRef.current = JSON.stringify(nextSettings);
       setGenerationSettings(nextSettings);
     }, 650);
@@ -1549,7 +1635,7 @@ export default function App() {
       return;
     }
     const data = await response.json() as Partial<GenerationSettings>;
-    const nextSettings = { ...defaultGenerationSettings, ...data, api_key: '', clear_api_key: false };
+    const nextSettings = { ...defaultGenerationSettings, ...data, api_key: '', clear_api_key: false, proxy_password: '', clear_proxy_password: false };
     generationSettingsSaveSignatureRef.current = JSON.stringify(nextSettings);
     generationSettingsLoadedRef.current = true;
     setGenerationSettings(nextSettings);
@@ -1678,7 +1764,7 @@ export default function App() {
     if (applyResponse.ok) {
       const applied = await applyResponse.json() as { active: Record<string, string>; settings: Partial<GenerationSettings> };
       setActivePresets(applied.active);
-      setGenerationSettings({ ...generationSettings, ...applied.settings, api_key: '', clear_api_key: false });
+      setGenerationSettings({ ...generationSettings, ...applied.settings, api_key: '', clear_api_key: false, proxy_password: '', clear_proxy_password: false });
     }
   };
 
@@ -1745,7 +1831,7 @@ export default function App() {
     }
     const data = await response.json() as { active: Record<string, string>; settings: Partial<GenerationSettings> };
     setActivePresets(data.active);
-    setGenerationSettings({ ...generationSettings, ...data.settings, api_key: '', clear_api_key: false });
+    setGenerationSettings({ ...generationSettings, ...data.settings, api_key: '', clear_api_key: false, proxy_password: '', clear_proxy_password: false });
     setPresetMessage('Пресет применен');
   };
 
@@ -2048,7 +2134,7 @@ export default function App() {
       return;
     }
     const data = await response.json() as { settings: Partial<GenerationSettings> };
-    setGenerationSettings({ ...generationSettings, ...data.settings, api_key: '', clear_api_key: false });
+    setGenerationSettings({ ...generationSettings, ...data.settings, api_key: '', clear_api_key: false, proxy_password: '', clear_proxy_password: false });
     setConnectionPresetName('');
     await loadConnectionPresets();
     setConnectionMessage('Подключение сохранено в пресет');
@@ -2065,7 +2151,7 @@ export default function App() {
       return;
     }
     const data = await response.json() as { settings: Partial<GenerationSettings>; active: string };
-    setGenerationSettings({ ...generationSettings, ...data.settings, api_key: '', clear_api_key: false });
+    setGenerationSettings({ ...generationSettings, ...data.settings, api_key: '', clear_api_key: false, proxy_password: '', clear_proxy_password: false });
     setActiveConnectionPresetName(data.active);
     setConnectionMessage(`Пресет выбран: ${preset.name}`);
   };
@@ -4916,29 +5002,162 @@ function SettingsSection({
           <EditableField label="Название пресета для сохранения" value={connectionPresetName} onChange={setConnectionPresetName} />
           <button type="button" onClick={() => void saveGenerationSettings()}>Сохранить подключение</button>
         </div>
-        <label className="field-preview">
-          <span>Метод подключения</span>
-          <select value={generationSettings.provider} onChange={(event) => setGenerationSettings({ ...generationSettings, provider: event.target.value })}>
-            {connectionMethods.map(([value, label]) => <option value={value} key={value}>{label}</option>)}
-          </select>
-        </label>
-        <EditableField label="Endpoint / proxy URL" value={generationSettings.base_url} onChange={(base_url) => setGenerationSettings({ ...generationSettings, base_url })} />
-        <p className="helper-text">Имя и аватар бота берутся из выбранной карточки. Имя и аватар игрока берутся из локально выбранной персоны.</p>
-        <TwoColumns
-          left={(
-            <label className="field-preview model-field">
-              <span>Model</span>
-              <input value={generationSettings.model} onChange={(event) => setGenerationSettings({ ...generationSettings, model: event.target.value })} />
-              <select className="model-picker" value={models.includes(generationSettings.model) ? generationSettings.model : ''} disabled={!models.length} onChange={(event) => event.target.value && setGenerationSettings({ ...generationSettings, model: event.target.value })}>
-                <option value="">{models.length ? 'Выбрать из загруженных моделей' : 'Список моделей еще не загружен'}</option>
-                {models.map((model) => <option value={model} key={model}>{model}</option>)}
-              </select>
-              <button className="ghost-button model-load-button" type="button" onClick={() => void checkConnection()}>Запросить модели / проверить</button>
-              {connectionMessage ? <p className="library-message connection-message-inline">{connectionMessage}</p> : null}
-            </label>
-          )}
-          right={<KeyManager mode="popover" />}
-        />
+        {(() => {
+          const sourceId = generationSettings.chat_completion_source && generationSettings.chat_completion_source !== 'disabled' ? generationSettings.chat_completion_source : (generationSettings.provider === 'disabled' ? '' : generationSettings.chat_completion_source);
+          const selectedSourceId = generationSettings.chat_completion_source || (generationSettings.provider === 'disabled' ? 'disabled' : '');
+          const sourceMeta = sourceById(selectedSourceId);
+          const sourceExtras = (generationSettings.source_settings || {})[selectedSourceId] || {};
+          const updateExtras = (patch: Record<string, unknown>) => {
+            const nextExtras = { ...sourceExtras, ...patch };
+            setGenerationSettings({
+              ...generationSettings,
+              source_settings: { ...(generationSettings.source_settings || {}), [selectedSourceId]: nextExtras },
+            });
+          };
+          const updateParameters = (patch: Record<string, unknown>) => {
+            const nextParameters = { ...(generationSettings.parameters || {}), ...patch };
+            setGenerationSettings({ ...generationSettings, parameters: nextParameters });
+          };
+          const handleSourceChange = (nextSourceId: string) => {
+            const meta = sourceById(nextSourceId);
+            // Always reset base URL to the new source's default; keep an existing override
+            // only when the previous source had no default (custom / azure) so user-typed URLs persist.
+            const previousMeta = sourceById(selectedSourceId);
+            const previousHadDefault = Boolean(previousMeta?.default_base_url);
+            const nextBaseUrl = nextSourceId === 'disabled'
+              ? ''
+              : (previousHadDefault ? (meta?.default_base_url || '') : (generationSettings.base_url || meta?.default_base_url || ''));
+            setGenerationSettings({
+              ...generationSettings,
+              provider: nextSourceId,
+              chat_completion_source: nextSourceId,
+              base_url: nextBaseUrl,
+            });
+          };
+          const extraFieldKey = selectedSourceId;
+          void sourceId;
+          void extraFieldKey;
+          return (
+            <>
+              <label className="field-preview">
+                <span>Источник Chat Completion</span>
+                <select value={selectedSourceId || 'disabled'} onChange={(event) => handleSourceChange(event.target.value)}>
+                  {chatCompletionSourceOptions.map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+                </select>
+              </label>
+              {sourceMeta?.custom_url_field || sourceMeta?.supports_reverse_proxy || !sourceMeta ? (
+                <EditableField
+                  label={sourceMeta?.custom_url_field ? 'Endpoint URL' : 'Endpoint (необязательно, override default)'}
+                  value={generationSettings.base_url}
+                  onChange={(base_url) => setGenerationSettings({ ...generationSettings, base_url })}
+                />
+              ) : (
+                <p className="helper-text">Базовый URL: <code>{sourceMeta.default_base_url}</code></p>
+              )}
+              {sourceMeta && sourceMeta.extra_field_keys.length > 0 ? (
+                <div className="connection-source-extras">
+                  {sourceMeta.extra_field_keys.map((key) => {
+                    const label = extraFieldLabels[key] || key;
+                    const raw = sourceExtras[key];
+                    if (booleanExtraFields.has(key)) {
+                      return (
+                        <label className="field-preview" key={key}>
+                          <span>{label}</span>
+                          <input type="checkbox" checked={Boolean(raw)} onChange={(event) => updateExtras({ [key]: event.target.checked })} />
+                        </label>
+                      );
+                    }
+                    if (longTextExtraFields.has(key)) {
+                      return (
+                        <label className="field-preview" key={key}>
+                          <span>{label}</span>
+                          <textarea value={typeof raw === 'string' ? raw : ''} onChange={(event) => updateExtras({ [key]: event.target.value })} />
+                        </label>
+                      );
+                    }
+                    return (
+                      <EditableField
+                        key={key}
+                        label={label}
+                        value={typeof raw === 'string' || typeof raw === 'number' ? String(raw) : ''}
+                        onChange={(value) => updateExtras({ [key]: value })}
+                      />
+                    );
+                  })}
+                </div>
+              ) : null}
+              <p className="helper-text">Имя и аватар бота берутся из выбранной карточки. Имя и аватар игрока берутся из локально выбранной персоны.</p>
+              <TwoColumns
+                left={(
+                  <label className="field-preview model-field">
+                    <span>Модель</span>
+                    <input value={generationSettings.model} onChange={(event) => setGenerationSettings({ ...generationSettings, model: event.target.value })} />
+                    <select className="model-picker" value={models.includes(generationSettings.model) ? generationSettings.model : ''} disabled={!models.length} onChange={(event) => event.target.value && setGenerationSettings({ ...generationSettings, model: event.target.value })}>
+                      <option value="">{models.length ? 'Выбрать из загруженных моделей' : 'Список моделей еще не загружен'}</option>
+                      {models.map((model) => <option value={model} key={model}>{model}</option>)}
+                    </select>
+                    <button className="ghost-button model-load-button" type="button" onClick={() => void checkConnection()}>Запросить модели / проверить</button>
+                    {connectionMessage ? <p className="library-message connection-message-inline">{connectionMessage}</p> : null}
+                  </label>
+                )}
+                right={<KeyManager mode="popover" />}
+              />
+              {sourceMeta && sourceMeta.supports_reverse_proxy ? (
+                <details className="connection-proxy-section">
+                  <summary>Обратный прокси (Reverse Proxy)</summary>
+                  <EditableField
+                    label="Reverse Proxy URL"
+                    value={generationSettings.reverse_proxy}
+                    onChange={(reverse_proxy) => setGenerationSettings({ ...generationSettings, reverse_proxy })}
+                  />
+                  <label className="field-preview">
+                    <span>Proxy Password {generationSettings.proxy_password_configured ? '(установлен)' : ''}</span>
+                    <input
+                      type="password"
+                      value={generationSettings.proxy_password}
+                      placeholder={generationSettings.proxy_password_configured ? 'Скрыт. Введите для замены.' : 'Введите пароль'}
+                      onChange={(event) => setGenerationSettings({ ...generationSettings, proxy_password: event.target.value, clear_proxy_password: false })}
+                    />
+                  </label>
+                  {generationSettings.proxy_password_configured ? (
+                    <button type="button" className="ghost-button" onClick={() => setGenerationSettings({ ...generationSettings, proxy_password: '', clear_proxy_password: true })}>
+                      Очистить proxy password
+                    </button>
+                  ) : null}
+                  <p className="helper-text">URL и пароль прокси заменяют базовый адрес и API-ключ источника на стороне сервера.</p>
+                </details>
+              ) : null}
+              {sourceMeta && sourceMeta.extra_param_keys.length > 0 ? (
+                <details className="connection-params-section">
+                  <summary>Дополнительные параметры ответа</summary>
+                  <div className="connection-source-extras">
+                    {sourceMeta.extra_param_keys.map((key) => {
+                      const label = extraParamLabels[key] || key;
+                      const raw = (generationSettings.parameters || {})[key];
+                      return (
+                        <EditableField
+                          key={key}
+                          label={label}
+                          value={typeof raw === 'string' || typeof raw === 'number' ? String(raw) : ''}
+                          onChange={(value) => {
+                            if (!value.trim()) {
+                              const next = { ...(generationSettings.parameters || {}) };
+                              delete next[key];
+                              setGenerationSettings({ ...generationSettings, parameters: next });
+                              return;
+                            }
+                            const numeric = Number(value);
+                            updateParameters({ [key]: Number.isFinite(numeric) && value.trim() !== '' && !isNaN(numeric) && !value.trim().match(/^[a-z]/i) ? numeric : value });
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
+                </details>
+              ) : null}
+            </>
+          );
+        })()}
         <EditableTextArea label="System prompt" value={generationSettings.system_prompt} onChange={(system_prompt) => setGenerationSettings({ ...generationSettings, system_prompt })} />
         <TwoColumns
           left={<EditableField label="Temperature" value={String(generationSettings.temperature)} onChange={(temperature) => setGenerationSettings({ ...generationSettings, temperature: Number(temperature) || 0 })} />}

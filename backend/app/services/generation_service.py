@@ -8,6 +8,7 @@ import yaml
 
 from backend.app.config import GenerationConfig
 from backend.app.llm.base import ChatMessage, GenerationRequest
+from backend.app.llm.chat_completion_sources import build_provider, get_source, resolve_source_id
 from backend.app.llm.openai_compatible import OpenAICompatibleProvider
 from backend.app.models import Message, ParticipantRole
 from backend.app.secrets import SecretStore
@@ -92,11 +93,26 @@ class GenerationService:
             await on_update(reply)
         return reply
 
-    def _provider(self) -> OpenAICompatibleProvider:
-        if self.config.provider != "disabled":
+    def _provider(self):
+        if self.config.provider == "disabled":
+            raise RuntimeError("Unsupported generation provider: disabled")
+        source_id = self.config.chat_completion_source or resolve_source_id(self.config.provider)
+        source = get_source(source_id)
+        api_key = ""
+        if source and source.secret_key_name:
+            api_key = self.secret_store.read(source.secret_key_name, source.api_key_env)
+        if not api_key:
             api_key = self.secret_store.read(self.config.api_key_secret, self.config.api_key_env)
-            return OpenAICompatibleProvider(self.config.base_url, api_key, self.config.timeout_seconds)
-        raise RuntimeError(f"Unsupported generation provider: {self.config.provider}")
+        proxy_password = self.secret_store.read(self.config.proxy_password_secret, "") if self.config.reverse_proxy else ""
+        return build_provider(
+            source_id,
+            base_url=self.config.base_url,
+            api_key=api_key,
+            timeout_seconds=self.config.timeout_seconds,
+            extra_settings=(self.config.source_settings or {}).get(source_id, {}),
+            reverse_proxy=self.config.reverse_proxy,
+            proxy_password=proxy_password,
+        )
 
     def _preset_model(self, preset: dict[str, Any] | None) -> str:
         if not isinstance(preset, dict):
