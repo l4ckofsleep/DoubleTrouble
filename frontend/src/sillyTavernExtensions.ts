@@ -766,6 +766,7 @@ export type ExtensionMessageFormatOptions = {
   forceImagePending?: boolean;
   renderPendingMarkersAsSpinner?: boolean;
   reasoning?: RuntimeReasoningSettings;
+  t?: (key: string) => string;
 };
 
 export function formatExtensionMessageHtml(content: string, options: ExtensionMessageFormatOptions = {}) {
@@ -829,7 +830,7 @@ function sanitizeNode(node: ChildNode, options: ExtensionMessageFormatOptions): 
     .filter((attr): attr is string => Boolean(attr))
     .join('');
   if ((tag === 'img' || tag === 'video') && shouldRenderImagePending(node, options)) {
-    return renderImagePendingPlaceholder(node);
+    return renderImagePendingPlaceholder(node, options);
   }
   if ((tag === 'img' || tag === 'video') && isImagePendingMarker(node)) {
     return `<span class="iig-pending-media-shell">${renderSanitizedElement(tag, attrs, node, options)}</span>`;
@@ -857,10 +858,11 @@ function isImagePendingMarker(node: Element) {
   return Boolean(hasInstruction && /^\[(?:IMG|VID):/i.test(pendingSrc || pendingPoster));
 }
 
-function renderImagePendingPlaceholder(node: Element) {
+function renderImagePendingPlaceholder(node: Element, options: ExtensionMessageFormatOptions) {
   const instruction = node.getAttribute('data-iig-instruction') || '';
   const pendingSrc = node.getAttribute('data-iig-pending-src') || node.getAttribute('src') || '';
-  return `<div class="iig-loading-placeholder iig-rendered-pending" data-iig-instruction="${escapeHtml(instruction)}" data-iig-pending-src="${escapeHtml(pendingSrc)}"><div class="iig-spinner"></div><div class="iig-status">Генерация картинки...</div></div>`;
+  const statusText = options.t ? options.t('message.imageGenerating') : 'Generating image...';
+  return `<div class="iig-loading-placeholder iig-rendered-pending" data-iig-instruction="${escapeHtml(instruction)}" data-iig-pending-src="${escapeHtml(pendingSrc)}"><div class="iig-spinner"></div><div class="iig-status">${escapeHtml(statusText)}</div></div>`;
 }
 
 function renderSanitizedElement(tag: string, attrs: string, node: Element, options: ExtensionMessageFormatOptions) {

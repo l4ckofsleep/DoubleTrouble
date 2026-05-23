@@ -1,6 +1,9 @@
 import { Fragment, useEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { emitSillyTavernChatChanged, emitSillyTavernMessageRendered, emitSillyTavernMessageSwiped, formatExtensionMessageHtml, initSillyTavernExtensions, updateSillyTavernExtensionSettings, updateSillyTavernRuntime, type ExtensionMessageFormatOptions } from './sillyTavernExtensions';
+import { getRegexedString, getRegexScripts, regex_placement, setRegexContext, setRegexNames } from './regexEngine';
+import { RegexSettings } from './RegexSettings';
+import { useLocaleContext, type Language } from './localization';
 
 type MenuSection = 'presets' | 'connection' | 'visual' | 'personas' | 'security' | 'lorebooks' | 'cards' | 'extensions';
 type IconName = 'sliders' | 'plug' | 'palette' | 'user' | 'card' | 'book' | 'bot' | 'lock' | 'key' | 'menu' | 'send' | 'edit' | 'trash' | 'eye' | 'eyeOff' | 'check' | 'x';
@@ -275,16 +278,18 @@ type NoricoreScene = { location: string; weather: string; date: string; time: st
 type NoricoreCharacter = { name: string; status: string; outfit: string; health: string; mood: string; feelings: string; thoughts: string };
 type NoricoreData = { scene: NoricoreScene | null; characters: NoricoreCharacter[] };
 
-const menuItems: Array<{ id: MenuSection; label: string; icon: IconName; description: string }> = [
-  { id: 'presets', label: 'Пресеты', icon: 'sliders', description: 'Prompt, sampler, параметры генерации' },
-  { id: 'connection', label: 'Подключение', icon: 'plug', description: 'Provider, endpoint, model, API key' },
-  { id: 'visual', label: 'Визуал', icon: 'palette', description: 'Тема, плотность, размер текста' },
-  { id: 'cards', label: 'Карточки', icon: 'card', description: 'Character cards, боты и чаты карточек' },
-  { id: 'personas', label: 'Персоны', icon: 'user', description: 'Профили игроков и persona prompt' },
-  { id: 'lorebooks', label: 'Лорбуки', icon: 'book', description: 'World Info ST, ключи и привязки' },
-  { id: 'extensions', label: 'Расширения', icon: 'plug', description: 'SillyTavern extensions и настройки' },
-  { id: 'security', label: 'Безопасность', icon: 'lock', description: 'Пароль фронта, локальная сеть, key checking' },
-];
+function getMenuItems(t: (key: string) => string): Array<{ id: MenuSection; label: string; icon: IconName; description: string }> {
+  return [
+    { id: 'presets', label: t('menu.presets'), icon: 'sliders', description: t('menu.presets.desc') },
+    { id: 'connection', label: t('menu.connection'), icon: 'plug', description: t('menu.connection.desc') },
+    { id: 'visual', label: t('menu.visual'), icon: 'palette', description: t('menu.visual.desc') },
+    { id: 'cards', label: t('menu.cards'), icon: 'card', description: t('menu.cards.desc') },
+    { id: 'personas', label: t('menu.personas'), icon: 'user', description: t('menu.personas.desc') },
+    { id: 'lorebooks', label: t('menu.lorebooks'), icon: 'book', description: t('menu.lorebooks.desc') },
+    { id: 'extensions', label: t('menu.extensions'), icon: 'plug', description: t('menu.extensions.desc') },
+    { id: 'security', label: t('menu.security'), icon: 'lock', description: t('menu.security.desc') },
+  ];
+}
 
 const VISUAL_STORAGE_KEY = 'doubletrouble.visualSettings';
 const SELECTED_PERSONA_STORAGE_KEY = 'doubletrouble.selectedPersonaId';
@@ -297,29 +302,31 @@ const ACCESS_TOKEN_STORAGE_KEY = 'doubletrouble.accessToken';
 const AUTH_USERNAME_STORAGE_KEY = 'doubletrouble.lastUsername';
 const OPENAI_PROMPT_ORDER_CHARACTER_ID = 100001;
 
-const permissionLabels: Record<string, string> = {
-  view_cards: 'Просмотр карточек',
-  view_personas: 'Просмотр персон',
-  view_chats: 'Просмотр чатов',
-  view_presets: 'Просмотр пресетов',
-  view_lorebooks: 'Просмотр лорбуков',
-  edit_cards: 'Создание и правка карточек',
-  delete_cards: 'Удаление карточек',
-  edit_personas: 'Создание и правка персон',
-  delete_personas: 'Удаление персон',
-  manage_chats: 'Управление чатами',
-  edit_messages: 'Правка/скрытие сообщений',
-  delete_messages: 'Удаление сообщений',
-  generate: 'Генерация, swipes и reroll',
-  manage_presets: 'Пресеты и подключения',
-  manage_lorebooks: 'Лорбуки и привязки',
-  manage_extensions: 'Установка и управление расширениями',
-  manage_keys: 'Доступ к менеджеру ключей',
-  manage_security: 'Настройки безопасности',
-};
+function getPermissionLabels(t: (key: string) => string): Record<string, string> {
+  return {
+    view_cards: t('permissions.viewCards'),
+    view_personas: t('permissions.viewPersonas'),
+    view_chats: t('permissions.viewChats'),
+    view_presets: t('permissions.viewPresets'),
+    view_lorebooks: t('permissions.viewLorebooks'),
+    edit_cards: t('permissions.editCards'),
+    delete_cards: t('permissions.deleteCards'),
+    edit_personas: t('permissions.editPersonas'),
+    delete_personas: t('permissions.deletePersonas'),
+    manage_chats: t('permissions.manageChats'),
+    edit_messages: t('permissions.editMessages'),
+    delete_messages: t('permissions.deleteMessages'),
+    generate: t('permissions.generate'),
+    manage_presets: t('permissions.managePresets'),
+    manage_lorebooks: t('permissions.manageLorebooks'),
+    manage_extensions: t('permissions.manageExtensions'),
+    manage_keys: t('permissions.manageKeys'),
+    manage_security: t('permissions.manageSecurity'),
+  };
+}
 
-const defaultSecurityPermissions: SecurityPermissions = Object.fromEntries(Object.keys(permissionLabels).map((key) => [key, { mode: key === 'manage_security' || key === 'manage_keys' ? 'admins' : 'everyone', users: [] }])) as SecurityPermissions;
-const accessDeniedText = 'Доступ запрещен. Войдите или попросите администратора выдать права.';
+const defaultSecurityPermissionKeys = ['view_cards', 'view_personas', 'view_chats', 'view_presets', 'view_lorebooks', 'edit_cards', 'delete_cards', 'edit_personas', 'delete_personas', 'manage_chats', 'edit_messages', 'delete_messages', 'generate', 'manage_presets', 'manage_lorebooks', 'manage_extensions', 'manage_keys', 'manage_security'];
+const defaultSecurityPermissions: SecurityPermissions = Object.fromEntries(defaultSecurityPermissionKeys.map((key) => [key, { mode: key === 'manage_security' || key === 'manage_keys' ? 'admins' : 'everyone', users: [] }])) as SecurityPermissions;
 const defaultDeletionLocks: DeletionLocks = { cards: [], personas: [], chats: [] };
 const defaultBuiltInExtensionSettings: BuiltInExtensionSettings = { noriMynInfoblock: true };
 const defaultImageExtensionSettings: ImageExtensionSettings = { apiType: 'openai', endpoint: '', model: '', apiKey: '' };
@@ -360,32 +367,36 @@ const chatCompletionSources: ChatCompletionSourceMeta[] = [
 
 const sourceById = (id: string): ChatCompletionSourceMeta | undefined => chatCompletionSources.find((source) => source.id === id);
 
-const chatCompletionSourceOptions: Array<[string, string]> = [
-  ['disabled', 'Отключено'],
-  ...chatCompletionSources.map((source): [string, string] => [source.id, source.label]),
-];
+function getChatCompletionSourceOptions(t: (key: string) => string): Array<[string, string]> {
+  return [
+    ['disabled', t('connection.disabled')],
+    ...chatCompletionSources.map((source): [string, string] => [source.id, source.label]),
+  ];
+}
 
-const extraFieldLabels: Record<string, string> = {
-  openrouter_providers: 'OpenRouter providers (через запятую)',
-  openrouter_quantizations: 'OpenRouter quantizations (через запятую)',
-  openrouter_middleout: 'OpenRouter middle-out (auto / on / off)',
-  openrouter_use_fallback: 'OpenRouter использовать fallback',
-  azure_base_url: 'Azure base URL',
-  azure_deployment_name: 'Azure deployment name',
-  azure_api_version: 'Azure API version',
-  vertexai_region: 'Vertex AI region',
-  vertexai_express_project_id: 'Vertex AI Express project ID',
-  vertexai_auth_mode: 'Vertex AI auth mode (express / service_account)',
-  zai_endpoint: 'Z.AI endpoint (common / coding)',
-  siliconflow_endpoint: 'SiliconFlow endpoint (global / cn)',
-  minimax_endpoint: 'MiniMax endpoint (global / cn)',
-  workers_ai_account_id: 'Cloudflare Account ID',
-  custom_include_headers: 'Включить заголовки (YAML)',
-  custom_include_body: 'Включить поля тела (YAML)',
-  custom_exclude_body: 'Исключить поля тела (по строкам)',
-  google_safety_off: 'Отключить safety filters',
-  google_use_sysprompt: 'Использовать system prompt',
-};
+function getExtraFieldLabels(t: (key: string) => string): Record<string, string> {
+  return {
+    openrouter_providers: 'OpenRouter providers ' + t('common.commaSeparated'),
+    openrouter_quantizations: 'OpenRouter quantizations ' + t('common.commaSeparated'),
+    openrouter_middleout: 'OpenRouter middle-out (auto / on / off)',
+    openrouter_use_fallback: 'OpenRouter ' + t('connection.useFallback'),
+    azure_base_url: 'Azure base URL',
+    azure_deployment_name: 'Azure deployment name',
+    azure_api_version: 'Azure API version',
+    vertexai_region: 'Vertex AI region',
+    vertexai_express_project_id: 'Vertex AI Express project ID',
+    vertexai_auth_mode: 'Vertex AI auth mode (express / service_account)',
+    zai_endpoint: 'Z.AI endpoint (common / coding)',
+    siliconflow_endpoint: 'SiliconFlow endpoint (global / cn)',
+    minimax_endpoint: 'MiniMax endpoint (global / cn)',
+    workers_ai_account_id: 'Cloudflare Account ID',
+    custom_include_headers: t('connection.includeHeaders'),
+    custom_include_body: t('connection.includeBody'),
+    custom_exclude_body: t('connection.excludeBody'),
+    google_safety_off: t('connection.disableSafety'),
+    google_use_sysprompt: t('connection.useSystemPrompt'),
+  };
+}
 
 const extraParamLabels: Record<string, string> = {
   top_p: 'top_p',
@@ -479,45 +490,47 @@ const defaultVisualSettings: VisualSettings = {
 };
 
 const themes: Array<{ id: ThemeId; name: string; description: string; swatches: string[]; tone: 'dark' | 'light' }> = [
-  { id: 'midnight', name: 'Midnight', description: 'Темная библиотека, янтарь и teal', swatches: ['#0f1418', '#1d2630', '#d8a75f', '#73b7a7'], tone: 'dark' },
-  { id: 'abyss', name: 'Abyss', description: 'Почти полный черный для OLED', swatches: ['#000000', '#0a0a0a', '#d6b46a', '#6fb5a5'], tone: 'dark' },
-  { id: 'forest', name: 'Forest', description: 'Темный лес, мох, теплый свет', swatches: ['#0f1712', '#1c2a20', '#c69a55', '#7fb069'], tone: 'dark' },
-  { id: 'ocean', name: 'Ocean', description: 'Холодная ночь, синий и циан', swatches: ['#0c1420', '#172638', '#7fb7ff', '#76d1cf'], tone: 'dark' },
-  { id: 'plum', name: 'Plum', description: 'Черничный тон без кислотности', swatches: ['#17111b', '#261d2d', '#c69ad7', '#d2a75f'], tone: 'dark' },
-  { id: 'ember', name: 'Ember', description: 'Уголь, медь и приглушенное тепло', swatches: ['#17110d', '#2a1d17', '#e09a58', '#c76f54'], tone: 'dark' },
-  { id: 'aurora', name: 'Aurora', description: 'Северное сияние, холодный изумруд и фиолетовый', swatches: ['#071317', '#10262a', '#8de3c6', '#a991ff'], tone: 'dark' },
-  { id: 'slate', name: 'Slate', description: 'Нейтральный графит без яркой театральности', swatches: ['#111417', '#1f252b', '#9db0bf', '#d1a66b'], tone: 'dark' },
-  { id: 'noir', name: 'Noir', description: 'Черно-белый нуар с красным акцентом', swatches: ['#08090b', '#15171c', '#e6e1d8', '#c94747'], tone: 'dark' },
-  { id: 'cyberpunk', name: 'Cyberpunk', description: 'Темный неон, розовый и циан', swatches: ['#10071f', '#1b0e33', '#ff5bd8', '#47e6ff'], tone: 'dark' },
-  { id: 'dracula', name: 'Dracula', description: 'Фиолетовая ночь, розовый и зеленый', swatches: ['#171421', '#282238', '#ff79c6', '#50fa7b'], tone: 'dark' },
-  { id: 'nord', name: 'Nord', description: 'Полярная ночь, холодный голубой', swatches: ['#1d2430', '#2e3440', '#88c0d0', '#a3be8c'], tone: 'dark' },
-  { id: 'coffee', name: 'Coffee', description: 'Эспрессо, сливки и медь', swatches: ['#17100c', '#261914', '#c58b5a', '#8db596'], tone: 'dark' },
-  { id: 'parchment', name: 'Parchment', description: 'Светлая бумага, чернила, бронза', swatches: ['#f4eddf', '#fffaf0', '#9c6b2f', '#3e746c'], tone: 'light' },
-  { id: 'rose', name: 'Rose Tea', description: 'Теплая светлая тема с розой и чаем', swatches: ['#f4e6df', '#fff6ee', '#b95d68', '#7b5f3f'], tone: 'light' },
-  { id: 'porcelain', name: 'Porcelain', description: 'Белый фарфор, синий и мягкий серый', swatches: ['#edf3f8', '#ffffff', '#4d7ea8', '#7a8a99'], tone: 'light' },
-  { id: 'mint', name: 'Mint', description: 'Светлая мята, эвкалипт и графит', swatches: ['#e8f4ed', '#f7fff9', '#3a8f73', '#53685f'], tone: 'light' },
-  { id: 'lavender', name: 'Lavender', description: 'Лавандовая бумага и черничные чернила', swatches: ['#eee8f8', '#fbf8ff', '#7d61b3', '#8b6d8f'], tone: 'light' },
-  { id: 'solar', name: 'Solar', description: 'Теплый дневной свет, янтарь и синева', swatches: ['#f5ead2', '#fff9e8', '#c77923', '#407c9c'], tone: 'light' },
-  { id: 'sand', name: 'Sand', description: 'Песок, охра и приглушенный шалфей', swatches: ['#efe3cc', '#fbf2df', '#a66f2d', '#6f8060'], tone: 'light' },
-  { id: 'linen', name: 'Linen', description: 'Лен, теплые чернила и оливковый акцент', swatches: ['#f1eadc', '#fffaf0', '#8a6b3e', '#6f7d54'], tone: 'light' },
-  { id: 'cloud', name: 'Cloud', description: 'Мягкий облачный интерфейс с голубым акцентом', swatches: ['#eef4f7', '#ffffff', '#5c89a8', '#8da6b5'], tone: 'light' },
-  { id: 'buttercream', name: 'Buttercream', description: 'Сливочный свет, мед и карамель', swatches: ['#f7efd6', '#fff9e6', '#bf7d2e', '#8a7350'], tone: 'light' },
-  { id: 'seashell', name: 'Seashell', description: 'Ракушка, коралл и тихая бирюза', swatches: ['#f7ebe4', '#fff7f1', '#c46b60', '#4f8f8a'], tone: 'light' },
-  { id: 'morning', name: 'Morning', description: 'Утреннее окно, холодный свет и лаванда', swatches: ['#edf0fb', '#fbfcff', '#637cc0', '#9b7fb5'], tone: 'light' },
-  { id: 'paper', name: 'Paper', description: 'Чистая бумага, графит и спокойный зеленый', swatches: ['#f2f0e8', '#fffdf7', '#5f6f5d', '#7d8f73'], tone: 'light' },
+  { id: 'midnight', name: 'Midnight', description: 'theme.midnight', swatches: ['#0f1418', '#1d2630', '#d8a75f', '#73b7a7'], tone: 'dark' },
+  { id: 'abyss', name: 'Abyss', description: 'theme.abyss', swatches: ['#000000', '#0a0a0a', '#d6b46a', '#6fb5a5'], tone: 'dark' },
+  { id: 'forest', name: 'Forest', description: 'theme.forest', swatches: ['#0f1712', '#1c2a20', '#c69a55', '#7fb069'], tone: 'dark' },
+  { id: 'ocean', name: 'Ocean', description: 'theme.ocean', swatches: ['#0c1420', '#172638', '#7fb7ff', '#76d1cf'], tone: 'dark' },
+  { id: 'plum', name: 'Plum', description: 'theme.plum', swatches: ['#17111b', '#261d2d', '#c69ad7', '#d2a75f'], tone: 'dark' },
+  { id: 'ember', name: 'Ember', description: 'theme.ember', swatches: ['#17110d', '#2a1d17', '#e09a58', '#c76f54'], tone: 'dark' },
+  { id: 'aurora', name: 'Aurora', description: 'theme.aurora', swatches: ['#071317', '#10262a', '#8de3c6', '#a991ff'], tone: 'dark' },
+  { id: 'slate', name: 'Slate', description: 'theme.slate', swatches: ['#111417', '#1f252b', '#9db0bf', '#d1a66b'], tone: 'dark' },
+  { id: 'noir', name: 'Noir', description: 'theme.noir', swatches: ['#08090b', '#15171c', '#e6e1d8', '#c94747'], tone: 'dark' },
+  { id: 'cyberpunk', name: 'Cyberpunk', description: 'theme.cyberpunk', swatches: ['#10071f', '#1b0e33', '#ff5bd8', '#47e6ff'], tone: 'dark' },
+  { id: 'dracula', name: 'Dracula', description: 'theme.dracula', swatches: ['#171421', '#282238', '#ff79c6', '#50fa7b'], tone: 'dark' },
+  { id: 'nord', name: 'Nord', description: 'theme.nord', swatches: ['#1d2430', '#2e3440', '#88c0d0', '#a3be8c'], tone: 'dark' },
+  { id: 'coffee', name: 'Coffee', description: 'theme.coffee', swatches: ['#17100c', '#261914', '#c58b5a', '#8db596'], tone: 'dark' },
+  { id: 'parchment', name: 'Parchment', description: 'theme.parchment', swatches: ['#f4eddf', '#fffaf0', '#9c6b2f', '#3e746c'], tone: 'light' },
+  { id: 'rose', name: 'Rose Tea', description: 'theme.rose', swatches: ['#f4e6df', '#fff6ee', '#b95d68', '#7b5f3f'], tone: 'light' },
+  { id: 'porcelain', name: 'Porcelain', description: 'theme.porcelain', swatches: ['#edf3f8', '#ffffff', '#4d7ea8', '#7a8a99'], tone: 'light' },
+  { id: 'mint', name: 'Mint', description: 'theme.mint', swatches: ['#e8f4ed', '#f7fff9', '#3a8f73', '#53685f'], tone: 'light' },
+  { id: 'lavender', name: 'Lavender', description: 'theme.lavender', swatches: ['#eee8f8', '#fbf8ff', '#7d61b3', '#8b6d8f'], tone: 'light' },
+  { id: 'solar', name: 'Solar', description: 'theme.solar', swatches: ['#f5ead2', '#fff9e8', '#c77923', '#407c9c'], tone: 'light' },
+  { id: 'sand', name: 'Sand', description: 'theme.sand', swatches: ['#efe3cc', '#fbf2df', '#a66f2d', '#6f8060'], tone: 'light' },
+  { id: 'linen', name: 'Linen', description: 'theme.linen', swatches: ['#f1eadc', '#fffaf0', '#8a6b3e', '#6f7d54'], tone: 'light' },
+  { id: 'cloud', name: 'Cloud', description: 'theme.cloud', swatches: ['#eef4f7', '#ffffff', '#5c89a8', '#8da6b5'], tone: 'light' },
+  { id: 'buttercream', name: 'Buttercream', description: 'theme.buttercream', swatches: ['#f7efd6', '#fff9e6', '#bf7d2e', '#8a7350'], tone: 'light' },
+  { id: 'seashell', name: 'Seashell', description: 'theme.seashell', swatches: ['#f7ebe4', '#fff7f1', '#c46b60', '#4f8f8a'], tone: 'light' },
+  { id: 'morning', name: 'Morning', description: 'theme.morning', swatches: ['#edf0fb', '#fbfcff', '#637cc0', '#9b7fb5'], tone: 'light' },
+  { id: 'paper', name: 'Paper', description: 'theme.paper', swatches: ['#f2f0e8', '#fffdf7', '#5f6f5d', '#7d8f73'], tone: 'light' },
 ];
 
 const darkThemes = themes.filter((theme) => theme.tone === 'dark');
 const lightThemes = themes.filter((theme) => theme.tone === 'light');
 
-const slashCommands = [
-  { command: '/hide', hint: '0-3', description: 'Скрыть сообщения' },
-  { command: '/unhide', hint: '0-3', description: 'Показать сообщения' },
-  { command: '/delete', hint: '4 7-9', description: 'Удалить сообщения' },
-  { command: '/reroll', hint: '', description: 'Полный реролл последнего ответа' },
-  { command: '/copy', hint: '0-5', description: 'Скопировать сообщения' },
-  { command: '/help', hint: '', description: 'Показать команды' },
-];
+function getSlashCommands(t: (key: string) => string) {
+  return [
+    { command: '/hide', hint: '0-3', description: t('commands.hideMessages') },
+    { command: '/unhide', hint: '0-3', description: t('commands.unhideMessages') },
+    { command: '/delete', hint: '4 7-9', description: t('commands.deleteMessages') },
+    { command: '/reroll', hint: '', description: t('commands.rerollLast') },
+    { command: '/copy', hint: '0-5', description: t('commands.copyMessages') },
+    { command: '/help', hint: '', description: t('commands.showHelp') },
+  ];
+}
 
 function loadVisualSettings(): VisualSettings {
   try {
@@ -655,6 +668,7 @@ function participantId(): string {
 }
 
 export default function App() {
+  const { t } = useLocaleContext();
   const [menuOpen, setMenuOpen] = useState(false);
   const [activeSection, setActiveSection] = useState<MenuSection>('presets');
   const [visualSettings, setVisualSettings] = useState<VisualSettings>(loadVisualSettings);
@@ -712,6 +726,7 @@ export default function App() {
   const [imagePendingMessages, setImagePendingMessages] = useState<Record<string, boolean>>({});
   const [extensionMessageRenderVersions, setExtensionMessageRenderVersions] = useState<Record<string, number>>({});
   const [authToken, setAuthToken] = useState(() => window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '');
+  const [cookieAuth, setCookieAuth] = useState(false);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [authDraft, setAuthDraft] = useState({ username: '', password: '', adminCode: '' });
   const [authMessage, setAuthMessage] = useState('');
@@ -728,6 +743,15 @@ export default function App() {
   const [securityAccessPasswordRequiredDraft, setSecurityAccessPasswordRequiredDraft] = useState(false);
   const [securityAccessPasswordDraft, setSecurityAccessPasswordDraft] = useState('');
   const [securityPermissions, setSecurityPermissions] = useState<SecurityPermissions>(defaultSecurityPermissions);
+  const [securityDirty, setSecurityDirty] = useState(false);
+  const lastSavedSecurityRef = useRef({
+    authRequired: false,
+    registrationAllowed: true,
+    botReplyAllowed: true,
+    securityAccessPasswordRequiredDraft: false,
+    securityAccessPasswordDraft: '',
+    permissionsHash: JSON.stringify(defaultSecurityPermissions),
+  });
   const [accessDenied, setAccessDenied] = useState<AccessDeniedState>({ cards: false, personas: false, chats: false, presets: false, lorebooks: false });
   const [deletionLocks, setDeletionLocks] = useState<DeletionLocks>(defaultDeletionLocks);
   const [pendingDeleteKey, setPendingDeleteKey] = useState('');
@@ -820,12 +844,15 @@ export default function App() {
   }, [authToken]);
 
   useEffect(() => {
+    if (cookieAuth) {
+      return;
+    }
     if (authToken) {
       window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, authToken);
     } else {
       window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
     }
-  }, [authToken]);
+  }, [authToken, cookieAuth]);
 
   useEffect(() => {
     window.localStorage.setItem(VISUAL_STORAGE_KEY, JSON.stringify(visualSettings));
@@ -854,6 +881,26 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    void (async () => {
+      try {
+        const response = await fetch('/api/security/config');
+        const data = await response.json() as { cookie_auth?: boolean } | null;
+        setCookieAuth(Boolean(data?.cookie_auth));
+      } catch {
+        setCookieAuth(false);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (cookieAuth) {
+      void (async () => {
+        await loadCurrentUser();
+        sendPresence(selectedPersona);
+      })();
+      void loadDeleteLocks();
+      return;
+    }
     if (authToken) {
       void (async () => {
         await loadCurrentUser();
@@ -863,7 +910,7 @@ export default function App() {
     } else {
       setAuthUser(null);
     }
-  }, [authToken]);
+  }, [authToken, cookieAuth]);
 
   useEffect(() => {
     if (accessToken) {
@@ -920,6 +967,18 @@ export default function App() {
   }, [menuOpen, activeSection]);
 
   useEffect(() => {
+    const currentHash = JSON.stringify(securityPermissions);
+    const isSame =
+      authRequired === lastSavedSecurityRef.current.authRequired &&
+      registrationAllowed === lastSavedSecurityRef.current.registrationAllowed &&
+      botReplyAllowed === lastSavedSecurityRef.current.botReplyAllowed &&
+      securityAccessPasswordRequiredDraft === lastSavedSecurityRef.current.securityAccessPasswordRequiredDraft &&
+      securityAccessPasswordDraft === lastSavedSecurityRef.current.securityAccessPasswordDraft &&
+      currentHash === lastSavedSecurityRef.current.permissionsHash;
+    setSecurityDirty(!isSame);
+  }, [authRequired, registrationAllowed, botReplyAllowed, securityAccessPasswordRequiredDraft, securityAccessPasswordDraft, securityPermissions]);
+
+  useEffect(() => {
     const settingsHost = document.getElementById('extensions_settings');
     if (!settingsHost) {
       return;
@@ -937,6 +996,10 @@ export default function App() {
   }, [selectedPersona?.id, selectedPersona?.name, selectedPersona?.avatar_url, authUser?.username, authUser?.is_admin]);
 
   useEffect(() => {
+    const userName = selectedPersona?.name || authUser?.username || 'Player';
+    const charName = activeCard?.name || generationSettings.bot_name || 'Bot';
+    setRegexNames(userName, charName);
+    setRegexContext(activeCard?.id || '', activeConnectionPresetName, generationSettings.chat_completion_source || generationSettings.provider || 'openai');
     updateSillyTavernRuntime({
       messages: activeMessages,
       characters: activeCard ? [{ id: activeCard.id, name: activeCard.name, avatar: activeCard.image_url, image_url: imageSrc(activeCard.image_url) }] : [],
@@ -944,15 +1007,15 @@ export default function App() {
       activePersonas: activeReferencePersonas.map((persona) => ({ ...persona, avatar_url: imageSrc(persona.avatar_url) })),
       selectedPersonaId,
       characterId: activeCard ? 0 : undefined,
-      name1: selectedPersona?.name || authUser?.username || 'Player',
-      name2: activeCard?.name || generationSettings.bot_name || 'Bot',
+      name1: userName,
+      name2: charName,
       getRequestHeaders: actorHeaders,
       saveMessageByIndex: saveExtensionMessageByIndex,
       toast: addToast,
       extensionLeader,
       reasoning: reasoningDisplay,
     });
-  }, [activeMessages, activeCard?.id, activeCard?.name, activeCard?.image_url, personas, activeReferencePersonas, selectedPersonaId, selectedPersona?.name, authUser?.username, generationSettings.bot_name, authToken, accessToken, extensionLeader, presetJsonDraft]);
+  }, [activeMessages, activeCard?.id, activeCard?.name, activeCard?.image_url, personas, activeReferencePersonas, selectedPersonaId, selectedPersona?.name, authUser?.username, generationSettings.bot_name, authToken, accessToken, extensionLeader, presetJsonDraft, activeConnectionPresetName, generationSettings.chat_completion_source, generationSettings.provider]);
 
   useEffect(() => {
     if (authChecked && (!authRequired || authUser)) {
@@ -1050,12 +1113,12 @@ export default function App() {
         setIsGenerating(true);
         setGenerationStreamText('');
         setGenerationReplaceMessageId(payload.replace_message_id || null);
-        setGenerationStatus(`${activeCardRef.current?.name || 'Бот'} печатает...`);
+        setGenerationStatus(`${activeCardRef.current?.name || t('composer.bot')} ${t('composer.typing')}`);
       }
       if (payload.type === 'generation.stream' && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
         activeGenerationRef.current = true;
         setIsGenerating(true);
-        setGenerationStatus(`${activeCardRef.current?.name || 'Бот'} печатает...`);
+        setGenerationStatus(`${activeCardRef.current?.name || t('composer.bot')} ${t('composer.typing')}`);
         setGenerationReplaceMessageId(payload.replace_message_id || null);
         setGenerationStreamText(payload.message || '');
       }
@@ -1350,7 +1413,7 @@ export default function App() {
       body: JSON.stringify({ name, preset: parsed }),
     });
     if (!response.ok) {
-      setPresetMessage('Не удалось активировать изменения пресета');
+      setPresetMessage(t('presets.error.activate'));
       activePresetDraftSignatureRef.current = '';
       return;
     }
@@ -1379,7 +1442,7 @@ export default function App() {
         body: JSON.stringify(generationSettings),
       });
       if (!response.ok) {
-        setConnectionMessage('Не удалось применить настройки подключения');
+        setConnectionMessage(t('connection.error.apply'));
         return;
       }
       const data = await response.json() as Partial<GenerationSettings>;
@@ -1404,7 +1467,7 @@ export default function App() {
       body: JSON.stringify({ content }),
     });
     if (!response.ok) {
-      addToast('Расширение не смогло сохранить сообщение');
+      addToast(t('extensions.error.saveMessage'));
       return;
     }
     const data = await response.json() as { chat: BotChat };
@@ -1437,10 +1500,12 @@ export default function App() {
 
   const loadCurrentUser = async () => {
     const response = await fetch('/api/auth/me', {
-      headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+      headers: !cookieAuth && authToken ? { Authorization: `Bearer ${authToken}` } : {},
     });
     if (!response.ok) {
-      setAuthToken('');
+      if (!cookieAuth) {
+        setAuthToken('');
+      }
       return;
     }
     const data = await response.json() as { user: AuthUser | null };
@@ -1455,25 +1520,27 @@ export default function App() {
     });
     const data = await response.json().catch(() => null) as { token?: string; user?: AuthUser; detail?: string } | null;
     if (!response.ok || !data?.token) {
-      setAuthMessage(data?.detail || 'Не удалось войти');
+      setAuthMessage(data?.detail || t('auth.error.login'));
       return;
     }
-    setAuthToken(data.token);
+    if (!cookieAuth) {
+      setAuthToken(data.token);
+    }
     setAuthUser(data.user || null);
     setAuthDraft({ ...authDraft, password: '' });
     window.localStorage.setItem(AUTH_USERNAME_STORAGE_KEY, authDraft.username);
-    setAuthMessage(mode === 'login' ? 'Вход выполнен' : 'Пользователь создан');
+    setAuthMessage(mode === 'login' ? t('auth.loggedIn') : t('auth.userCreated'));
     await Promise.all([refreshLibrary(), loadGenerationSettings(), loadConnectionPresets(), loadPresetTypes(), loadLorebooks()]);
     sendPresence(selectedPersona);
   };
 
   const logout = async () => {
-    if (authToken) {
-      await fetch('/api/auth/logout', { method: 'POST', headers: actorHeaders() });
+    await fetch('/api/auth/logout', { method: 'POST', headers: actorHeaders() });
+    if (!cookieAuth) {
+      setAuthToken('');
     }
-    setAuthToken('');
     setAuthUser(null);
-    setAuthMessage('Вы вышли');
+    setAuthMessage(t('auth.loggedOut'));
     await Promise.all([refreshLibrary(), loadGenerationSettings(), loadConnectionPresets(), loadPresetTypes(), loadLorebooks()]);
     sendPresence(selectedPersona);
   };
@@ -1486,12 +1553,12 @@ export default function App() {
     });
     const data = await response.json().catch(() => null) as { user?: AuthUser; detail?: string } | null;
     if (!response.ok || !data?.user) {
-      setAuthMessage(data?.detail || 'Не удалось получить админ-права');
+      setAuthMessage(data?.detail || t('auth.error.claimAdmin'));
       return;
     }
     setAuthUser(data.user);
     setAuthDraft({ ...authDraft, adminCode: '' });
-    setAuthMessage('Админ-права включены');
+    setAuthMessage(t('auth.adminEnabled'));
     sendPresence(selectedPersona);
   };
 
@@ -1514,6 +1581,15 @@ export default function App() {
         await verifyAccessPasswordToken(accessToken);
       }
       setSecurityPermissions({ ...defaultSecurityPermissions, ...data.permissions });
+      lastSavedSecurityRef.current = {
+        authRequired: Boolean(data.auth_required),
+        registrationAllowed: data.registration_allowed !== false,
+        botReplyAllowed: data.bot_reply_allowed !== false,
+        securityAccessPasswordRequiredDraft: Boolean(data.access_password_required),
+        securityAccessPasswordDraft: '',
+        permissionsHash: JSON.stringify({ ...defaultSecurityPermissions, ...data.permissions }),
+      };
+      setSecurityDirty(false);
     } finally {
       setAuthChecked(true);
     }
@@ -1539,20 +1615,20 @@ export default function App() {
     });
     const data = await response.json().catch(() => null) as { token?: string; detail?: string } | null;
     if (!response.ok || !data?.token) {
-      setAccessPasswordMessage(data?.detail || 'Неверный пароль доступа');
+      setAccessPasswordMessage(data?.detail || t('auth.error.accessPassword'));
       return;
     }
     setAccessToken(data.token);
     setAccessUnlocked(true);
     setAccessPasswordDraft('');
-    setAccessPasswordMessage('Доступ открыт');
+    setAccessPasswordMessage(t('auth.accessUnlocked'));
     await Promise.all([refreshLibrary(), loadGenerationSettings(), loadConnectionPresets(), loadPresetTypes(), loadLorebooks(), loadDeleteLocks(), loadCurrentUser()]);
   };
 
   const saveSecurityPermissions = async () => {
     const nextAccessPasswordRequired = securityAccessPasswordRequiredDraft;
     if (nextAccessPasswordRequired && !accessPasswordConfigured && securityAccessPasswordDraft.trim().length < 4) {
-      setAuthMessage('Введите пароль доступа минимум из 4 символов перед включением защиты');
+      setAuthMessage(t('auth.error.passwordTooShort'));
       return;
     }
     const response = await fetch('/api/security/permissions', {
@@ -1569,7 +1645,7 @@ export default function App() {
     });
     const data = await response.json().catch(() => null) as { auth_required?: boolean; registration_allowed?: boolean; bot_reply_allowed?: boolean; access_password_required?: boolean; access_password_configured?: boolean; permissions?: SecurityPermissions; detail?: string } | null;
     if (!response.ok || !data?.permissions) {
-      setAuthMessage(data?.detail || 'Не удалось сохранить права');
+      setAuthMessage(data?.detail || t('auth.error.savePermissions'));
       return;
     }
     setAuthRequired(Boolean(data.auth_required));
@@ -1586,7 +1662,16 @@ export default function App() {
     }
     setSecurityPermissions({ ...defaultSecurityPermissions, ...data.permissions });
     setSecurityAccessPasswordDraft('');
-    setAuthMessage('Права сохранены');
+    lastSavedSecurityRef.current = {
+      authRequired: Boolean(data.auth_required),
+      registrationAllowed: data.registration_allowed !== false,
+      botReplyAllowed: data.bot_reply_allowed !== false,
+      securityAccessPasswordRequiredDraft: Boolean(data.access_password_required),
+      securityAccessPasswordDraft: '',
+      permissionsHash: JSON.stringify({ ...defaultSecurityPermissions, ...data.permissions }),
+    };
+    setSecurityDirty(false);
+    setAuthMessage(t('security.saved'));
   };
 
   const refreshLibrary = async () => {
@@ -1718,7 +1803,7 @@ export default function App() {
         setPresetNameDraft('');
         setPresetJsonDraft('{}');
       }
-      setPresetMessage('Не удалось загрузить пресеты');
+      setPresetMessage(t('presets.error.load'));
       return;
     }
     const data = await response.json() as { presets: PresetSummary[] };
@@ -1749,7 +1834,7 @@ export default function App() {
         setPresetNameDraft('');
         setPresetJsonDraft('{}');
       }
-      setPresetMessage('Не удалось открыть пресет');
+      setPresetMessage(t('presets.error.open'));
       return;
     }
     const data = await response.json() as { preset: unknown };
@@ -1777,12 +1862,12 @@ export default function App() {
     try {
       parsed = JSON.parse(presetJsonDraft) as Record<string, unknown>;
     } catch {
-      setPresetMessage('JSON пресета невалидный');
+      setPresetMessage(t('presets.error.json'));
       return;
     }
     const name = presetNameDraft.trim() || selectedPresetName;
     if (!name) {
-      setPresetMessage('Введи имя пресета');
+      setPresetMessage(t('presets.error.name'));
       return;
     }
     const response = await fetch(`/api/presets/${encodeURIComponent(selectedPresetType)}`, {
@@ -1791,10 +1876,10 @@ export default function App() {
       body: JSON.stringify({ name, preset: parsed }),
     });
     if (!response.ok) {
-      setPresetMessage('Не удалось сохранить пресет');
+      setPresetMessage(t('presets.error.save'));
       return;
     }
-    setPresetMessage('Пресет сохранен');
+    setPresetMessage(t('presets.saved'));
     await syncActivePresetDraft(JSON.stringify(parsed, null, 2));
     await loadPresets(selectedPresetType, name);
   };
@@ -1807,12 +1892,12 @@ export default function App() {
     body.append('file', file);
     const response = await fetch(`/api/presets/${encodeURIComponent(selectedPresetType)}/import`, { method: 'POST', headers: actorHeaders(), body });
     if (!response.ok) {
-      setPresetMessage('Не удалось импортировать пресет');
+      setPresetMessage(t('presets.error.import'));
       return;
     }
     const data = await response.json() as { preset?: PresetSummary };
     const importedName = data.preset?.name;
-    setPresetMessage(importedName ? `Пресет импортирован: ${importedName}` : 'Пресет импортирован');
+    setPresetMessage(importedName ? `${t('presets.imported')}: ${importedName}` : t('presets.imported'));
     await loadPresets(selectedPresetType);
     if (importedName) {
       await selectPreset(importedName);
@@ -1821,18 +1906,18 @@ export default function App() {
 
   const applyPreset = async () => {
     if (!selectedPresetName) {
-      setPresetMessage('Сначала выбери пресет');
+      setPresetMessage(t('presets.error.selectFirst'));
       return;
     }
     const response = await fetch(`/api/presets/${encodeURIComponent(selectedPresetType)}/${encodeURIComponent(selectedPresetName)}/apply`, { method: 'POST', headers: actorHeaders() });
     if (!response.ok) {
-      setPresetMessage('Не удалось применить пресет');
+      setPresetMessage(t('presets.error.apply'));
       return;
     }
     const data = await response.json() as { active: Record<string, string>; settings: Partial<GenerationSettings> };
     setActivePresets(data.active);
     setGenerationSettings({ ...generationSettings, ...data.settings, api_key: '', clear_api_key: false, proxy_password: '', clear_proxy_password: false });
-    setPresetMessage('Пресет применен');
+    setPresetMessage(t('presets.applied'));
   };
 
   const deletePreset = async () => {
@@ -1841,13 +1926,13 @@ export default function App() {
     }
     const response = await fetch(`/api/presets/${encodeURIComponent(selectedPresetType)}/${encodeURIComponent(selectedPresetName)}`, { method: 'DELETE', headers: actorHeaders() });
     if (!response.ok) {
-      setPresetMessage('Не удалось удалить пресет');
+      setPresetMessage(t('presets.error.delete'));
       return;
     }
     setSelectedPresetName('');
     setPresetNameDraft('');
     setPresetJsonDraft('{}');
-    setPresetMessage('Пресет удален');
+    setPresetMessage(t('presets.deleted'));
     await loadPresets(selectedPresetType);
   };
 
@@ -1856,22 +1941,22 @@ export default function App() {
     body.append('source_root', 'E:/ST/SillyTavern/default/content');
     const response = await fetch('/api/presets/import-sillytavern-defaults', { method: 'POST', headers: actorHeaders(), body });
     const data = await response.json().catch(() => null) as { copied?: number } | null;
-    setPresetMessage(response.ok ? `Импортировано дефолтных пресетов: ${data?.copied ?? 0}` : 'Не удалось импортировать дефолты SillyTavern');
+    setPresetMessage(response.ok ? `${t('presets.importedDefaults')}: ${data?.copied ?? 0}` : t('presets.error.importST'));
     await loadPresets(selectedPresetType);
   };
 
   const exportPreset = async () => {
     if (!selectedPresetName) {
-      setPresetMessage('Сначала выбери пресет');
+      setPresetMessage(t('presets.error.selectFirst'));
       return;
     }
     const response = await fetch(`/api/presets/${encodeURIComponent(selectedPresetType)}/${encodeURIComponent(selectedPresetName)}/export`, { headers: actorHeaders() });
     if (!response.ok) {
-      setPresetMessage('Не удалось экспортировать пресет');
+      setPresetMessage(t('presets.error.export'));
       return;
     }
     await downloadResponse(response, `${selectedPresetName}.json`);
-    setPresetMessage('Экспорт пресета готов');
+    setPresetMessage(t('presets.exported'));
   };
 
   const loadLorebooks = async () => {
@@ -1942,7 +2027,7 @@ export default function App() {
     }
     const response = await authedFetch(`/api/lorebooks/${encodeURIComponent(name)}`);
     if (!response.ok) {
-      setLorebookMessage('Не удалось открыть лорбук');
+      setLorebookMessage(t('lorebooks.error.open'));
       return;
     }
     const data = await response.json() as { book: unknown };
@@ -1957,20 +2042,20 @@ export default function App() {
     try {
       parsed = JSON.parse(lorebookJsonDraft) as Record<string, unknown>;
     } catch {
-      setLorebookMessage('JSON лорбука невалидный');
+      setLorebookMessage(t('lorebooks.error.json'));
       return;
     }
     const name = lorebookNameDraft.trim() || selectedLorebookName;
     if (!name) {
-      setLorebookMessage('Введи имя лорбука');
+      setLorebookMessage(t('lorebooks.error.name'));
       return;
     }
     const response = await fetch('/api/lorebooks', { method: 'PUT', headers: authJsonHeaders(), body: JSON.stringify({ name, book: parsed }) });
     if (!response.ok) {
-      setLorebookMessage('Не удалось сохранить лорбук');
+      setLorebookMessage(t('lorebooks.error.save'));
       return;
     }
-    setLorebookMessage('Лорбук сохранен');
+    setLorebookMessage(t('lorebooks.saved'));
     await loadLorebooks();
     await openLorebook(name);
   };
@@ -1983,7 +2068,7 @@ export default function App() {
     body.append('file', file);
     const response = await fetch('/api/lorebooks/import', { method: 'POST', headers: actorHeaders(), body });
     if (!response.ok) {
-      setLorebookMessage('Не удалось импортировать лорбук');
+      setLorebookMessage(t('lorebooks.error.import'));
       return;
     }
     const data = await response.json() as { lorebook?: LorebookSummary };
@@ -1991,30 +2076,30 @@ export default function App() {
     if (data.lorebook?.name) {
       await openLorebook(data.lorebook.name);
     }
-    setLorebookMessage('Лорбук импортирован');
+    setLorebookMessage(t('lorebooks.imported'));
   };
 
   const exportLorebook = async () => {
     if (!selectedLorebookName) {
-      setLorebookMessage('Сначала выбери лорбук');
+      setLorebookMessage(t('lorebooks.error.selectFirst'));
       return;
     }
     const response = await fetch(`/api/lorebooks/${encodeURIComponent(selectedLorebookName)}/export`, { headers: actorHeaders() });
     if (!response.ok) {
-      setLorebookMessage('Не удалось экспортировать лорбук');
+      setLorebookMessage(t('lorebooks.error.export'));
       return;
     }
     await downloadResponse(response, `${selectedLorebookName}.json`);
-    setLorebookMessage('Экспорт лорбука готов');
+    setLorebookMessage(t('lorebooks.exported'));
   };
 
   const deleteLorebook = async () => {
-    if (!selectedLorebookName || !window.confirm(`Удалить лорбук "${selectedLorebookName}"?`)) {
+    if (!selectedLorebookName || !window.confirm(`${t('lorebooks.deleteConfirm')}"${selectedLorebookName}"?`)) {
       return;
     }
     const response = await fetch(`/api/lorebooks/${encodeURIComponent(selectedLorebookName)}`, { method: 'DELETE', headers: actorHeaders() });
     if (!response.ok) {
-      setLorebookMessage('Не удалось удалить лорбук');
+      setLorebookMessage(t('lorebooks.error.delete'));
       return;
     }
     setSelectedLorebookName('');
@@ -2026,19 +2111,19 @@ export default function App() {
   const saveLorebookBindings = async (bindings = lorebookBindings) => {
     const response = await fetch('/api/lorebooks/bindings', { method: 'PUT', headers: authJsonHeaders(), body: JSON.stringify({ bindings }) });
     if (!response.ok) {
-      setLorebookMessage('Не удалось сохранить привязки');
+      setLorebookMessage(t('lorebooks.error.saveBindings'));
       return;
     }
     const data = await response.json() as { bindings: LorebookBinding[] };
     setLorebookBindings(data.bindings);
-    setLorebookMessage('Привязки сохранены');
+    setLorebookMessage(t('lorebooks.bindingsSaved'));
     await loadLorebooks();
   };
 
   const addLorebookBinding = async () => {
     const book = lorebookBindingDraft.book || selectedLorebookName;
     if (!book) {
-      setLorebookMessage('Выбери лорбук для привязки');
+      setLorebookMessage(t('lorebooks.error.selectBook'));
       return;
     }
     const binding = { ...lorebookBindingDraft, book, target_id: lorebookBindingDraft.target_type === 'global' ? '' : lorebookBindingDraft.target_id };
@@ -2120,24 +2205,24 @@ export default function App() {
   const saveGenerationSettings = async () => {
     const name = connectionPresetName.trim();
     if (!name) {
-      setConnectionMessage('Введи название пресета');
+      setConnectionMessage(t('connection.error.presetName'));
       return;
     }
-    setConnectionMessage('Сохраняю подключение и пресет...');
+    setConnectionMessage(t('connection.saving'));
     const response = await fetch('/api/generation/presets', {
       method: 'POST',
       headers: authJsonHeaders(),
       body: JSON.stringify({ name, settings: generationSettings }),
     });
     if (!response.ok) {
-      setConnectionMessage('Не удалось сохранить подключение');
+      setConnectionMessage(t('connection.error.saveConnection'));
       return;
     }
     const data = await response.json() as { settings: Partial<GenerationSettings> };
     setGenerationSettings({ ...generationSettings, ...data.settings, api_key: '', clear_api_key: false, proxy_password: '', clear_proxy_password: false });
     setConnectionPresetName('');
     await loadConnectionPresets();
-    setConnectionMessage('Подключение сохранено в пресет');
+    setConnectionMessage(t('connection.savedToPreset'));
   };
 
   const applyConnectionPreset = async (presetName: string) => {
@@ -2147,13 +2232,13 @@ export default function App() {
     }
     const response = await fetch(`/api/generation/presets/${encodeURIComponent(presetName)}/active`, { method: 'POST', headers: actorHeaders() });
     if (!response.ok) {
-      setConnectionMessage('Не удалось выбрать пресет подключения');
+      setConnectionMessage(t('connection.error.selectConnectionPreset'));
       return;
     }
     const data = await response.json() as { settings: Partial<GenerationSettings>; active: string };
     setGenerationSettings({ ...generationSettings, ...data.settings, api_key: '', clear_api_key: false, proxy_password: '', clear_proxy_password: false });
     setActiveConnectionPresetName(data.active);
-    setConnectionMessage(`Пресет выбран: ${preset.name}`);
+    setConnectionMessage(`${t('connection.presetSelected')}: ${preset.name}`);
   };
 
   const deleteConnectionPreset = async (presetName: string) => {
@@ -2162,17 +2247,17 @@ export default function App() {
     }
     const response = await fetch(`/api/generation/presets/${encodeURIComponent(presetName)}`, { method: 'DELETE', headers: actorHeaders() });
     if (!response.ok) {
-      setConnectionMessage('Не удалось удалить пресет');
+      setConnectionMessage(t('connection.error.deleteConnectionPreset'));
       return;
     }
     const data = await response.json().catch(() => null) as { active?: string } | null;
     setActiveConnectionPresetName(data?.active || '');
     await loadConnectionPresets();
-    setConnectionMessage('Пресет удален');
+    setConnectionMessage(t('connection.presetDeleted'));
   };
 
   const checkConnection = async () => {
-    setConnectionMessage('Проверяю подключение...');
+    setConnectionMessage(t('connection.checking'));
     const response = await fetch('/api/generation/models', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2180,12 +2265,12 @@ export default function App() {
     });
     const data = await response.json().catch(() => null) as { ok?: boolean; error?: string; models?: unknown } | null;
     if (!response.ok || !data?.ok) {
-      setConnectionMessage(data?.error || 'Провайдер недоступен');
+      setConnectionMessage(data?.error || t('connection.providerUnavailable'));
       return;
     }
     const modelNames = extractModelNames(data.models);
     setModels(modelNames);
-    setConnectionMessage(modelNames.length ? `Найдено моделей: ${modelNames.length}` : 'Подключение работает, но список моделей пуст');
+    setConnectionMessage(modelNames.length ? `${t('connection.modelsFound')}: ${modelNames.length}` : t('connection.emptyModelList'));
   };
 
   const refreshCardChats = async (cardId: string) => {
@@ -2211,21 +2296,21 @@ export default function App() {
     }
     const body = new FormData();
     body.append('file', file);
-    setLibraryMessage('Импортирую карточку...');
+    setLibraryMessage(t('cards.importing'));
     const response = await fetch('/api/cards/import', { method: 'POST', headers: actorHeaders(), body });
     if (!response.ok) {
       const error = await response.json().catch(() => null) as { detail?: string } | null;
-      setLibraryMessage(error?.detail || 'Не удалось импортировать карточку');
+      setLibraryMessage(error?.detail || t('cards.error.import'));
       return;
     }
-    setLibraryMessage('Карточка импортирована');
+    setLibraryMessage(t('cards.imported'));
     await refreshLibrary();
   };
 
   const createCard = async () => {
     const name = cardDraft.name.trim();
     if (!name) {
-      setLibraryMessage('Введите имя карточки');
+      setLibraryMessage(t('cards.error.name'));
       return;
     }
     const body = new FormData();
@@ -2241,23 +2326,23 @@ export default function App() {
     if (cardAvatar) {
       body.append('avatar', cardAvatar);
     }
-    setLibraryMessage('Создаю карточку...');
+    setLibraryMessage(t('cards.creating'));
     const response = await fetch('/api/cards', { method: 'POST', headers: actorHeaders(), body });
     if (!response.ok) {
       const error = await response.json().catch(() => null) as { detail?: string } | null;
-      setLibraryMessage(error?.detail || 'Не удалось создать карточку');
+      setLibraryMessage(error?.detail || t('cards.error.create'));
       return;
     }
     setCardDraft(emptyCardDraft);
     setCardAvatar(null);
-    setLibraryMessage('Карточка создана');
+    setLibraryMessage(t('cards.created'));
     await refreshLibrary();
   };
 
   const updateCard = async (cardId: string, draft: CardDraft) => {
     const name = draft.name.trim();
     if (!name) {
-      setLibraryMessage('Введите имя карточки');
+      setLibraryMessage(t('cards.error.name'));
       return;
     }
     const response = await fetch(`/api/cards/${encodeURIComponent(cardId)}`, {
@@ -2277,7 +2362,7 @@ export default function App() {
     });
     if (!response.ok) {
       const error = await response.json().catch(() => null) as { detail?: string } | null;
-      setLibraryMessage(error?.detail || 'Не удалось сохранить карточку');
+      setLibraryMessage(error?.detail || t('cards.error.save'));
       return;
     }
     const data = await response.json() as { card: CharacterCard };
@@ -2285,17 +2370,17 @@ export default function App() {
     if (activeCard?.id === data.card.id) {
       setActiveCard(data.card);
     }
-    setLibraryMessage('Карточка сохранена');
+    setLibraryMessage(t('cards.saved'));
   };
 
   const deleteCard = async (card: CharacterCard) => {
     if (isDeleteLocked('cards', card.id)) {
-      setLibraryMessage('Удаление карточек заблокировано админом');
+      setLibraryMessage(t('cards.error.deleteLocked'));
       return;
     }
     const response = await fetch(`/api/cards/${encodeURIComponent(card.id)}`, { method: 'DELETE', headers: actorHeaders() });
     if (!response.ok) {
-      setLibraryMessage('Не удалось удалить карточку');
+      setLibraryMessage(t('cards.error.delete'));
       return;
     }
     setCards((current) => current.filter((item) => item.id !== card.id));
@@ -2304,7 +2389,7 @@ export default function App() {
       setActiveChat(null);
       setBotChats([]);
     }
-    setLibraryMessage('Карточка удалена');
+    setLibraryMessage(t('cards.deleted'));
   };
 
   const uploadCardAvatar = async (card: CharacterCard, file: File | null) => {
@@ -2316,7 +2401,7 @@ export default function App() {
     const response = await fetch(`/api/cards/${encodeURIComponent(card.id)}/avatar`, { method: 'POST', headers: actorHeaders(), body });
     if (!response.ok) {
       const error = await response.json().catch(() => null) as { detail?: string } | null;
-      setLibraryMessage(error?.detail || 'Не удалось обновить аватар карточки');
+      setLibraryMessage(error?.detail || t('cards.error.avatar'));
       return;
     }
     const data = await response.json() as { card: CharacterCard };
@@ -2324,13 +2409,13 @@ export default function App() {
     if (activeCard?.id === data.card.id) {
       setActiveCard(data.card);
     }
-    setLibraryMessage('Аватар карточки обновлен');
+    setLibraryMessage(t('cards.avatarUpdated'));
   };
 
   const selectBotCard = async (card: CharacterCard, notify = true) => {
     const rememberedChatId = lastChatByCard()[card.id];
     if (rememberedChatId && await openChatForCard(card, rememberedChatId)) {
-      setLibraryMessage(`Открыт последний чат: ${card.name}`);
+      setLibraryMessage(`${t('chat.openedLast')}: ${card.name}`);
       if (notify) {
         sendRealtimeEvent({ type: 'card.select', name: card.name, persona_name: selectedPersona?.name || 'Player' });
       }
@@ -2343,7 +2428,7 @@ export default function App() {
       body: JSON.stringify({ character_name: card.name, title: 'New Chat' }),
     });
     if (!response.ok) {
-      setLibraryMessage('Не удалось открыть чат бота');
+      setLibraryMessage(t('chat.error.openBotChat'));
       return;
     }
     const chatData = await response.json() as { chat: BotChat };
@@ -2351,7 +2436,7 @@ export default function App() {
     setActiveCard(card);
     setActiveChat(chatData.chat);
     rememberChatSelection(card.id, chatData.chat.id);
-    setLibraryMessage(`Открыт чат: ${chatData.chat.title}`);
+    setLibraryMessage(`${t('chat.opened')}: ${chatData.chat.title}`);
     if (notify) {
       sendRealtimeEvent({ type: 'card.select', name: card.name, persona_name: selectedPersona?.name || 'Player' });
     }
@@ -2359,7 +2444,7 @@ export default function App() {
 
   const createBotChat = async () => {
     if (!activeCard) {
-      setLibraryMessage('Сначала выбери карточку бота');
+      setLibraryMessage(t('chat.error.selectCardFirst'));
       return;
     }
     const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats`, {
@@ -2368,7 +2453,7 @@ export default function App() {
       body: JSON.stringify({ character_name: activeCard.name, title: `Chat ${new Date().toLocaleString()}` }),
     });
     if (!response.ok) {
-      setLibraryMessage('Не удалось создать чат');
+      setLibraryMessage(t('chat.error.create'));
       return;
     }
     const { chat } = await response.json() as { chat: BotChat };
@@ -2383,7 +2468,7 @@ export default function App() {
     }
     const opened = await openChatForCard(activeCard, chatId);
     if (!opened) {
-      setLibraryMessage('Не удалось открыть чат');
+      setLibraryMessage(t('chat.error.open'));
     }
   };
 
@@ -2393,7 +2478,7 @@ export default function App() {
     }
     const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(chatId)}/copy`, { method: 'POST', headers: actorHeaders() });
     if (!response.ok) {
-      setLibraryMessage('Не удалось скопировать чат');
+      setLibraryMessage(t('chat.error.copy'));
       return;
     }
     const data = await response.json() as { chat: BotChat };
@@ -2408,7 +2493,7 @@ export default function App() {
     }
     const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(chatId)}/export/sillytavern`, { headers: actorHeaders() });
     if (!response.ok) {
-      setLibraryMessage('Не удалось экспортировать чат для SillyTavern');
+      setLibraryMessage(t('chat.error.exportST'));
       return;
     }
     const blob = await response.blob();
@@ -2420,7 +2505,7 @@ export default function App() {
     link.click();
     link.remove();
     window.URL.revokeObjectURL(url);
-    setLibraryMessage('Экспорт SillyTavern .jsonl готов');
+    setLibraryMessage(t('chat.exportedST'));
   };
 
   const toggleDeletionLock = async (category: keyof DeletionLocks, itemId: string) => {
@@ -2433,7 +2518,7 @@ export default function App() {
       body: JSON.stringify({ category, item_id: itemId, locked: !isDeleteLocked(category, itemId) }),
     });
     if (!response.ok) {
-      setLibraryMessage('Не удалось изменить блокировку удаления');
+      setLibraryMessage(t('chat.error.toggleDeleteLock'));
       return;
     }
     const data = await response.json() as { delete_locks: DeletionLocks };
@@ -2463,7 +2548,7 @@ export default function App() {
       body: JSON.stringify({ title }),
     });
     if (!response.ok) {
-      setLibraryMessage('Не удалось переименовать чат');
+      setLibraryMessage(t('chat.error.rename'));
       return;
     }
     const data = await response.json() as { chat: BotChat };
@@ -2479,12 +2564,12 @@ export default function App() {
       return;
     }
     if (isDeleteLocked('chats', chatDeleteLockId(activeCard.id, chatId))) {
-      setLibraryMessage('Удаление чатов заблокировано админом');
+      setLibraryMessage(t('chat.error.deleteLocked'));
       return;
     }
     const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(chatId)}`, { method: 'DELETE', headers: actorHeaders() });
     if (!response.ok) {
-      setLibraryMessage('Не удалось удалить чат');
+      setLibraryMessage(t('chat.error.delete'));
       return;
     }
     if (activeChat?.id === chatId) {
@@ -2505,7 +2590,7 @@ export default function App() {
     if (!activeCard || !activeChat) {
       return;
     }
-    const content = chatInput;
+    const content = getRegexedString(chatInput, regex_placement.USER_INPUT);
     setChatInput('');
     const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/messages`, {
       method: 'POST',
@@ -2514,7 +2599,7 @@ export default function App() {
     });
     if (!response.ok) {
       setChatInput(content);
-      setLibraryMessage('Не удалось отправить сообщение');
+      setLibraryMessage(t('message.error.send'));
       return;
     }
     const data = await response.json() as { chat: BotChat };
@@ -2547,7 +2632,7 @@ export default function App() {
 
   const updateMessagesHidden = async (indexes: number[], hidden: boolean) => {
     if (!activeCard || !activeChat || !indexes.length) {
-      setLibraryMessage('Укажи номера сообщений, например /hide 1-3');
+      setLibraryMessage(t('commands.specifyNumbers'));
       return;
     }
     let latestChat: BotChat | null = null;
@@ -2568,13 +2653,13 @@ export default function App() {
     }
     if (latestChat) {
       setActiveChat(latestChat);
-      setLibraryMessage(hidden ? 'Сообщения скрыты' : 'Сообщения показаны');
+      setLibraryMessage(hidden ? t('message.hidden') : t('message.shown'));
     }
   };
 
   const deleteMessagesByIndex = async (indexes: number[]) => {
     if (!activeCard || !activeChat || !indexes.length) {
-      setLibraryMessage('Укажи номера сообщений, например /delete 2 4-5');
+      setLibraryMessage(t('commands.specifyDeleteNumbers'));
       return;
     }
     let latestChat: BotChat | null = null;
@@ -2591,16 +2676,17 @@ export default function App() {
     }
     if (latestChat) {
       setActiveChat(latestChat);
-      setLibraryMessage('Сообщения удалены');
+      setLibraryMessage(t('message.deleted'));
     }
   };
 
   const executeSlashCommand = async (rawCommand: string) => {
-    const [commandToken, ...args] = rawCommand.trim().split(/\s+/);
+    const regexedCommand = getRegexedString(rawCommand, regex_placement.SLASH_COMMAND);
+    const [commandToken, ...args] = regexedCommand.trim().split(/\s+/);
     const command = commandToken.toLowerCase();
     const argText = args.join(' ');
     if (command === '/help') {
-      setLibraryMessage(`Команды: ${slashCommands.map((item) => `${item.command}${item.hint ? ` ${item.hint}` : ''}`).join(', ')}`);
+      setLibraryMessage(`${t('commands.title')}: ${getSlashCommands(t).map((item) => `${item.command}${item.hint ? ` ${item.hint}` : ''}`).join(', ')}`);
       setChatInput('');
       return;
     }
@@ -2631,15 +2717,15 @@ export default function App() {
         return message ? `#${index} ${message.author}: ${message.content}` : '';
       }).filter(Boolean).join('\n\n');
       if (!text) {
-        setLibraryMessage('Нечего копировать');
+        setLibraryMessage(t('message.nothingToCopy'));
         return;
       }
       await window.navigator.clipboard.writeText(text);
       setChatInput('');
-      setLibraryMessage('Сообщения скопированы');
+      setLibraryMessage(t('message.copied'));
       return;
     }
-    setLibraryMessage('Неизвестная команда. Используй /help');
+      setLibraryMessage(t('commands.unknown'));
   };
 
   const startEditMessage = (message: ChatMessage) => {
@@ -2651,7 +2737,8 @@ export default function App() {
     if (!activeCard || !activeChat) {
       return;
     }
-    const content = editingMessageText.trim();
+    const rawContent = editingMessageText.trim();
+    const content = getRegexedString(rawContent, regex_placement.MD_DISPLAY, { isMarkdown: true, isEdit: true });
     if (!content || content === message.content) {
       setEditingMessageId('');
       setEditingMessageText('');
@@ -2663,7 +2750,7 @@ export default function App() {
       body: JSON.stringify({ content }),
     });
     if (!response.ok) {
-      setLibraryMessage('Не удалось отредактировать сообщение');
+      setLibraryMessage(t('message.error.edit'));
       return;
     }
     const data = await response.json() as { chat: BotChat };
@@ -2682,7 +2769,7 @@ export default function App() {
       body: JSON.stringify({ hidden: !message.hidden }),
     });
     if (!response.ok) {
-      setLibraryMessage('Не удалось скрыть сообщение');
+      setLibraryMessage(t('message.error.toggleHide'));
       return;
     }
     const data = await response.json() as { chat: BotChat };
@@ -2695,7 +2782,7 @@ export default function App() {
     }
     const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/messages/${encodeURIComponent(message.id)}`, { method: 'DELETE', headers: actorHeaders() });
     if (!response.ok) {
-      setLibraryMessage('Не удалось удалить сообщение');
+      setLibraryMessage(t('message.error.delete'));
       return;
     }
     const data = await response.json() as { chat: BotChat };
@@ -2712,7 +2799,7 @@ export default function App() {
       body: JSON.stringify({ direction }),
     });
     if (!response.ok) {
-      setLibraryMessage('Не удалось переключить swipe');
+      setLibraryMessage(t('message.error.swipe'));
       return;
     }
     const data = await response.json() as { chat: BotChat };
@@ -2721,20 +2808,20 @@ export default function App() {
 
   const requestBotReply = async (replaceMessageId?: string, sourceChat?: BotChat, resetSwipes = false) => {
     const chat = sourceChat || activeChat;
-    if (!replaceMessageId && !botReplyAllowed) {
-      setLibraryMessage('Кнопка "Ответ бота" отключена в настройках безопасности');
+    if (!replaceMessageId && !botReplyAllowed && !authUser?.is_admin) {
+      setLibraryMessage(t('chat.error.botReplyDisabled'));
       return;
     }
     if (!activeCard || !chat || isGenerating) {
-      setLibraryMessage('Сначала выбери карточку и чат');
+      setLibraryMessage(t('chat.error.selectCardAndChat'));
       return;
     }
     activeGenerationRef.current = true;
     setIsGenerating(true);
     setGenerationStreamText('');
     setGenerationReplaceMessageId(replaceMessageId || null);
-    setGenerationStatus(`${activeCard.name} печатает...`);
-    setLibraryMessage(replaceMessageId ? 'Реролл ответа...' : 'Бот отвечает...');
+    setGenerationStatus(`${activeCard.name} ${t('composer.typing')}`);
+    setLibraryMessage(replaceMessageId ? t('message.reroll') : t('message.botAnswering'));
     try {
       const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(chat.id)}/bot/reply`, {
         method: 'POST',
@@ -2747,16 +2834,17 @@ export default function App() {
           persona_name: selectedPersona?.name || '',
           persona_description: selectedPersona?.description || '',
           participants: generationParticipants(),
+          regex_scripts: getRegexScripts({ allowedOnly: true }),
         }),
       });
       if (!response.ok) {
         const error = await response.json().catch(() => null) as { detail?: string } | null;
-        setLibraryMessage(response.status === 499 ? 'Генерация отменена' : error?.detail || 'Не удалось получить ответ бота');
+        setLibraryMessage(response.status === 499 ? t('message.generationCancelled') : error?.detail || t('message.error.botReply'));
         return;
       }
       const data = await response.json() as { chat: BotChat };
       setActiveChat(data.chat);
-      setLibraryMessage(replaceMessageId ? 'Реролл добавлен в swipes' : 'Ответ бота добавлен');
+      setLibraryMessage(replaceMessageId ? t('message.rerollAdded') : t('message.botReplyAdded'));
     } finally {
       activeGenerationRef.current = false;
       setIsGenerating(false);
@@ -2769,7 +2857,7 @@ export default function App() {
   const rerollLastBotMessage = async () => {
     const lastBotMessage = [...activeMessages].reverse().find((message) => message.role === 'assistant');
     if (!lastBotMessage) {
-      setLibraryMessage('Нет ответа бота для реролла');
+      setLibraryMessage(t('message.error.noBotReplyForReroll'));
       return;
     }
     await requestBotReply(lastBotMessage.id, undefined, true);
@@ -2779,14 +2867,14 @@ export default function App() {
     if (!activeCard || !activeChat || !isGenerating) {
       return;
     }
-    setGenerationStatus('Отмена генерации...');
+    setGenerationStatus(t('message.generationCancelling'));
     await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/bot/cancel`, { method: 'POST', headers: actorHeaders() });
   };
 
   const createPersona = async () => {
     const name = personaDraft.name.trim();
     if (!name) {
-      setLibraryMessage('Введите имя персоны');
+      setLibraryMessage(t('personas.error.name'));
       return;
     }
     const response = await fetch('/api/personas', {
@@ -2795,14 +2883,14 @@ export default function App() {
       body: JSON.stringify({ name, description: personaDraft.description }),
     });
     if (!response.ok) {
-      setLibraryMessage('Не удалось создать персону');
+      setLibraryMessage(t('personas.error.create'));
       return;
     }
     const data = await response.json() as { persona: Persona };
     setPersonaDraft({ name: '', description: '' });
     participantPersonaRestoredRef.current = true;
     applySelectedPersonaId(data.persona.id);
-    setLibraryMessage('Персона создана');
+    setLibraryMessage(t('personas.created'));
     await refreshLibrary();
   };
 
@@ -2810,9 +2898,9 @@ export default function App() {
     const persona = personas.find((item) => item.id === personaId) ?? null;
     participantPersonaRestoredRef.current = true;
     applySelectedPersonaId(personaId);
-    setLibraryMessage('Персона выбрана для этого браузера');
+    setLibraryMessage(t('personas.selectedBrowser'));
     if (persona) {
-      sendRealtimeEvent({ type: 'notification', content: `выбрал персону: ${persona.name}`, persona_name: persona.name });
+      sendRealtimeEvent({ type: 'notification', content: `${t('personas.selected')}: ${persona.name}`, persona_name: persona.name });
       sendPresence(persona);
     }
   };
@@ -2820,7 +2908,7 @@ export default function App() {
   const activatePersona = async (personaId: string) => {
     const response = await fetch(`/api/personas/${personaId}/active`, { method: 'PUT', headers: actorHeaders() });
     if (!response.ok) {
-      setLibraryMessage('Не удалось активировать персону');
+      setLibraryMessage(t('personas.error.activate'));
       return;
     }
     await refreshLibrary();
@@ -2837,21 +2925,21 @@ export default function App() {
       body: JSON.stringify({ name: persona.name, description: persona.description }),
     });
     if (!response.ok) {
-      setLibraryMessage('Не удалось сохранить персону');
+      setLibraryMessage(t('personas.error.save'));
       return;
     }
-    setLibraryMessage('Персона сохранена');
+    setLibraryMessage(t('personas.saved'));
     await refreshLibrary();
   };
 
   const deletePersona = async (persona: Persona) => {
     if (isDeleteLocked('personas', persona.id)) {
-      setLibraryMessage('Удаление персон заблокировано админом');
+      setLibraryMessage(t('personas.error.deleteLocked'));
       return;
     }
     const response = await fetch(`/api/personas/${persona.id}`, { method: 'DELETE', headers: actorHeaders() });
     if (!response.ok) {
-      setLibraryMessage('Не удалось удалить персону');
+      setLibraryMessage(t('personas.error.delete'));
       return;
     }
     if (selectedPersonaId === persona.id) {
@@ -2859,7 +2947,7 @@ export default function App() {
       setSelectedPersonaId('');
       window.localStorage.removeItem(SELECTED_PERSONA_STORAGE_KEY);
     }
-    setLibraryMessage('Персона удалена');
+    setLibraryMessage(t('personas.deleted'));
     await refreshLibrary();
   };
 
@@ -2871,10 +2959,10 @@ export default function App() {
     body.append('file', file);
     const response = await fetch(`/api/personas/${personaId}/avatar`, { method: 'POST', headers: actorHeaders(), body });
     if (!response.ok) {
-      setLibraryMessage('Не удалось загрузить аватарку');
+      setLibraryMessage(t('personas.error.avatarUpload'));
       return;
     }
-    setLibraryMessage('Аватарка обновлена');
+    setLibraryMessage(t('personas.avatarUpdated'));
     await refreshLibrary();
   };
 
@@ -2919,22 +3007,22 @@ export default function App() {
       <header className={`${topbarVisible ? 'topbar topbar-visible' : 'topbar topbar-hidden'}${mobileTopbarCollapsed ? ' topbar-collapsed' : ''}`} onClick={toggleMobileTopbar}>
         <button className="menu-trigger" type="button" onClick={() => setMenuOpen(true)}>
           <Icon name="menu" />
-          Меню
+          {t('topbar.menu')}
         </button>
         <div className="turn-strip app-status-strip">
           <div>
-            <span>Персона</span>
-            <strong>{selectedPersona?.name || 'не выбрана'}</strong>
+            <span>{t('topbar.persona')}</span>
+            <strong>{selectedPersona?.name || t('topbar.persona.none')}</strong>
           </div>
           <div>
-            <span>Активный чат</span>
-            <strong>{activeCard?.name || 'карточка не выбрана'} · {activeChat?.title || 'чат не выбран'}</strong>
+            <span>{t('topbar.activeChat')}</span>
+            <strong>{activeCard?.name || t('topbar.activeChat.noCard')} · {activeChat?.title || t('topbar.activeChat.noChat')}</strong>
           </div>
           <div>
-            <span>Подключения</span>
+            <span>{t('topbar.connections')}</span>
             <div className="connections-status">
               <strong>{connectedCount}</strong>
-              <button className="ghost-button" type="button" onClick={() => setPlayersMenuOpen((open) => !open)}>Игроки</button>
+              <button className="ghost-button" type="button" onClick={() => setPlayersMenuOpen((open) => !open)}>{t('topbar.players')}</button>
               {playersMenuOpen ? (
                 <div className="players-popover">
                   {connectedPlayers.length ? connectedPlayers.map((player) => (
@@ -2943,7 +3031,7 @@ export default function App() {
                       <strong className="identity-name">{player.is_admin ? <span className="admin-crown">♛</span> : null}<span>{player.persona_name || player.name}</span></strong>
                       {player.username ? <small className="hover-username">({player.username})</small> : null}
                     </span>
-                  )) : <strong>нет подключенных игроков</strong>}
+                  )) : <strong>{t('topbar.players.none')}</strong>}
                 </div>
               ) : null}
             </div>
@@ -3004,17 +3092,17 @@ export default function App() {
                 <div className="message-avatar-rail">
                   {message.avatar_url ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(message.avatar_url), title: message.author })}><img src={imageSrc(message.avatar_url)} alt="" loading="lazy" /></button> : <i>{message.author.slice(0, 1) || '?'}</i>}
                   <small className="message-index">#{messageIndex}</small>
-                  <small className="message-token-count">{approxTokens(visibleMessageContent)} ток.</small>
+                  <small className="message-token-count">{approxTokens(visibleMessageContent)} {t('message.tokens')}</small>
                 </div>
-                <div className="message-actions extraMesButtons" aria-label="Действия сообщения">
-                  {canSwipe ? <button className="mes_button" type="button" title="Предыдущий swipe" onClick={() => void swipeBotMessage(message, -1)}>‹</button> : null}
-                  {canSwipe ? <button className="mes_button" type="button" title="Следующий swipe" onClick={() => void swipeBotMessage(message, 1)}>›</button> : null}
+                <div className="message-actions extraMesButtons" aria-label={t('message.actions')}>
+                  {canSwipe ? <button className="mes_button" type="button" title={t('message.swipe.prev')} onClick={() => void swipeBotMessage(message, -1)}>‹</button> : null}
+                  {canSwipe ? <button className="mes_button" type="button" title={t('message.swipe.next')} onClick={() => void swipeBotMessage(message, 1)}>›</button> : null}
                   {canSwipe ? <small className="swipe-counter">{(message.active_swipe_index ?? 0) + 1}/{swipeCount}</small> : null}
-                  {message.role === 'assistant' ? <button className="mes_button" type="button" title="Новый swipe" onClick={() => void requestBotReply(message.id)}>↻</button> : null}
-                  {isImagePending ? <button className="mes_button" type="button" title="Отменить генерацию картинки" onClick={() => cancelImageGeneration(messageIndex, message)}><Icon name="x" /></button> : null}
-                  <button className="mes_button" type="button" title="Редактировать" onClick={() => startEditMessage(message)}><Icon name="edit" /></button>
-                  <button className="mes_button" type="button" title={message.hidden ? 'Показать' : 'Скрыть'} onClick={() => void toggleMessageHidden(message)}><Icon name={message.hidden ? 'eye' : 'eyeOff'} /></button>
-                  <button className="mes_button" type="button" title="Удалить" onClick={() => void deleteChatMessage(message)}><Icon name="trash" /></button>
+                  {message.role === 'assistant' ? <button className="mes_button" type="button" title={t('message.swipe.new')} onClick={() => void requestBotReply(message.id)}>↻</button> : null}
+                  {isImagePending ? <button className="mes_button" type="button" title={t('message.cancelImage')} onClick={() => cancelImageGeneration(messageIndex, message)}><Icon name="x" /></button> : null}
+                  <button className="mes_button" type="button" title={t('message.edit')} onClick={() => startEditMessage(message)}><Icon name="edit" /></button>
+                  <button className="mes_button" type="button" title={message.hidden ? t('common.show') : t('common.hide')} onClick={() => void toggleMessageHidden(message)}><Icon name={message.hidden ? 'eye' : 'eyeOff'} /></button>
+                  <button className="mes_button" type="button" title={t('message.delete')} onClick={() => void deleteChatMessage(message)}><Icon name="trash" /></button>
                 </div>
                 <div className="message-main">
                   <header>
@@ -3028,15 +3116,15 @@ export default function App() {
                     <div className="message-editor">
                       <textarea value={editingMessageText} onChange={(event) => setEditingMessageText(event.target.value)} />
                       <div>
-                        <button type="button" title="Сохранить" onClick={() => void editChatMessage(message)}><Icon name="check" /></button>
-                        <button type="button" title="Отмена" onClick={() => { setEditingMessageId(''); setEditingMessageText(''); }}><Icon name="x" /></button>
+                        <button type="button" title={t('common.save')} onClick={() => void editChatMessage(message)}><Icon name="check" /></button>
+                        <button type="button" title={t('common.cancel')} onClick={() => { setEditingMessageId(''); setEditingMessageText(''); }}><Icon name="x" /></button>
                       </div>
                     </div>
                   ) : <MessageContent key={`${message.id}:${extensionMessageRenderVersions[message.id] || 0}`} content={visibleMessageContent} reasoning={reasoningDisplay} imagePending={isImagePending} renderPendingMarkersAsSpinner={!extensionLeader} isStreaming={generationReplaceMessageId === message.id && Boolean(generationStreamText)} />}
                 </div>
               </article>
               );
-            }) : <p className="empty-library">Выбери карточку и чат в меню у поля ввода или во вкладке Карточки.</p>}
+            }) : <p className="empty-library">{t('chat.noCard')}</p>}
             {isGenerating && !generationReplaceMessageId ? (
               <article className="message bot-message thinking-message">
                 <div className="message-avatar-rail">
@@ -3044,16 +3132,16 @@ export default function App() {
                 </div>
                 <div className="message-main">
                   <header>
-                    <span className="message-name-block"><strong className="identity-name"><span>{activeCard?.name || 'Бот'}</span></strong></span>
+                    <span className="message-name-block"><strong className="identity-name"><span>{activeCard?.name || t('composer.bot')}</span></strong></span>
                   </header>
-                  {generationStreamText ? <MessageContent content={generationStreamText} reasoning={reasoningDisplay} isStreaming /> : <div className="message-content"><p><span className="thinking-dots"><i /> <i /> <i /></span>{generationStatus || `${activeCard?.name || 'Бот'} печатает...`}</p></div>}
+                  {generationStreamText ? <MessageContent content={generationStreamText} reasoning={reasoningDisplay} isStreaming /> : <div className="message-content"><p><span className="thinking-dots"><i /> <i /> <i /></span>{generationStatus || `${activeCard?.name || t('composer.bot')} ${t('composer.typing')}`}</p></div>}
                 </div>
               </article>
             ) : null}
           </div>
 
           <form id="send_form" className="composer" onSubmit={(event) => { event.preventDefault(); void sendChatMessage(); }}>
-            <button className="composer-menu-button" type="button" aria-label="Дополнительные действия" onClick={() => setComposerMenuOpen(!composerMenuOpen)}>+</button>
+            <button className="composer-menu-button" type="button" aria-label={t('composer.actions')} onClick={() => setComposerMenuOpen(!composerMenuOpen)}>+</button>
             {composerMenuOpen ? (
               <ComposerActionMenu
                 activeChat={activeChat}
@@ -3085,7 +3173,7 @@ export default function App() {
             ) : null}
             {chatInput.trimStart().startsWith('/') ? (
               <div className="slash-command-menu">
-                {slashCommands.map((item) => (
+                {getSlashCommands(t).map((item) => (
                   <button type="button" key={item.command} onClick={() => setChatInput(`${item.command}${item.hint ? ' ' : ''}`)}>
                     <strong>{item.command}</strong>
                     {item.hint ? <code>{item.hint}</code> : null}
@@ -3094,16 +3182,16 @@ export default function App() {
                 ))}
               </div>
             ) : null}
-            <textarea value={chatInput} placeholder="Напишите действие или реплику..." onChange={(event) => setChatInput(event.target.value)} />
+            <textarea value={chatInput} placeholder={t('composer.placeholder')} onChange={(event) => setChatInput(event.target.value)} />
             <div className="composer-actions">
-              <button className="send-button" type="submit" aria-label="Отправить ход" disabled={!activeChat || isGenerating || accessDenied.chats}>
-                <span>{isGenerating ? 'Думает...' : 'Отправить'}</span>
+              <button className="send-button" type="submit" aria-label={t('composer.send')} disabled={!activeChat || isGenerating || accessDenied.chats}>
+                <span>{isGenerating ? t('composer.thinking') : t('composer.send')}</span>
                 <Icon name="send" />
               </button>
               {isGenerating ? (
-                <button className="ghost-button bot-reply-button" type="button" onClick={() => void cancelGeneration()}>Отмена</button>
+                <button className="ghost-button bot-reply-button" type="button" onClick={() => void cancelGeneration()}>{t('composer.cancel')}</button>
               ) : (
-                <button className="ghost-button bot-reply-button" type="button" disabled={!activeChat || accessDenied.chats || !botReplyAllowed} title={!botReplyAllowed ? 'Отключено в настройках безопасности' : undefined} onClick={() => void requestBotReply()}>Ответ бота</button>
+                <button className="ghost-button bot-reply-button" type="button" disabled={!activeChat || accessDenied.chats || (!botReplyAllowed && !authUser?.is_admin)} title={(!botReplyAllowed && !authUser?.is_admin) ? t('composer.botReply.disabled') : undefined} onClick={() => void requestBotReply()}>{t('composer.botReply')}</button>
               )}
             </div>
           </form>
@@ -3119,7 +3207,7 @@ export default function App() {
 
       {imagePreview ? (
         <div className="image-preview-overlay" role="dialog" aria-modal="true" onClick={() => setImagePreview(null)}>
-          <button className="image-preview-close" type="button" onClick={() => setImagePreview(null)}>Закрыть</button>
+          <button className="image-preview-close" type="button" onClick={() => setImagePreview(null)}>{t('imagePreview.close')}</button>
           <img src={imagePreview.src} alt={imagePreview.title} />
           <strong>{imagePreview.title}</strong>
         </div>
@@ -3252,10 +3340,35 @@ export default function App() {
           logout={logout}
           claimAdmin={claimAdmin}
           saveSecurityPermissions={saveSecurityPermissions}
+          securityDirty={securityDirty}
           close={() => setMenuOpen(false)}
         />
       ) : null}
     </main>
+  );
+}
+
+function LanguageSelector({ language, setLanguage }: { language: Language; setLanguage: (lang: Language) => void }) {
+  const { t } = useLocaleContext();
+  return (
+    <div className="language-selector" role="group" aria-label={t('language.label')}>
+      <button
+        className={language === 'ru' ? 'lang-button active' : 'lang-button'}
+        type="button"
+        onClick={() => setLanguage('ru')}
+        aria-pressed={language === 'ru'}
+      >
+        {t('language.ru')}
+      </button>
+      <button
+        className={language === 'en' ? 'lang-button active' : 'lang-button'}
+        type="button"
+        onClick={() => setLanguage('en')}
+        aria-pressed={language === 'en'}
+      >
+        {t('language.en')}
+      </button>
+    </div>
   );
 }
 
@@ -3378,6 +3491,7 @@ function MenuOverlay({
   logout,
   claimAdmin,
   saveSecurityPermissions,
+  securityDirty,
   close,
 }: {
   activeSection: MenuSection;
@@ -3498,20 +3612,23 @@ function MenuOverlay({
   logout: () => Promise<void>;
   claimAdmin: () => Promise<void>;
   saveSecurityPermissions: () => Promise<void>;
+  securityDirty: boolean;
   close: () => void;
 }) {
+  const { t, language, setLanguage } = useLocaleContext();
+  const menuItems = getMenuItems(t);
   const activeItem = menuItems.find((item) => item.id === activeSection) ?? menuItems[0];
 
   return (
     <div className="overlay" role="dialog" aria-modal="true">
-      <button className="overlay-scrim" type="button" aria-label="Закрыть меню" onClick={close} />
+      <button className="overlay-scrim" type="button" aria-label={t('menu.close')} onClick={close} />
       <section className="settings-drawer">
         <header className="drawer-header">
           <div>
-            <span className="eyebrow">Меню</span>
+            <span className="eyebrow">{t('menu.title')}</span>
             <h2>{activeItem.label}</h2>
           </div>
-          <button className="close-button" type="button" onClick={close}>Закрыть</button>
+          <button className="close-button" type="button" onClick={close}>{t('menu.close')}</button>
         </header>
 
         <div className="drawer-body">
@@ -3530,6 +3647,7 @@ function MenuOverlay({
                 </span>
               </button>
             ))}
+            <LanguageSelector language={language} setLanguage={setLanguage} />
           </nav>
 
           <section className="section-preview">
@@ -3651,6 +3769,7 @@ function MenuOverlay({
               logout={logout}
               claimAdmin={claimAdmin}
               saveSecurityPermissions={saveSecurityPermissions}
+              securityDirty={securityDirty}
             />
           </section>
         </div>
@@ -3660,6 +3779,7 @@ function MenuOverlay({
 }
 
 function AuthGate({ authDraft, setAuthDraft, authMessage, registrationAllowed, login, register }: { authDraft: { username: string; password: string; adminCode: string }; setAuthDraft: (draft: { username: string; password: string; adminCode: string }) => void; authMessage: string; registrationAllowed: boolean; login: () => Promise<void>; register: () => Promise<void> }) {
+  const { t } = useLocaleContext();
   useEffect(() => {
     const saved = window.localStorage.getItem(AUTH_USERNAME_STORAGE_KEY);
     if (saved) {
@@ -3671,17 +3791,17 @@ function AuthGate({ authDraft, setAuthDraft, authMessage, registrationAllowed, l
       <section className="auth-gate-card">
         <div>
           <span className="eyebrow">DoubleTrouble</span>
-          <h1>Вход закрыт</h1>
-          <p>Этот сервер требует аккаунт для просмотра карточек, персон, чатов и аватарок.</p>
+          <h1>{t('auth.loginClosed')}</h1>
+          <p>{t('auth.loginRequired')}</p>
         </div>
         <form className="form-stack" onSubmit={(event) => { event.preventDefault(); void login(); }}>
-          <EditableField label="Ник" value={authDraft.username} onChange={(username) => setAuthDraft({ ...authDraft, username })} />
-          <EditableField label="Пароль" type="password" value={authDraft.password} onChange={(password) => setAuthDraft({ ...authDraft, password })} />
+          <EditableField label={t('auth.username')} value={authDraft.username} onChange={(username) => setAuthDraft({ ...authDraft, username })} />
+          <EditableField label={t('auth.password')} type="password" value={authDraft.password} onChange={(password) => setAuthDraft({ ...authDraft, password })} />
           <div className="preset-actions">
-            <button type="submit">Войти</button>
-            {registrationAllowed ? <button className="ghost-button" type="button" onClick={() => void register()}>Регистрация</button> : null}
+            <button type="submit">{t('auth.login')}</button>
+            {registrationAllowed ? <button className="ghost-button" type="button" onClick={() => void register()}>{t('auth.register')}</button> : null}
           </div>
-          {!registrationAllowed ? <p className="helper-text">Регистрация на сервере отключена администратором.</p> : null}
+          {!registrationAllowed ? <p className="helper-text">{t('auth.registrationDisabled')}</p> : null}
           {authMessage ? <p className="library-message">{authMessage}</p> : null}
         </form>
       </section>
@@ -3690,18 +3810,19 @@ function AuthGate({ authDraft, setAuthDraft, authMessage, registrationAllowed, l
 }
 
 function AccessPasswordGate({ password, setPassword, message, unlock }: { password: string; setPassword: (password: string) => void; message: string; unlock: () => Promise<void> }) {
+  const { t } = useLocaleContext();
   return (
     <main className="auth-gate-shell">
       <section className="auth-gate-card">
         <div>
           <span className="eyebrow">DoubleTrouble</span>
-          <h1>Доступ закрыт</h1>
-          <p>Администратор включил дополнительный пароль доступа. Его нужно ввести до входа в аккаунт.</p>
+          <h1>{t('auth.accessClosed')}</h1>
+          <p>{t('auth.accessPasswordHelp')}</p>
         </div>
         <form className="form-stack" onSubmit={(event) => { event.preventDefault(); void unlock(); }}>
-          <EditableField label="Пароль доступа" type="password" value={password} onChange={setPassword} />
+          <EditableField label={t('auth.accessPassword')} type="password" value={password} onChange={setPassword} />
           <div className="preset-actions">
-            <button type="submit">Открыть доступ</button>
+            <button type="submit">{t('auth.unlockAccess')}</button>
           </div>
           {message ? <p className="library-message">{message}</p> : null}
         </form>
@@ -3711,6 +3832,7 @@ function AccessPasswordGate({ password, setPassword, message, unlock }: { passwo
 }
 
 function KeyManager({ mode = 'panel' }: { mode?: 'panel' | 'popover' }) {
+  const { t } = useLocaleContext();
   const [keys, setKeys] = useState<ManagedKeySummary[]>([]);
   const [nameDrafts, setNameDrafts] = useState<Record<string, string>>({});
   const [valueDrafts, setValueDrafts] = useState<Record<string, string>>({});
@@ -3737,7 +3859,7 @@ function KeyManager({ mode = 'panel' }: { mode?: 'panel' | 'popover' }) {
       const response = await fetch('/api/keys', { headers: headers() });
       const data = await response.json().catch(() => null) as { keys?: ManagedKeySummary[]; detail?: string } | null;
       if (!response.ok) {
-        setMessage(response.status === 401 || response.status === 403 ? 'Нет доступа к менеджеру ключей' : data?.detail || 'Не удалось загрузить ключи');
+        setMessage(response.status === 401 || response.status === 403 ? t('keys.noAccess') : data?.detail || t('keys.error.load'));
         return;
       }
       setKeys(data?.keys || []);
@@ -3772,7 +3894,7 @@ function KeyManager({ mode = 'panel' }: { mode?: 'panel' | 'popover' }) {
     const name = newKeyName.trim();
     const value = newKeyValue.trim();
     if (!name || !value) {
-      setMessage('Введите название и значение ключа');
+      setMessage(t('keys.error.nameValue'));
       return;
     }
     const response = await fetch('/api/keys', {
@@ -3782,18 +3904,18 @@ function KeyManager({ mode = 'panel' }: { mode?: 'panel' | 'popover' }) {
     });
     const data = await response.json().catch(() => null) as { keys?: ManagedKeySummary[]; detail?: string } | null;
     if (!response.ok || !data?.keys) {
-      setMessage(data?.detail || 'Не удалось создать ключ');
+      setMessage(data?.detail || t('keys.error.create'));
       return;
     }
     applyKeys(data.keys);
-    setMessage('Ключ добавлен');
+    setMessage(t('keys.added'));
   };
 
   const saveKey = async (key: ManagedKeySummary) => {
     const name = (nameDrafts[key.id] ?? key.name ?? key.label).trim();
     const value = (valueDrafts[key.id] || '').trim();
     if (!name) {
-      setMessage('Введите название ключа');
+      setMessage(t('keys.error.name'));
       return;
     }
     const response = await fetch(`/api/keys/${encodeURIComponent(key.id)}`, {
@@ -3803,33 +3925,33 @@ function KeyManager({ mode = 'panel' }: { mode?: 'panel' | 'popover' }) {
     });
     const data = await response.json().catch(() => null) as { keys?: ManagedKeySummary[]; detail?: string } | null;
     if (!response.ok || !data?.keys) {
-      setMessage(data?.detail || 'Не удалось сохранить ключ');
+      setMessage(data?.detail || t('keys.error.save'));
       return;
     }
     applyKeys(data.keys);
-    setMessage('Ключ сохранен');
+    setMessage(t('keys.saved'));
   };
 
   const activateKey = async (keyId: string) => {
     const response = await fetch(`/api/keys/${encodeURIComponent(keyId)}/active`, { method: 'POST', headers: headers() });
     const data = await response.json().catch(() => null) as { keys?: ManagedKeySummary[]; detail?: string } | null;
     if (!response.ok || !data?.keys) {
-      setMessage(data?.detail || 'Не удалось выбрать ключ');
+      setMessage(data?.detail || t('keys.error.select'));
       return;
     }
     applyKeys(data.keys);
-    setMessage('Активный ключ выбран');
+    setMessage(t('keys.activeSelected'));
   };
 
   const deleteKey = async (keyId: string) => {
     const response = await fetch(`/api/keys/${encodeURIComponent(keyId)}`, { method: 'DELETE', headers: headers() });
     const data = await response.json().catch(() => null) as { keys?: ManagedKeySummary[]; detail?: string } | null;
     if (!response.ok || !data?.keys) {
-      setMessage(data?.detail || 'Не удалось удалить ключ');
+      setMessage(data?.detail || t('keys.error.delete'));
       return;
     }
     applyKeys(data.keys);
-    setMessage('Ключ удален');
+    setMessage(t('keys.deleted'));
   };
 
   const activeKey = keys.find((key) => key.active);
@@ -3837,15 +3959,15 @@ function KeyManager({ mode = 'panel' }: { mode?: 'panel' | 'popover' }) {
     <div className={mode === 'panel' ? 'key-manager' : 'key-manager key-manager-compact'}>
       <div className="key-manager-toolbar">
         <div>
-          <strong>{activeKey ? activeKey.name : 'Активный ключ не выбран'}</strong>
-          <small>{activeKey?.masked || (activeKey?.configured ? 'Ключ сохранен' : 'Добавь ключ или выбери сохраненный')}</small>
+          <strong>{activeKey ? activeKey.name : t('keys.noActive')}</strong>
+          <small>{activeKey?.masked || (activeKey?.configured ? t('keys.savedStatus') : t('keys.addOrSelect'))}</small>
         </div>
-        <button className="ghost-button" type="button" disabled={loading} onClick={() => void loadKeys()}>Обновить</button>
+        <button className="ghost-button" type="button" disabled={loading} onClick={() => void loadKeys()}>{t('common.refresh')}</button>
       </div>
       <article className="key-manager-create">
-        <input value={newKeyName} placeholder="Название ключа" onChange={(event) => setNewKeyName(event.target.value)} />
-        <input type="password" value={newKeyValue} placeholder="API key" onChange={(event) => setNewKeyValue(event.target.value)} />
-        <button type="button" onClick={() => void createKey()}>Добавить</button>
+        <input value={newKeyName} placeholder={t('keys.namePlaceholder')} onChange={(event) => setNewKeyName(event.target.value)} />
+        <input type="password" value={newKeyValue} placeholder={t('keys.apiKeyPlaceholder')} onChange={(event) => setNewKeyValue(event.target.value)} />
+        <button type="button" onClick={() => void createKey()}>{t('common.add')}</button>
       </article>
       {keys.length ? keys.map((key) => {
         const configured = key.configured || key.env_configured;
@@ -3855,22 +3977,22 @@ function KeyManager({ mode = 'panel' }: { mode?: 'panel' | 'popover' }) {
           <article className={key.active ? 'key-manager-row active' : 'key-manager-row'} key={key.id}>
             <button className={key.active ? 'key-select-button active' : 'key-select-button'} type="button" disabled={key.active || !key.configured} onClick={() => void activateKey(key.id)}>
               <strong>{keyName}</strong>
-              <small>{key.active ? 'Активный' : configured ? 'Сделать активным' : 'Нет значения'}{key.masked ? ` · ${key.masked}` : ''}{key.env_configured ? ` · env ${key.env_name}` : ''}</small>
+              <small>{key.active ? t('keys.active') : configured ? t('keys.makeActive') : t('keys.noValue')}{key.masked ? ` · ${key.masked}` : ''}{key.env_configured ? ` · env ${key.env_name}` : ''}</small>
             </button>
             <div className="key-manager-actions">
-              <button className="ghost-button" type="button" onClick={() => { setEditingKeyId(editing ? '' : key.id); setNameDrafts({ ...nameDrafts, [key.id]: keyName }); }}>{editing ? 'Свернуть' : 'Править'}</button>
-              <button className="ghost-button danger-button" type="button" onClick={() => void deleteKey(key.id)}>Удалить</button>
+              <button className="ghost-button" type="button" onClick={() => { setEditingKeyId(editing ? '' : key.id); setNameDrafts({ ...nameDrafts, [key.id]: keyName }); }}>{editing ? t('common.collapse') : t('common.edit')}</button>
+              <button className="ghost-button danger-button" type="button" onClick={() => void deleteKey(key.id)}>{t('common.delete')}</button>
             </div>
             {editing ? (
               <div className="key-manager-edit">
-                <input className="key-name-input" value={nameDrafts[key.id] ?? keyName} aria-label="Название ключа" onChange={(event) => setNameDrafts({ ...nameDrafts, [key.id]: event.target.value })} />
-                <input type="password" value={valueDrafts[key.id] || ''} placeholder={configured ? 'Новое значение' : 'Значение ключа'} onChange={(event) => setValueDrafts({ ...valueDrafts, [key.id]: event.target.value })} />
-                <button type="button" onClick={() => void saveKey(key)}>Сохранить</button>
+                <input className="key-name-input" value={nameDrafts[key.id] ?? keyName} aria-label={t('keys.namePlaceholder')} onChange={(event) => setNameDrafts({ ...nameDrafts, [key.id]: event.target.value })} />
+                <input type="password" value={valueDrafts[key.id] || ''} placeholder={configured ? t('keys.newValue') : t('keys.valuePlaceholder')} onChange={(event) => setValueDrafts({ ...valueDrafts, [key.id]: event.target.value })} />
+                <button type="button" onClick={() => void saveKey(key)}>{t('common.save')}</button>
               </div>
             ) : null}
           </article>
         );
-      }) : <p className="empty-library">Ключи не загружены.</p>}
+      }) : <p className="empty-library">{t('keys.notLoaded')}</p>}
       {message ? <p className="library-message">{message}</p> : null}
     </div>
   );
@@ -3882,18 +4004,18 @@ function KeyManager({ mode = 'panel' }: { mode?: 'panel' | 'popover' }) {
         <button className={open ? 'api-key-trigger active' : 'api-key-trigger'} type="button" onClick={() => setOpen(!open)}>
           <Icon name="key" />
           <span>
-            <strong>{activeKey ? activeKey.name : 'Менеджер ключей'}</strong>
-            <small>{activeKey?.masked || (generationKeyState(keys) || 'Открыть сохраненные ключи')}</small>
+            <strong>{activeKey ? activeKey.name : t('keys.manager')}</strong>
+            <small>{activeKey?.masked || (generationKeyState(keys, t) || t('keys.openSaved'))}</small>
           </span>
         </button>
         {open ? (
-          <div className="api-key-popover" role="dialog" aria-label="Менеджер API ключей">
+          <div className="api-key-popover" role="dialog" aria-label={t('keys.apiManager')}>
             <div className="key-popover-header">
               <div>
                 <span className="eyebrow">Provider</span>
                 <h3>API keys</h3>
               </div>
-              <button className="ghost-button" type="button" onClick={() => setOpen(false)}>Закрыть</button>
+              <button className="ghost-button" type="button" onClick={() => setOpen(false)}>{t('common.close')}</button>
             </div>
             {manager}
           </div>
@@ -3906,6 +4028,7 @@ function KeyManager({ mode = 'panel' }: { mode?: 'panel' | 'popover' }) {
 }
 
 function ImageKeyManager({ onApplyKey }: { onApplyKey: (apiKey: string) => void }) {
+  const { t } = useLocaleContext();
   const [keys, setKeys] = useState<ImageKeyRecord[]>(loadImageKeys);
   const [newKeyName, setNewKeyName] = useState('');
   const [newKeyValue, setNewKeyValue] = useState('');
@@ -3933,7 +4056,7 @@ function ImageKeyManager({ onApplyKey }: { onApplyKey: (apiKey: string) => void 
   const createKey = () => {
     const value = newKeyValue.trim();
     if (!value) {
-      setMessage('Введите значение ключа');
+      setMessage(t('keys.error.value'));
       return;
     }
     const key: ImageKeyRecord = {
@@ -3942,39 +4065,39 @@ function ImageKeyManager({ onApplyKey }: { onApplyKey: (apiKey: string) => void 
       value,
       active: !activeKey,
     };
-    persistKeys([...keys, key], key.active ? 'Ключ добавлен и выбран' : 'Ключ добавлен', key.active);
+    persistKeys([...keys, key], key.active ? t('keys.addedAndSelected') : t('keys.added'), key.active);
   };
 
   const saveKey = (key: ImageKeyRecord) => {
     const name = (nameDrafts[key.id] ?? key.name).trim() || key.name;
     const value = (valueDrafts[key.id] || '').trim() || key.value;
     const nextKeys = keys.map((item) => item.id === key.id ? { ...item, name, value } : item);
-    persistKeys(nextKeys, 'Ключ сохранен', key.active);
+    persistKeys(nextKeys, t('keys.saved'), key.active);
   };
 
   const activateKey = (keyId: string) => {
     const nextKeys = keys.map((key) => ({ ...key, active: key.id === keyId }));
-    persistKeys(nextKeys, 'Ключ выбран для картинок', true);
+    persistKeys(nextKeys, t('keys.selectedForImages'), true);
   };
 
   const deleteKey = (keyId: string) => {
     const wasActive = keys.some((key) => key.id === keyId && key.active);
     const nextKeys = keys.filter((key) => key.id !== keyId).map((key, index) => ({ ...key, active: wasActive ? index === 0 : key.active }));
-    persistKeys(nextKeys, 'Ключ удален', wasActive);
+    persistKeys(nextKeys, t('keys.deleted'), wasActive);
   };
 
   const manager = (
     <div className="key-manager key-manager-compact image-local-key-manager">
       <div className="key-manager-toolbar">
         <div>
-          <strong>{activeKey ? activeKey.name : 'Ключ картинок не выбран'}</strong>
-          <small>{activeKey ? maskSecret(activeKey.value) : 'Отдельные ключи image-extension'}</small>
+          <strong>{activeKey ? activeKey.name : t('keys.noImageKey')}</strong>
+          <small>{activeKey ? maskSecret(activeKey.value) : t('keys.imageExtensionKeys')}</small>
         </div>
       </div>
       <article className="key-manager-create">
-        <input value={newKeyName} placeholder="Название ключа" onChange={(event) => setNewKeyName(event.target.value)} />
-        <input type="password" value={newKeyValue} placeholder="Image API key" onChange={(event) => setNewKeyValue(event.target.value)} />
-        <button type="button" onClick={createKey}>Добавить</button>
+        <input value={newKeyName} placeholder={t('keys.namePlaceholder')} onChange={(event) => setNewKeyName(event.target.value)} />
+        <input type="password" value={newKeyValue} placeholder={t('keys.imageApiKeyPlaceholder')} onChange={(event) => setNewKeyValue(event.target.value)} />
+        <button type="button" onClick={createKey}>{t('common.add')}</button>
       </article>
       {keys.length ? keys.map((key) => {
         const editing = editingKeyId === key.id;
@@ -3982,22 +4105,22 @@ function ImageKeyManager({ onApplyKey }: { onApplyKey: (apiKey: string) => void 
           <article className={key.active ? 'key-manager-row active' : 'key-manager-row'} key={key.id}>
             <button className={key.active ? 'key-select-button active' : 'key-select-button'} type="button" disabled={key.active} onClick={() => activateKey(key.id)}>
               <strong>{key.name}</strong>
-              <small>{key.active ? 'Активный для картинок' : 'Сделать активным'} · {maskSecret(key.value)}</small>
+              <small>{key.active ? t('keys.activeForImages') : t('keys.makeActive')} · {maskSecret(key.value)}</small>
             </button>
             <div className="key-manager-actions">
-              <button className="ghost-button" type="button" onClick={() => { setEditingKeyId(editing ? '' : key.id); setNameDrafts({ ...nameDrafts, [key.id]: key.name }); }}>{editing ? 'Свернуть' : 'Править'}</button>
-              <button className="ghost-button danger-button" type="button" onClick={() => deleteKey(key.id)}>Удалить</button>
+              <button className="ghost-button" type="button" onClick={() => { setEditingKeyId(editing ? '' : key.id); setNameDrafts({ ...nameDrafts, [key.id]: key.name }); }}>{editing ? t('common.collapse') : t('common.edit')}</button>
+              <button className="ghost-button danger-button" type="button" onClick={() => deleteKey(key.id)}>{t('common.delete')}</button>
             </div>
             {editing ? (
               <div className="key-manager-edit">
-                <input className="key-name-input" value={nameDrafts[key.id] ?? key.name} aria-label="Название ключа" onChange={(event) => setNameDrafts({ ...nameDrafts, [key.id]: event.target.value })} />
-                <input type="password" value={valueDrafts[key.id] || ''} placeholder="Новое значение" onChange={(event) => setValueDrafts({ ...valueDrafts, [key.id]: event.target.value })} />
-                <button type="button" onClick={() => saveKey(key)}>Сохранить</button>
+                <input className="key-name-input" value={nameDrafts[key.id] ?? key.name} aria-label={t('keys.namePlaceholder')} onChange={(event) => setNameDrafts({ ...nameDrafts, [key.id]: event.target.value })} />
+                <input type="password" value={valueDrafts[key.id] || ''} placeholder={t('keys.newValue')} onChange={(event) => setValueDrafts({ ...valueDrafts, [key.id]: event.target.value })} />
+                <button type="button" onClick={() => saveKey(key)}>{t('common.save')}</button>
               </div>
             ) : null}
           </article>
         );
-      }) : <p className="empty-library">Ключей картинок пока нет.</p>}
+      }) : <p className="empty-library">{t('keys.noImageKeys')}</p>}
       {message ? <p className="library-message">{message}</p> : null}
     </div>
   );
@@ -4006,16 +4129,16 @@ function ImageKeyManager({ onApplyKey }: { onApplyKey: (apiKey: string) => void 
     <div className="image-key-button-wrap">
       <button className={open ? 'ghost-button image-key-button active' : 'ghost-button image-key-button'} type="button" onClick={() => setOpen(!open)}>
         <Icon name="key" />
-        <span>Ключи</span>
+        <span>{t('keys.label')}</span>
       </button>
       {open ? (
-        <div className="api-key-popover image-key-popover" role="dialog" aria-label="Ключи image-extension">
+        <div className="api-key-popover image-key-popover" role="dialog" aria-label={t('keys.imageExtensionKeys')}>
           <div className="key-popover-header">
             <div>
               <span className="eyebrow">Images</span>
-              <h3>Ключи картинок</h3>
+              <h3>{t('keys.imageKeysTitle')}</h3>
             </div>
-            <button className="ghost-button" type="button" onClick={() => setOpen(false)}>Закрыть</button>
+            <button className="ghost-button" type="button" onClick={() => setOpen(false)}>{t('common.close')}</button>
           </div>
           {manager}
         </div>
@@ -4025,6 +4148,7 @@ function ImageKeyManager({ onApplyKey }: { onApplyKey: (apiKey: string) => void 
 }
 
 function ImageExtensionSettingsPortal({ extension, imageSettings, setImageSettings, imageEndpointPresets, selectedImageEndpointName, imageEndpointName, setImageEndpointName, applyImageEndpointPreset, saveImageEndpointPreset, saveImageSettings, applyImageKey }: { extension: ExtensionSummary | null; imageSettings: ImageExtensionSettings; setImageSettings: (settings: ImageExtensionSettings) => void; imageEndpointPresets: ImageEndpointPreset[]; selectedImageEndpointName: string; imageEndpointName: string; setImageEndpointName: (name: string) => void; applyImageEndpointPreset: (name: string) => void; saveImageEndpointPreset: () => void; saveImageSettings: () => void; applyImageKey: (apiKey: string) => void }) {
+  const { t } = useLocaleContext();
   const [host, setHost] = useState<HTMLElement | null>(null);
   const [imageModels, setImageModels] = useState<string[]>([]);
   const [imageModelsLoading, setImageModelsLoading] = useState(false);
@@ -4057,12 +4181,12 @@ function ImageExtensionSettingsPortal({ extension, imageSettings, setImageSettin
       const data = await response.json().catch(() => null) as { ok?: boolean; error?: string; models?: unknown } | null;
       if (!response.ok || !data?.ok) {
         setImageModels([]);
-        setImageModelsMessage(data?.error || 'Не удалось загрузить модели');
+        setImageModelsMessage(data?.error || t('image.error.loadModels'));
         return;
       }
       const modelNames = extractModelNames(data.models);
       setImageModels(modelNames);
-      setImageModelsMessage(modelNames.length ? `Загружено моделей: ${modelNames.length}` : 'Провайдер вернул пустой список');
+      setImageModelsMessage(modelNames.length ? `${t('image.modelsLoaded')}: ${modelNames.length}` : t('image.emptyModelList'));
     } finally {
       setImageModelsLoading(false);
     }
@@ -4072,18 +4196,18 @@ function ImageExtensionSettingsPortal({ extension, imageSettings, setImageSettin
     <section className="image-extension-settings-panel image-extension-settings-portal" data-dt-extension-owner={extension.external_name}>
       <div className="image-extension-settings-header">
         <div>
-          <strong>Подключение картинок</strong>
-          <small>DoubleTrouble: сохраненные endpoints и отдельные ключи для SillyImages.</small>
+          <strong>{t('image.connection')}</strong>
+          <small>{t('image.connectionHelp')}</small>
         </div>
         <ImageKeyManager onApplyKey={applyImageKey} />
       </div>
       <div className="image-endpoint-row">
         <select value={selectedImageEndpointName} onChange={(event) => applyImageEndpointPreset(event.target.value)}>
-          <option value="">Выбрать endpoint</option>
+          <option value="">{t('image.selectEndpoint')}</option>
           {imageEndpointPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}</option>)}
         </select>
-        <input value={imageEndpointName} placeholder="Имя endpoint" onChange={(event) => setImageEndpointName(event.target.value)} />
-        <button className="ghost-button tiny-button" type="button" onClick={saveImageEndpointPreset}>Сохр.</button>
+        <input value={imageEndpointName} placeholder={t('image.endpointName')} onChange={(event) => setImageEndpointName(event.target.value)} />
+        <button className="ghost-button tiny-button" type="button" onClick={saveImageEndpointPreset}>{t('common.saveShort')}</button>
       </div>
       <div className="key-manager-edit image-extension-fields">
         <select value={imageSettings.apiType} onChange={(event) => setImageSettings({ ...imageSettings, apiType: event.target.value })}>
@@ -4097,10 +4221,10 @@ function ImageExtensionSettingsPortal({ extension, imageSettings, setImageSettin
           <datalist id="image-model-options">
             {imageModels.map((model) => <option value={model} key={model} />)}
           </datalist>
-          <button className="ghost-button tiny-button" type="button" disabled={imageModelsLoading} onClick={() => void loadImageModels()}>{imageModelsLoading ? '...' : 'Модели'}</button>
+          <button className="ghost-button tiny-button" type="button" disabled={imageModelsLoading} onClick={() => void loadImageModels()}>{imageModelsLoading ? '...' : t('image.models')}</button>
         </div>
-        <input type="password" value={imageSettings.apiKey} placeholder="API key (оставь пустым, чтобы не менять)" onChange={(event) => setImageSettings({ ...imageSettings, apiKey: event.target.value })} />
-        <button type="button" onClick={saveImageSettings}>Применить</button>
+        <input type="password" value={imageSettings.apiKey} placeholder={t('image.apiKeyPlaceholder')} onChange={(event) => setImageSettings({ ...imageSettings, apiKey: event.target.value })} />
+        <button type="button" onClick={saveImageSettings}>{t('common.apply')}</button>
       </div>
       {imageModelsMessage ? <small className="helper-text">{imageModelsMessage}</small> : null}
     </section>,
@@ -4108,14 +4232,15 @@ function ImageExtensionSettingsPortal({ extension, imageSettings, setImageSettin
   );
 }
 
-function generationKeyState(keys: ManagedKeySummary[]) {
+function generationKeyState(keys: ManagedKeySummary[], t: (key: string) => string) {
   if (!keys.length) {
     return '';
   }
-  return keys.some((key) => key.configured || key.env_configured) ? 'Есть сохраненные ключи' : 'Ключи не заданы';
+  return keys.some((key) => key.configured || key.env_configured) ? t('keys.savedAvailable') : t('keys.notConfigured');
 }
 
 function ExtensionsManager() {
+  const { t } = useLocaleContext();
   const [extensions, setExtensions] = useState<ExtensionSummary[]>([]);
   const [builtInSettings, setBuiltInSettings] = useState(loadBuiltInExtensionSettings);
   const [imageSettings, setImageSettings] = useState(loadImageExtensionSettings);
@@ -4140,7 +4265,7 @@ function ExtensionsManager() {
     try {
       const response = await fetch('/api/extensions', { headers: headers() });
       if (!response.ok) {
-        setMessage(response.status === 401 || response.status === 403 ? 'Нет прав на управление расширениями' : 'Не удалось загрузить расширения');
+        setMessage(response.status === 401 || response.status === 403 ? t('extensions.noPermission') : t('extensions.error.load'));
         return;
       }
       const data = await response.json() as { extensions: ExtensionSummary[] };
@@ -4180,11 +4305,11 @@ function ExtensionsManager() {
         body: JSON.stringify({ enabled }),
       });
       if (!response.ok) {
-        setMessage('Не удалось изменить состояние расширения');
+        setMessage(t('extensions.error.toggle'));
         return false;
       }
       setExtensions((current) => current.map((item) => item.name === extension.name ? { ...item, enabled } : item));
-      setMessage(`${enabled ? 'Включено' : 'Выключено'}. Старые сообщения не перерендериваются.`);
+      setMessage(`${enabled ? t('common.enabled') : t('common.disabled')}. ${t('extensions.oldMessagesNotRerendered')}`);
       return true;
     } finally {
       setLoading(false);
@@ -4198,7 +4323,7 @@ function ExtensionsManager() {
     const nextSettings = { ...builtInSettings, noriMynInfoblock: enabled };
     setBuiltInSettings(nextSettings);
     window.localStorage.setItem(BUILT_IN_EXTENSIONS_STORAGE_KEY, JSON.stringify(nextSettings));
-    setMessage(`${enabled ? 'Включено' : 'Выключено'}. Новые сообщения применят настройку без перезагрузки.`);
+    setMessage(`${enabled ? t('common.enabled') : t('common.disabled')}. ${t('extensions.newMessagesApply')}`);
   };
 
   const persistImageSettings = (settings: ImageExtensionSettings, messageText = '', clearApiKeyDraft = false) => {
@@ -4229,13 +4354,13 @@ function ExtensionsManager() {
   };
 
   const saveImageSettings = () => {
-    persistImageSettings(imageSettings, 'Настройки картинок сохранены локально для расширения.', true);
+    persistImageSettings(imageSettings, t('extensions.imageSettingsSaved'), true);
   };
 
   const applyImageKey = (apiKey: string) => {
     persistImageSettings({ ...imageSettings, apiKey });
     setImageSettings((current) => ({ ...current, apiKey: '' }));
-    setMessage(apiKey ? 'Ключ картинок выбран отдельно от ключей подключения.' : 'Активный ключ картинок очищен.');
+    setMessage(apiKey ? t('extensions.imageKeySelected') : t('extensions.imageKeyCleared'));
   };
 
   const applyImageEndpointPreset = (name: string) => {
@@ -4256,7 +4381,7 @@ function ExtensionsManager() {
     saveImageEndpointPresets(nextPresets);
     setSelectedImageEndpointName(name);
     setImageEndpointName(name);
-    setMessage('Endpoint картинок сохранен.');
+    setMessage(t('extensions.endpointSaved'));
   };
 
   const deleteExtension = async (extension: ExtensionSummary) => {
@@ -4264,11 +4389,11 @@ function ExtensionsManager() {
     try {
       const response = await fetch(`/api/extensions/${encodeURIComponent(extension.name)}`, { method: 'DELETE', headers: headers() });
       if (!response.ok) {
-        setMessage('Не удалось удалить расширение');
+        setMessage(t('extensions.error.delete'));
         return;
       }
       setExtensions((current) => current.filter((item) => item.name !== extension.name));
-      setMessage('Расширение удалено из списка. Если его скрипт уже загружен, обнови страницу вручную.');
+      setMessage(t('extensions.deleted'));
     } finally {
       setLoading(false);
     }
@@ -4282,11 +4407,11 @@ function ExtensionsManager() {
   return (
     <section className="extensions-manager">
       <div className="extension-install-card">
-        <span className="extension-warning">Пока не работает стабильно</span>
-        <p className="helper-text">Установка расширений по ссылке, локальному пути или файлом временно отключена, чтобы не ломать чат и генерацию картинок. Сторонние расширения можно просмотреть в списке ниже.</p>
+        <span className="extension-warning">{t('extensions.unstable')}</span>
+        <p className="helper-text">{t('extensions.installDisabledHelp')}</p>
         <div className="preset-actions">
-          <button type="button" disabled>Установка отключена</button>
-          <button className="ghost-button" type="button" disabled={loading} onClick={() => void loadExtensions()}>Обновить список</button>
+          <button type="button" disabled>{t('extensions.installDisabled')}</button>
+          <button className="ghost-button" type="button" disabled={loading} onClick={() => void loadExtensions()}>{t('extensions.refreshList')}</button>
         </div>
       </div>
 
@@ -4295,8 +4420,8 @@ function ExtensionsManager() {
       <div className="extension-list">
         <div className="preset-title-row">
           <div>
-            <span className="eyebrow">Сторонние</span>
-            <h3>Установленные расширения</h3>
+            <span className="eyebrow">{t('extensions.thirdParty')}</span>
+            <h3>{t('extensions.installed')}</h3>
           </div>
         </div>
         {thirdPartyExtensions.length ? thirdPartyExtensions.map((extension) => {
@@ -4305,36 +4430,36 @@ function ExtensionsManager() {
             <article className={extension.enabled ? 'extension-row enabled' : 'extension-row'} key={extension.name}>
               <div className="extension-row-main">
                 <strong>{manifest.display_name || extension.name}</strong>
-                <small>{extension.external_name} · {manifest.version || 'no version'} · {manifest.author || 'unknown author'}</small>
-                <small>{extension.source || 'local install'}</small>
+                <small>{extension.external_name} · {manifest.version || t('extensions.noVersion')} · {manifest.author || t('extensions.unknownAuthor')}</small>
+                <small>{extension.source || t('extensions.localInstall')}</small>
               </div>
               <div className="extension-row-actions">
-                <span className="extension-status">Пока не работает</span>
-                <button className="ghost-button" type="button" disabled={loading || !extension.enabled} onClick={() => openExtensionSettingsPanel(extension)}>Настройки</button>
-                <button type="button" disabled={loading} onClick={() => void setEnabled(extension, !extension.enabled)}>{extension.enabled ? 'Выключить' : 'Включить'}</button>
-                <button className="ghost-button danger-button" type="button" disabled={loading} onClick={() => void deleteExtension(extension)}>Удалить</button>
+                <span className="extension-status">{t('extensions.unstable')}</span>
+                <button className="ghost-button" type="button" disabled={loading || !extension.enabled} onClick={() => openExtensionSettingsPanel(extension)}>{t('common.settings')}</button>
+                <button type="button" disabled={loading} onClick={() => void setEnabled(extension, !extension.enabled)}>{extension.enabled ? t('common.disable') : t('common.enable')}</button>
+                <button className="ghost-button danger-button" type="button" disabled={loading} onClick={() => void deleteExtension(extension)}>{t('common.delete')}</button>
               </div>
             </article>
           );
-        }) : <EmptyLibrary text="Сторонних расширений пока нет. Установка временно отключена." />}
+        }) : <EmptyLibrary text={t('extensions.noThirdParty')} />}
       </div>
 
       <div className="extension-list">
         <div className="preset-title-row">
           <div>
-            <span className="eyebrow">Встроенные</span>
-            <h3>Расширения DoubleTrouble</h3>
+            <span className="eyebrow">{t('extensions.builtIn')}</span>
+            <h3>{t('extensions.dtExtensions')}</h3>
           </div>
         </div>
         <article className={inlineImageExtension?.enabled ? 'extension-row enabled' : 'extension-row'}>
           <div className="extension-row-main">
             <strong>{inlineImageExtension?.manifest.display_name || 'SillyImages'}</strong>
-            <small>Генерация картинок из HTML-блоков с [IMG:GEN]. Toggle не перезагружает страницу, чтобы не трогать старые сообщения.</small>
+            <small>{t('extensions.sillyImagesDesc')}</small>
           </div>
           <div className="extension-row-actions">
-            <span className={inlineImageExtension?.enabled ? 'extension-status enabled' : 'extension-status'}>{inlineImageExtension?.enabled ? 'Включено' : 'Выключено'}</span>
-            <button className="ghost-button" type="button" disabled={loading || !inlineImageExtension?.enabled} onClick={() => inlineImageExtension && openExtensionSettingsPanel(inlineImageExtension)}>Настройки</button>
-            <button type="button" disabled={loading || !inlineImageExtension} onClick={() => inlineImageExtension && void setEnabled(inlineImageExtension, !inlineImageExtension.enabled)}>{inlineImageExtension?.enabled ? 'Выключить' : 'Включить'}</button>
+            <span className={inlineImageExtension?.enabled ? 'extension-status enabled' : 'extension-status'}>{inlineImageExtension?.enabled ? t('common.enabled') : t('common.disabled')}</span>
+            <button className="ghost-button" type="button" disabled={loading || !inlineImageExtension?.enabled} onClick={() => inlineImageExtension && openExtensionSettingsPanel(inlineImageExtension)}>{t('common.settings')}</button>
+            <button type="button" disabled={loading || !inlineImageExtension} onClick={() => inlineImageExtension && void setEnabled(inlineImageExtension, !inlineImageExtension.enabled)}>{inlineImageExtension?.enabled ? t('common.disable') : t('common.enable')}</button>
           </div>
         </article>
         <ImageExtensionSettingsPortal
@@ -4353,13 +4478,23 @@ function ExtensionsManager() {
         <article className={noriMynEnabled ? 'extension-row enabled' : 'extension-row'}>
           <div className="extension-row-main">
             <strong>NoriMyn Infoblock</strong>
-            <small>Встроенный рендер инфоблока сцены и персонажей в сообщениях.</small>
+            <small>{t('extensions.noriMynDesc')}</small>
           </div>
           <div className="extension-row-actions">
-            <span className={noriMynEnabled ? 'extension-status enabled' : 'extension-status'}>{noriMynEnabled ? 'Включено' : 'Выключено'}</span>
-            <button type="button" disabled={loading} onClick={() => void setNoriMynEnabled(noriMynExtension, !noriMynEnabled)}>{noriMynEnabled ? 'Выключить' : 'Включить'}</button>
+            <span className={noriMynEnabled ? 'extension-status enabled' : 'extension-status'}>{noriMynEnabled ? t('common.enabled') : t('common.disabled')}</span>
+            <button type="button" disabled={loading} onClick={() => void setNoriMynEnabled(noriMynExtension, !noriMynEnabled)}>{noriMynEnabled ? t('common.disable') : t('common.enable')}</button>
           </div>
         </article>
+        <article className="extension-row enabled">
+          <div className="extension-row-main">
+            <strong>Regex</strong>
+            <small>{t('extensions.regexDesc')}</small>
+          </div>
+          <div className="extension-row-actions">
+            <span className="extension-status enabled">{t('extensions.alwaysEnabled')}</span>
+          </div>
+        </article>
+        <RegexSettings />
       </div>
     </section>
   );
@@ -4483,6 +4618,7 @@ function SettingsSection({
   logout,
   claimAdmin,
   saveSecurityPermissions,
+  securityDirty,
 }: {
   section: MenuSection;
   visualSettings: VisualSettings;
@@ -4601,7 +4737,9 @@ function SettingsSection({
   logout: () => Promise<void>;
   claimAdmin: () => Promise<void>;
   saveSecurityPermissions: () => Promise<void>;
+  securityDirty: boolean;
 }) {
+  const { t } = useLocaleContext();
   const [promptsOpen, setPromptsOpen] = useState(false);
   const [loreEntriesOpen, setLoreEntriesOpen] = useState(true);
   const [editingCardId, setEditingCardId] = useState('');
@@ -4798,13 +4936,13 @@ function SettingsSection({
         <div className="preset-title-row">
           <div>
             <span className="eyebrow">SillyTavern compatible</span>
-            <h3>Менеджер расширений</h3>
+            <h3>{t('extensions.manager')}</h3>
           </div>
         </div>
         <ExtensionsManager />
         <div className="extension-settings-note">
-          <strong>Настройки включенных расширений</strong>
-          <small>Они открываются отдельной кнопкой “Настройки” в строке расширения. После включения/выключения страница перезагружается, чтобы module scripts загрузились как в Tavern.</small>
+          <strong>{t('extensions.enabledSettings')}</strong>
+          <small>{t('extensions.enabledSettingsHelp')}</small>
         </div>
       </div>
     );
@@ -4817,7 +4955,7 @@ function SettingsSection({
           <div className="preset-title-row">
             <div>
               <span className="eyebrow">SillyTavern compatible</span>
-              <h3>Пресеты</h3>
+              <h3>{t('presets.title')}</h3>
             </div>
           </div>
           <AccessDeniedNotice />
@@ -4829,22 +4967,22 @@ function SettingsSection({
         <div className="preset-title-row">
           <div>
             <span className="eyebrow">SillyTavern compatible</span>
-            <h3>{selectedPresetType === 'openai' ? 'Пресеты для OpenAI' : 'Пресеты SillyTavern'}</h3>
-            <TokenBadge count={approxTokens(presetJsonDraft)} label="токенов в JSON" />
+            <h3>{selectedPresetType === 'openai' ? t('presets.title.openai') : t('presets.title.st')}</h3>
+            <TokenBadge count={approxTokens(presetJsonDraft)} label={t('tokens.label')} />
           </div>
-          <button className="ghost-button" type="button" onClick={() => void importSillyTavernDefaults()}>Импорт дефолтов ST</button>
+          <button className="ghost-button" type="button" onClick={() => void importSillyTavernDefaults()}>{t('presets.importST')}</button>
         </div>
         <TwoColumns
           left={(
             <div className="preset-select-save-row">
               <label className="field-preview">
-                <span>Пресет</span>
+                <span>{t('presets.select')}</span>
                 <div className="preset-select-with-button">
                   <select value={selectedPresetName} onChange={(event) => void selectPreset(event.target.value)}>
-                    <option value="">Выбрать пресет</option>
+                    <option value="">{t('presets.select')}</option>
                     {presets.map((preset) => <option value={preset.name} key={preset.filename}>{preset.name}{activePresets[preset.type] === preset.name ? ' · active' : ''}</option>)}
                   </select>
-                  <button className="preset-save-icon-button" type="button" title="Сохранить текущий пресет" onClick={() => void savePreset()} aria-label="Сохранить текущий пресет">
+                  <button className="preset-save-icon-button" type="button" title={t('common.save')} onClick={() => void savePreset()} aria-label={t('common.save')}>
                     <svg viewBox="0 0 24 24" aria-hidden="true">
                       <path d="M4 3h13.2L20 5.8V21H4V3Zm2 2v14h12V6.7L16.3 5H16v5H8V5H6Zm4 0v3h4V5h-4Zm-1 9h6v2H9v-2Z" />
                     </svg>
@@ -4853,49 +4991,50 @@ function SettingsSection({
               </label>
             </div>
           )}
-          right={<EditableField label="Имя для сохранения" value={presetNameDraft} onChange={setPresetNameDraft} />}
+          right={<EditableField label={t('presets.saveName')} value={presetNameDraft} onChange={setPresetNameDraft} />}
         />
         <label className="upload-card compact-upload">
-          <span>Импорт JSON пресета</span>
+          <span>{t('presets.import')}</span>
           <input type="file" accept="application/json,.json" onChange={(event) => { void importPreset(event.target.files?.[0] ?? null); event.target.value = ''; }} />
         </label>
         {selectedPresetType === 'openai' && presetObject ? (
           <div className="tavern-preset-panel">
             <section className="preset-card-section">
-              <h3>Генерация</h3>
-              <ToggleRow label="Неограниченный размер контекста" checked={Boolean(presetObject.max_context_unlocked)} onChange={(checked) => updatePresetField('max_context_unlocked', checked)} />
-              <SliderField label="Размер контекста (в токенах)" value={presetObject.openai_max_context} fallback={4095} min={0} max={1000000} step={512} onChange={(value) => updatePresetField('openai_max_context', value)} />
-              <NumberInputField label="Макс. длина ответа (в токенах)" value={presetObject.openai_max_tokens} fallback={300} min={0} step={1} onChange={(value) => updatePresetField('openai_max_tokens', value)} />
-              <NumberInputField label="Несколько свайпов на генерацию" value={presetObject.n} fallback={1} min={0} step={1} onChange={(value) => updatePresetField('n', value)} />
-              <ToggleRow label="Стриминг текста" checked={Boolean(presetObject.stream_openai)} onChange={(checked) => updatePresetField('stream_openai', checked)} />
-              <SliderField label="Температура" value={presetObject.temperature} fallback={1} min={0} max={2} step={0.01} onChange={(value) => updatePresetField('temperature', value)} />
-              <SliderField label="Штраф за частоту" value={presetObject.frequency_penalty} fallback={0} min={-2} max={2} step={0.01} onChange={(value) => updatePresetField('frequency_penalty', value)} />
-              <SliderField label="Штраф за присутствие" value={presetObject.presence_penalty} fallback={0} min={-2} max={2} step={0.01} onChange={(value) => updatePresetField('presence_penalty', value)} />
+              <h3>{t('presets.generation')}</h3>
+              <ToggleRow label={t('presets.unlimitedContext')} checked={Boolean(presetObject.max_context_unlocked)} onChange={(checked) => updatePresetField('max_context_unlocked', checked)} />
+              <SliderField label={t('presets.contextSize')} value={presetObject.openai_max_context} fallback={4095} min={0} max={1000000} step={512} onChange={(value) => updatePresetField('openai_max_context', value)} />
+              <NumberInputField label={t('presets.maxResponseLength')} value={presetObject.openai_max_tokens} fallback={300} min={0} step={1} onChange={(value) => updatePresetField('openai_max_tokens', value)} />
+              <NumberInputField label={t('presets.swipesPerGen')} value={presetObject.n} fallback={1} min={0} step={1} onChange={(value) => updatePresetField('n', value)} />
+              <ToggleRow label={t('presets.textStreaming')} checked={Boolean(presetObject.stream_openai)} onChange={(checked) => updatePresetField('stream_openai', checked)} />
+              <SliderField label={t('presets.temperature')} value={presetObject.temperature} fallback={1} min={0} max={2} step={0.01} onChange={(value) => updatePresetField('temperature', value)} />
+              <SliderField label={t('presets.frequencyPenalty')} value={presetObject.frequency_penalty} fallback={0} min={-2} max={2} step={0.01} onChange={(value) => updatePresetField('frequency_penalty', value)} />
+              <SliderField label={t('presets.presencePenalty')} value={presetObject.presence_penalty} fallback={0} min={-2} max={2} step={0.01} onChange={(value) => updatePresetField('presence_penalty', value)} />
               <SliderField label="Top P" value={presetObject.top_p} fallback={1} min={0} max={1} step={0.01} onChange={(value) => updatePresetField('top_p', value)} />
             </section>
 
             <section className="preset-card-section">
-              <h3>Служебные промпты</h3>
-              <NumberInputField label="Зерно" value={presetObject.seed} fallback={-1} step={1} onChange={(value) => updatePresetField('seed', value)} />
-              <NumberInputField label="Вставка имени персонажа" value={presetObject.names_behavior} fallback={0} min={0} step={1} onChange={(value) => updatePresetField('names_behavior', value)} />
-              <EditableField label="Постфикс для продолжения" value={String(presetObject.continue_nudge_prompt ?? '')} onChange={(value) => updatePresetField('continue_nudge_prompt', value)} />
-              <ToggleRow label="Префилл для продолжения" checked={Boolean(presetObject.continue_prefill)} onChange={(checked) => updatePresetField('continue_prefill', checked)} />
-              <ToggleRow label="Склеивать сообщения системы" checked={Boolean(presetObject.squash_system_messages)} onChange={(checked) => updatePresetField('squash_system_messages', checked)} />
-              <ToggleRow label="Включить функции" checked={Boolean(presetObject.function_calling)} onChange={(checked) => updatePresetField('function_calling', checked)} />
-              <ToggleRow label="Send inline media" checked={Boolean(presetObject.send_inline_images)} onChange={(checked) => updatePresetField('send_inline_images', checked)} />
-              <SelectField label="Рассуждения" value={String(presetObject.reasoning_effort ?? 'auto')} options={['auto', 'minimal', 'low', 'medium', 'high']} onChange={(value) => updatePresetField('reasoning_effort', value)} />
+              <h3>{t('presets.systemPrompts')}</h3>
+              <NumberInputField label={t('presets.seed')} value={presetObject.seed} fallback={-1} step={1} onChange={(value) => updatePresetField('seed', value)} />
+              <NumberInputField label={t('presets.nameInsertion')} value={presetObject.names_behavior} fallback={0} min={0} step={1} onChange={(value) => updatePresetField('names_behavior', value)} />
+              <EditableField label={t('presets.continueNudge')} value={String(presetObject.continue_nudge_prompt ?? '')} onChange={(value) => updatePresetField('continue_nudge_prompt', value)} />
+              <ToggleRow label={t('presets.continuePrefill')} checked={Boolean(presetObject.continue_prefill)} onChange={(checked) => updatePresetField('continue_prefill', checked)} />
+              <ToggleRow label={t('presets.squashSystemMessages')} checked={Boolean(presetObject.squash_system_messages)} onChange={(checked) => updatePresetField('squash_system_messages', checked)} />
+              <ToggleRow label={t('presets.functionCalling')} checked={Boolean(presetObject.function_calling)} onChange={(checked) => updatePresetField('function_calling', checked)} />
+              <ToggleRow label={t('presets.sendInlineMedia')} checked={Boolean(presetObject.send_inline_images)} onChange={(checked) => updatePresetField('send_inline_images', checked)} />
+              <ToggleRow label={t('presets.requestReasoning')} checked={presetObject.show_thoughts !== false} onChange={(checked) => updatePresetField('show_thoughts', checked)} />
+              <SelectField label={t('presets.reasoning')} value={String(presetObject.reasoning_effort ?? 'auto')} options={['auto', 'minimal', 'low', 'medium', 'high']} onChange={(value) => updatePresetField('reasoning_effort', value)} />
               <SelectField label="Verbosity" value={String(presetObject.verbosity ?? 'auto')} options={['auto', 'low', 'medium', 'high']} onChange={(value) => updatePresetField('verbosity', value)} />
             </section>
 
             <section className="preset-card-section">
               <div className="preset-title-row">
                 <div>
-                  <h3>Просмотр / Редактирование пресета промптов</h3>
-                  <small>Порядок, тоглы и содержимое сохраняются в SillyTavern `prompts` и `prompt_order`.</small>
+                  <h3>{t('presets.promptEditor')}</h3>
+                  <small>{t('presets.promptEditorHelp')}</small>
                 </div>
                 <div className="prompt-header-actions">
-                  <button className="ghost-button" type="button" onClick={() => setPromptsOpen((open) => !open)}>{promptsOpen ? 'Свернуть' : `Показать (${openAiPrompts.length})`}</button>
-                  <button type="button" onClick={addOpenAiPrompt}>Добавить</button>
+                  <button className="ghost-button" type="button" onClick={() => setPromptsOpen((open) => !open)}>{promptsOpen ? t('common.collapse') : `${t('common.show')} (${openAiPrompts.length})`}</button>
+                  <button type="button" onClick={addOpenAiPrompt}>{t('common.add')}</button>
                 </div>
               </div>
               {promptsOpen ? <div className="prompt-list">
@@ -4907,15 +5046,15 @@ function SettingsSection({
                   const promptPosition = Math.max(1, buildFullPromptOrder(presetObject).findIndex((item) => item.identifier === identifier) + 1);
                   return (
                     <article className={enabled ? 'prompt-row enabled' : 'prompt-row'} key={identifier}>
-                      <button className="drag-handle" type="button" aria-label="Переместить выше" onClick={() => moveOpenAiPrompt(identifier, -1)}>↑</button>
+                      <button className="drag-handle" type="button" aria-label={t('presets.moveUp')} onClick={() => moveOpenAiPrompt(identifier, -1)}>↑</button>
                       <span className="prompt-kind">{isInChatPrompt ? '@' : prompt.marker ? '◆' : prompt.system_prompt ? '★' : '*'}</span>
                       <div className="prompt-main">
                         <strong>{String(prompt.name || identifier)}</strong>
-                        <small>#{promptPosition} · {promptKind} · {String(prompt.role || 'system')} · {approxTokens(String(prompt.content || ''))} ток.</small>
+                        <small>#{promptPosition} · {promptKind} · {String(prompt.role || 'system')} · {approxTokens(String(prompt.content || ''))} {t('message.tokens')}</small>
                       </div>
-                      <button className="prompt-icon" type="button" title="Переместить ниже" onClick={() => moveOpenAiPrompt(identifier, 1)}>↓</button>
-                      <button className="prompt-icon" type="button" title="Редактировать" onClick={() => setEditingPromptId(isEditing ? '' : identifier)}><Icon name="edit" /></button>
-                      <button className="prompt-icon danger" type="button" title={prompt.system_prompt ? 'Системные prompt ST не удаляются' : 'Удалить prompt'} disabled={Boolean(prompt.system_prompt)} onClick={() => deleteOpenAiPrompt(identifier)}><Icon name="trash" /></button>
+                      <button className="prompt-icon" type="button" title={t('presets.moveDown')} onClick={() => moveOpenAiPrompt(identifier, 1)}>↓</button>
+                      <button className="prompt-icon" type="button" title={t('common.edit')} onClick={() => setEditingPromptId(isEditing ? '' : identifier)}><Icon name="edit" /></button>
+                      <button className="prompt-icon danger" type="button" title={prompt.system_prompt ? t('presets.cannotDeleteSystem') : t('common.delete')} disabled={Boolean(prompt.system_prompt)} onClick={() => deleteOpenAiPrompt(identifier)}><Icon name="trash" /></button>
                       <button className={enabled ? 'prompt-toggle active' : 'prompt-toggle'} type="button" onClick={() => toggleOpenAiPrompt(identifier)} aria-label="Toggle prompt"><i /></button>
                       {isEditing ? (
                         <div className="prompt-edit-panel">
@@ -4924,20 +5063,20 @@ function SettingsSection({
                               <h4>Edit</h4>
                               <small>{String(prompt.name || 'Prompt settings')}</small>
                             </div>
-                            <button className="ghost-button" type="button" onClick={() => setEditingPromptId('')}>Закрыть</button>
+                            <button className="ghost-button" type="button" onClick={() => setEditingPromptId('')}>{t('common.close')}</button>
                           </div>
                           <div className="prompt-edit-grid">
                             <EditableField label="Name" value={String(prompt.name || '')} onChange={(value) => updateOpenAiPrompt(identifier, { name: value })} />
                             <SelectField label="Role" value={String(prompt.role || 'system')} options={['system', 'user', 'assistant']} onChange={(value) => updateOpenAiPrompt(identifier, { role: value })} />
                             <SelectChoicesField label="Position" value={String(prompt.injection_position ?? 0)} options={[["0", "Relative"], ["1", "In-chat @ Depth"]]} onChange={(value) => updateOpenAiPrompt(identifier, { injection_position: Number(value) })} />
-                            {isInChatPrompt ? <NumberInputField label="Depth" value={prompt.injection_depth} fallback={4} min={0} max={9999} step={1} onChange={(value) => updateOpenAiPrompt(identifier, { injection_depth: value })} /> : <NumberInputField label="Позиция в списке" value={promptPosition} fallback={promptPosition} min={1} max={openAiPrompts.length} step={1} onChange={(value) => setOpenAiPromptPosition(identifier, value)} />}
-                            {isInChatPrompt ? <NumberInputField label="Order" value={prompt.injection_order} fallback={100} min={0} max={9999} step={1} onChange={(value) => updateOpenAiPrompt(identifier, { injection_order: value })} /> : <div className="relative-position-help"><span>Relative</span><small>Как в Tavern: место задается порядком строк в списке, не in-chat depth/order.</small></div>}
+                            {isInChatPrompt ? <NumberInputField label="Depth" value={prompt.injection_depth} fallback={4} min={0} max={9999} step={1} onChange={(value) => updateOpenAiPrompt(identifier, { injection_depth: value })} /> : <NumberInputField label={t('presets.listPosition')} value={promptPosition} fallback={promptPosition} min={1} max={openAiPrompts.length} step={1} onChange={(value) => setOpenAiPromptPosition(identifier, value)} />}
+                            {isInChatPrompt ? <NumberInputField label="Order" value={prompt.injection_order} fallback={100} min={0} max={9999} step={1} onChange={(value) => updateOpenAiPrompt(identifier, { injection_order: value })} /> : <div className="relative-position-help"><span>Relative</span><small>{t('presets.relativePositionHelp')}</small></div>}
                           </div>
                           <CheckboxGroupField label="Triggers" values={promptTriggerValues(prompt.injection_trigger)} options={['normal', 'continue', 'impersonate', 'swipe', 'regenerate', 'quiet']} onChange={(values) => updateOpenAiPrompt(identifier, { injection_trigger: values })} />
                           <div className="prompt-option-list">
-                            <PromptOptionRow title="Forbid Overrides" text="Запретить замену этого prompt override-ами из character card." checked={Boolean(prompt.forbid_overrides)} onChange={(checked) => updateOpenAiPrompt(identifier, { forbid_overrides: checked })} />
-                            <PromptOptionRow title="System Prompt" text="Служебный prompt Tavern. Такие prompt обычно не удаляются." checked={Boolean(prompt.system_prompt)} onChange={(checked) => updateOpenAiPrompt(identifier, { system_prompt: checked })} />
-                            <PromptOptionRow title="Marker" text="Плейсхолдер для куска контекста: chat history, examples, persona, world info." checked={Boolean(prompt.marker)} onChange={(checked) => updateOpenAiPrompt(identifier, { marker: checked })} />
+                            <PromptOptionRow title="Forbid Overrides" text={t('presets.forbidOverridesHelp')} checked={Boolean(prompt.forbid_overrides)} onChange={(checked) => updateOpenAiPrompt(identifier, { forbid_overrides: checked })} />
+                            <PromptOptionRow title="System Prompt" text={t('presets.systemPromptHelp')} checked={Boolean(prompt.system_prompt)} onChange={(checked) => updateOpenAiPrompt(identifier, { system_prompt: checked })} />
+                            <PromptOptionRow title="Marker" text={t('presets.markerHelp')} checked={Boolean(prompt.marker)} onChange={(checked) => updateOpenAiPrompt(identifier, { marker: checked })} />
                           </div>
                           <EditableTextArea label="Prompt" value={String(prompt.content || '')} disabled={Boolean(prompt.marker)} onChange={(value) => updateOpenAiPrompt(identifier, { content: value })} />
                           {prompt.marker ? <small>Marker prompt content is pulled from context pieces, like in SillyTavern.</small> : null}
@@ -4946,7 +5085,7 @@ function SettingsSection({
                     </article>
                   );
                 })}
-              </div> : <p className="prompt-list-collapsed">Список prompt скрыт. Пресет загружен, порядок и toggles сохраняются без изменений.</p>}
+              </div> : <p className="prompt-list-collapsed">{t('presets.promptListCollapsed')}</p>}
             </section>
 
             <ReasoningPresetPanel
@@ -4959,13 +5098,13 @@ function SettingsSection({
         ) : null}
 
         <details className="raw-preset-details">
-          <summary>Raw JSON пресета</summary>
+          <summary>{t('presets.rawJson')}</summary>
           <EditableTextArea label="Raw JSON" value={presetJsonDraft} onChange={setPresetJsonDraft} />
         </details>
         {presetMessage ? <p className="library-message">{presetMessage}</p> : null}
         <div className="preset-actions">
-          <button type="button" onClick={() => void exportPreset()}>Экспорт ST JSON</button>
-          <button type="button" onClick={() => void deletePreset()}>Удалить</button>
+          <button type="button" onClick={() => void exportPreset()}>{t('presets.export')}</button>
+          <button type="button" onClick={() => void deletePreset()}>{t('common.delete')}</button>
         </div>
       </div>
     );
@@ -4978,29 +5117,29 @@ function SettingsSection({
         <TwoColumns
           left={(
             <label className="field-preview">
-              <span>Пресет подключения</span>
+              <span>{t('connection.preset')}</span>
               <select value={activeConnectionPresetName} onChange={(event) => void applyConnectionPreset(event.target.value)}>
-                <option value="">Выбрать пресет</option>
+                <option value="">{t('connection.preset.select')}</option>
                 {connectionPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}{activeConnectionPresetName === preset.name ? ' · active' : ''}</option>)}
               </select>
             </label>
           )}
           right={(
             <div className="field-preview delete-preset-field">
-              <span>Удалить пресет</span>
+              <span>{t('connection.preset.delete')}</span>
               <div className="delete-preset-row">
                 <select value={presetToDelete} onChange={(event) => setPresetToDelete(event.target.value)}>
-                  <option value="">Выбрать</option>
+                  <option value="">{t('connection.preset.select')}</option>
                   {connectionPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}</option>)}
                 </select>
-                <button type="button" onClick={() => void deleteConnectionPreset(presetToDelete)}>Удалить</button>
+                <button type="button" onClick={() => void deleteConnectionPreset(presetToDelete)}>{t('common.delete')}</button>
               </div>
             </div>
           )}
         />
         <div className="connection-save-row">
-          <EditableField label="Название пресета для сохранения" value={connectionPresetName} onChange={setConnectionPresetName} />
-          <button type="button" onClick={() => void saveGenerationSettings()}>Сохранить подключение</button>
+          <EditableField label={t('connection.preset.saveName')} value={connectionPresetName} onChange={setConnectionPresetName} />
+          <button type="button" onClick={() => void saveGenerationSettings()}>{t('connection.preset.save')}</button>
         </div>
         {(() => {
           const sourceId = generationSettings.chat_completion_source && generationSettings.chat_completion_source !== 'disabled' ? generationSettings.chat_completion_source : (generationSettings.provider === 'disabled' ? '' : generationSettings.chat_completion_source);
@@ -5040,24 +5179,24 @@ function SettingsSection({
           return (
             <>
               <label className="field-preview">
-                <span>Источник Chat Completion</span>
+                <span>{t('connection.source')}</span>
                 <select value={selectedSourceId || 'disabled'} onChange={(event) => handleSourceChange(event.target.value)}>
-                  {chatCompletionSourceOptions.map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+                  {getChatCompletionSourceOptions(t).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
                 </select>
               </label>
               {sourceMeta?.custom_url_field || sourceMeta?.supports_reverse_proxy || !sourceMeta ? (
                 <EditableField
-                  label={sourceMeta?.custom_url_field ? 'Endpoint URL' : 'Endpoint (необязательно, override default)'}
+                  label={sourceMeta?.custom_url_field ? t('connection.endpoint') : t('connection.endpoint.optional')}
                   value={generationSettings.base_url}
                   onChange={(base_url) => setGenerationSettings({ ...generationSettings, base_url })}
                 />
               ) : (
-                <p className="helper-text">Базовый URL: <code>{sourceMeta.default_base_url}</code></p>
+                <p className="helper-text">{t('connection.baseUrl')}: <code>{sourceMeta.default_base_url}</code></p>
               )}
               {sourceMeta && sourceMeta.extra_field_keys.length > 0 ? (
                 <div className="connection-source-extras">
                   {sourceMeta.extra_field_keys.map((key) => {
-                    const label = extraFieldLabels[key] || key;
+                    const label = getExtraFieldLabels(t)[key] || key;
                     const raw = sourceExtras[key];
                     if (booleanExtraFields.has(key)) {
                       return (
@@ -5086,17 +5225,17 @@ function SettingsSection({
                   })}
                 </div>
               ) : null}
-              <p className="helper-text">Имя и аватар бота берутся из выбранной карточки. Имя и аватар игрока берутся из локально выбранной персоны.</p>
+              <p className="helper-text">{t('connection.help.botName')}</p>
               <TwoColumns
                 left={(
                   <label className="field-preview model-field">
-                    <span>Модель</span>
+                    <span>{t('connection.model')}</span>
                     <input value={generationSettings.model} onChange={(event) => setGenerationSettings({ ...generationSettings, model: event.target.value })} />
                     <select className="model-picker" value={models.includes(generationSettings.model) ? generationSettings.model : ''} disabled={!models.length} onChange={(event) => event.target.value && setGenerationSettings({ ...generationSettings, model: event.target.value })}>
-                      <option value="">{models.length ? 'Выбрать из загруженных моделей' : 'Список моделей еще не загружен'}</option>
+                      <option value="">{models.length ? t('connection.model.select') : t('connection.model.empty')}</option>
                       {models.map((model) => <option value={model} key={model}>{model}</option>)}
                     </select>
-                    <button className="ghost-button model-load-button" type="button" onClick={() => void checkConnection()}>Запросить модели / проверить</button>
+                    <button className="ghost-button model-load-button" type="button" onClick={() => void checkConnection()}>{t('connection.model.check')}</button>
                     {connectionMessage ? <p className="library-message connection-message-inline">{connectionMessage}</p> : null}
                   </label>
                 )}
@@ -5104,32 +5243,32 @@ function SettingsSection({
               />
               {sourceMeta && sourceMeta.supports_reverse_proxy ? (
                 <details className="connection-proxy-section">
-                  <summary>Обратный прокси (Reverse Proxy)</summary>
+                  <summary>{t('connection.reverseProxy')}</summary>
                   <EditableField
-                    label="Reverse Proxy URL"
+                    label={t('connection.proxyUrl')}
                     value={generationSettings.reverse_proxy}
                     onChange={(reverse_proxy) => setGenerationSettings({ ...generationSettings, reverse_proxy })}
                   />
                   <label className="field-preview">
-                    <span>Proxy Password {generationSettings.proxy_password_configured ? '(установлен)' : ''}</span>
+                    <span>{t('connection.proxyPassword')} {generationSettings.proxy_password_configured ? t('connection.proxyPassword.set') : ''}</span>
                     <input
                       type="password"
                       value={generationSettings.proxy_password}
-                      placeholder={generationSettings.proxy_password_configured ? 'Скрыт. Введите для замены.' : 'Введите пароль'}
+                      placeholder={generationSettings.proxy_password_configured ? t('connection.proxyPassword.placeholder.new') : t('connection.proxyPassword.placeholder.empty')}
                       onChange={(event) => setGenerationSettings({ ...generationSettings, proxy_password: event.target.value, clear_proxy_password: false })}
                     />
                   </label>
                   {generationSettings.proxy_password_configured ? (
                     <button type="button" className="ghost-button" onClick={() => setGenerationSettings({ ...generationSettings, proxy_password: '', clear_proxy_password: true })}>
-                      Очистить proxy password
+                      {t('connection.proxyPassword.clear')}
                     </button>
                   ) : null}
-                  <p className="helper-text">URL и пароль прокси заменяют базовый адрес и API-ключ источника на стороне сервера.</p>
+                  <p className="helper-text">{t('connection.proxy.help')}</p>
                 </details>
               ) : null}
               {sourceMeta && sourceMeta.extra_param_keys.length > 0 ? (
                 <details className="connection-params-section">
-                  <summary>Дополнительные параметры ответа</summary>
+                  <summary>{t('connection.extraParams')}</summary>
                   <div className="connection-source-extras">
                     {sourceMeta.extra_param_keys.map((key) => {
                       const label = extraParamLabels[key] || key;
@@ -5158,10 +5297,10 @@ function SettingsSection({
             </>
           );
         })()}
-        <EditableTextArea label="System prompt" value={generationSettings.system_prompt} onChange={(system_prompt) => setGenerationSettings({ ...generationSettings, system_prompt })} />
+        <EditableTextArea label={t('connection.systemPrompt')} value={generationSettings.system_prompt} onChange={(system_prompt) => setGenerationSettings({ ...generationSettings, system_prompt })} />
         <TwoColumns
-          left={<EditableField label="Temperature" value={String(generationSettings.temperature)} onChange={(temperature) => setGenerationSettings({ ...generationSettings, temperature: Number(temperature) || 0 })} />}
-          right={<EditableField label="Max tokens" value={String(generationSettings.max_tokens)} onChange={(maxTokens) => setGenerationSettings({ ...generationSettings, max_tokens: Number(maxTokens) || 1 })} />}
+          left={<EditableField label={t('connection.temperature')} value={String(generationSettings.temperature)} onChange={(temperature) => setGenerationSettings({ ...generationSettings, temperature: Number(temperature) || 0 })} />}
+          right={<EditableField label={t('connection.maxTokens')} value={String(generationSettings.max_tokens)} onChange={(maxTokens) => setGenerationSettings({ ...generationSettings, max_tokens: Number(maxTokens) || 1 })} />}
         />
       </div>
     );
@@ -5173,13 +5312,13 @@ function SettingsSection({
       <div className="form-stack visual-settings">
         <details className="visual-group theme-details">
           <summary>
-            <span className="theme-summary-label">Тема</span>
+            <span className="theme-summary-label">{t('visual.theme')}</span>
             <strong>{activeTheme.name}</strong>
-            <span className="theme-summary-action">Палитры</span>
+            <span className="theme-summary-action">{t('visual.palettes')}</span>
           </summary>
           <div className="theme-columns">
             <section className="theme-column">
-              <h4>Темные</h4>
+              <h4>{t('visual.darkThemes')}</h4>
               <div className="theme-grid">
                 {darkThemes.map((theme) => (
                   <button
@@ -5192,13 +5331,13 @@ function SettingsSection({
                       {theme.swatches.map((swatch) => <i key={swatch} style={{ background: swatch }} />)}
                     </span>
                     <strong>{theme.name}</strong>
-                    <small>{theme.description}</small>
+                    <small>{t(theme.description)}</small>
                   </button>
                 ))}
               </div>
             </section>
             <section className="theme-column">
-              <h4>Светлые</h4>
+              <h4>{t('visual.lightThemes')}</h4>
               <div className="theme-grid">
                 {lightThemes.map((theme) => (
                   <button
@@ -5211,7 +5350,7 @@ function SettingsSection({
                       {theme.swatches.map((swatch) => <i key={swatch} style={{ background: swatch }} />)}
                     </span>
                     <strong>{theme.name}</strong>
-                    <small>{theme.description}</small>
+                    <small>{t(theme.description)}</small>
                   </button>
                 ))}
               </div>
@@ -5220,69 +5359,69 @@ function SettingsSection({
         </details>
 
         <section className="visual-group">
-          <h3>Читаемость</h3>
+          <h3>{t('visual.readability')}</h3>
           <SegmentedControl
-            label="Размер текста"
+            label={t('visual.textSize')}
             value={visualSettings.textScale}
             options={[
-              ['small', 'Мелкий'],
-              ['normal', 'Обычный'],
-              ['large', 'Крупный'],
-              ['huge', 'Очень крупный'],
+              ['small', t('visual.textSize.small')],
+              ['normal', t('visual.textSize.normal')],
+              ['large', t('visual.textSize.large')],
+              ['huge', t('visual.textSize.huge')],
             ]}
             onChange={(textScale) => setVisualSettings({ ...visualSettings, textScale: textScale as VisualSettings['textScale'] })}
           />
           <SegmentedControl
-            label="Плотность"
+            label={t('visual.density')}
             value={visualSettings.density}
             options={[
-              ['compact', 'Компактно'],
-              ['comfortable', 'Нормально'],
-              ['spacious', 'Свободно'],
+              ['compact', t('visual.density.compact')],
+              ['comfortable', t('visual.density.comfortable')],
+              ['spacious', t('visual.density.spacious')],
             ]}
             onChange={(density) => setVisualSettings({ ...visualSettings, density: density as VisualSettings['density'] })}
           />
           <SegmentedControl
-            label="Ширина сообщений"
+            label={t('visual.messageWidth')}
             value={visualSettings.messageWidth}
             options={[
-              ['narrow', 'Узко'],
-              ['standard', 'Стандарт'],
-              ['wide', 'Широко'],
+              ['narrow', t('visual.messageWidth.narrow')],
+              ['standard', t('visual.messageWidth.standard')],
+              ['wide', t('visual.messageWidth.wide')],
             ]}
             onChange={(messageWidth) => setVisualSettings({ ...visualSettings, messageWidth: messageWidth as VisualSettings['messageWidth'] })}
           />
         </section>
 
         <section className="visual-group">
-          <h3>Поведение</h3>
+          <h3>{t('visual.behavior')}</h3>
           <SegmentedControl
-            label="Скругления"
+            label={t('visual.radius')}
             value={visualSettings.radius}
             options={[
-              ['sharp', 'Строго'],
-              ['soft', 'Мягко'],
-              ['round', 'Кругло'],
+              ['sharp', t('visual.radius.sharp')],
+              ['soft', t('visual.radius.soft')],
+              ['round', t('visual.radius.round')],
             ]}
             onChange={(radius) => setVisualSettings({ ...visualSettings, radius: radius as VisualSettings['radius'] })}
           />
-          <ToggleRow label="Легкие анимации" checked={visualSettings.motion} onChange={(motion) => setVisualSettings({ ...visualSettings, motion })} />
-          <ToggleRow label="Высокий контраст" checked={visualSettings.highContrast} onChange={(highContrast) => setVisualSettings({ ...visualSettings, highContrast })} />
-          <ToggleRow label="Аватары в списках" checked={visualSettings.showAvatars} onChange={(showAvatars) => setVisualSettings({ ...visualSettings, showAvatars })} />
-          <ToggleRow label="Закрепить окно чата" checked={visualSettings.stickyComposer} onChange={(stickyComposer) => setVisualSettings({ ...visualSettings, stickyComposer })} />
+          <ToggleRow label={t('visual.motion')} checked={visualSettings.motion} onChange={(motion) => setVisualSettings({ ...visualSettings, motion })} />
+          <ToggleRow label={t('visual.highContrast')} checked={visualSettings.highContrast} onChange={(highContrast) => setVisualSettings({ ...visualSettings, highContrast })} />
+          <ToggleRow label={t('visual.showAvatars')} checked={visualSettings.showAvatars} onChange={(showAvatars) => setVisualSettings({ ...visualSettings, showAvatars })} />
+          <ToggleRow label={t('visual.stickyComposer')} checked={visualSettings.stickyComposer} onChange={(stickyComposer) => setVisualSettings({ ...visualSettings, stickyComposer })} />
         </section>
 
         <section className="visual-group">
-          <h3>Украшения</h3>
-          <ToggleRow label="Декоративные градиенты" checked={visualSettings.gradients} onChange={(gradients) => setVisualSettings({ ...visualSettings, gradients })} />
-          <ToggleRow label="Стеклянные панели" checked={visualSettings.glass} onChange={(glass) => setVisualSettings({ ...visualSettings, glass })} />
-          <ToggleRow label="Легкая текстура фона" checked={visualSettings.texture} onChange={(texture) => setVisualSettings({ ...visualSettings, texture })} />
-          <ToggleRow label="Мягкие тени панелей" checked={visualSettings.panelShadows} onChange={(panelShadows) => setVisualSettings({ ...visualSettings, panelShadows })} />
-          <ToggleRow label="Легкая подсветка сообщений" checked={visualSettings.messageTint} onChange={(messageTint) => setVisualSettings({ ...visualSettings, messageTint })} />
-          <ToggleRow label="Виньетка фона" checked={visualSettings.backgroundVignette} onChange={(backgroundVignette) => setVisualSettings({ ...visualSettings, backgroundVignette })} />
+          <h3>{t('visual.decorations')}</h3>
+          <ToggleRow label={t('visual.gradients')} checked={visualSettings.gradients} onChange={(gradients) => setVisualSettings({ ...visualSettings, gradients })} />
+          <ToggleRow label={t('visual.glass')} checked={visualSettings.glass} onChange={(glass) => setVisualSettings({ ...visualSettings, glass })} />
+          <ToggleRow label={t('visual.texture')} checked={visualSettings.texture} onChange={(texture) => setVisualSettings({ ...visualSettings, texture })} />
+          <ToggleRow label={t('visual.panelShadows')} checked={visualSettings.panelShadows} onChange={(panelShadows) => setVisualSettings({ ...visualSettings, panelShadows })} />
+          <ToggleRow label={t('visual.messageTint')} checked={visualSettings.messageTint} onChange={(messageTint) => setVisualSettings({ ...visualSettings, messageTint })} />
+          <ToggleRow label={t('visual.backgroundVignette')} checked={visualSettings.backgroundVignette} onChange={(backgroundVignette) => setVisualSettings({ ...visualSettings, backgroundVignette })} />
         </section>
 
-        <button type="button" onClick={() => setVisualSettings(defaultVisualSettings)}>Сбросить визуал</button>
+        <button type="button" onClick={() => setVisualSettings(defaultVisualSettings)}>{t('visual.reset')}</button>
       </div>
     );
   }
@@ -5300,38 +5439,38 @@ function SettingsSection({
         <div className="preset-title-row">
           <div>
             <span className="eyebrow">SillyTavern World Info</span>
-            <h3>Лорбуки</h3>
-            <TokenBadge count={lorebookTokenCount(lorebookEntries)} label="токенов entries" />
+            <h3>{t('lorebooks.title')}</h3>
+            <TokenBadge count={lorebookTokenCount(lorebookEntries)} label={t('lorebooks.tokens')} />
           </div>
-          <button className="ghost-button" type="button" onClick={() => void exportLorebook()}>Экспорт ST JSON</button>
+          <button className="ghost-button" type="button" onClick={() => void exportLorebook()}>{t('lorebooks.export')}</button>
         </div>
         {accessDenied.lorebooks ? <AccessDeniedNotice /> : <>
           <TwoColumns
             left={(
               <label className="field-preview">
-                <span>Лорбук</span>
+                <span>{t('lorebooks.title')}</span>
                 <select value={selectedLorebookName} onChange={(event) => void openLorebook(event.target.value)}>
-                  <option value="">Выбрать лорбук</option>
+                  <option value="">{t('lorebooks.select')}</option>
                   {lorebooks.map((book) => <option value={book.name} key={book.filename}>{book.name} · {book.entry_count} entries</option>)}
                 </select>
               </label>
             )}
-            right={<EditableField label="Имя для сохранения" value={lorebookNameDraft} onChange={setLorebookNameDraft} />}
+            right={<EditableField label={t('lorebooks.saveName')} value={lorebookNameDraft} onChange={setLorebookNameDraft} />}
           />
           <label className="upload-card compact-upload">
-            <span>Импорт ST World Info JSON</span>
-            <small>Формат `worlds/*.json`: объект с `entries` как в SillyTavern.</small>
+            <span>{t('lorebooks.importST')}</span>
+            <small>{t('lorebooks.importHelp')}</small>
             <input type="file" accept="application/json,.json" onChange={(event) => { void importLorebook(event.target.files?.[0] ?? null); event.target.value = ''; }} />
           </label>
           <section className="preset-card-section">
             <div className="preset-title-row">
               <div>
-                <h3>Entries</h3>
-                <small>Редактор World Info записей: ключи, позиция, depth, probability, recursion и timing.</small>
+                <h3>{t('lorebooks.entries')}</h3>
+                <small>{t('lorebooks.entriesHelp')}</small>
               </div>
               <div className="prompt-header-actions">
-                <button className="ghost-button" type="button" onClick={() => setLoreEntriesOpen((open) => !open)}>{loreEntriesOpen ? 'Свернуть' : `Показать (${lorebookEntries.length})`}</button>
-                <button type="button" onClick={addLorebookEntry}>Добавить entry</button>
+                <button className="ghost-button" type="button" onClick={() => setLoreEntriesOpen((open) => !open)}>{loreEntriesOpen ? t('common.collapse') : `${t('common.show')} (${lorebookEntries.length})`}</button>
+                <button type="button" onClick={addLorebookEntry}>{t('lorebooks.addEntry')}</button>
               </div>
             </div>
             {loreEntriesOpen ? <div className="prompt-list">
@@ -5344,22 +5483,22 @@ function SettingsSection({
                     <span className="prompt-kind">{disabled ? '×' : '◆'}</span>
                     <div className="prompt-main">
                       <strong>{String(entry.comment || `Entry ${uid}`)}</strong>
-                      <small>uid {uid} · {lorebookPositionLabel(entry.position)} · order {String(entry.order ?? 100)} · {entryTokenCount(entry)} ток. · {csvFromArray(entry.key).join(', ') || 'без ключей'}</small>
+                      <small>uid {uid} · {lorebookPositionLabel(entry.position)} · order {String(entry.order ?? 100)} · {entryTokenCount(entry)} {t('message.tokens')} · {csvFromArray(entry.key).join(', ') || t('lorebooks.noKeys')}</small>
                     </div>
                     <div className="lore-entry-actions">
-                      <button className="prompt-icon" type="button" title="Редактировать" onClick={() => setEditingLoreEntryUid(isEditing ? '' : uid)}><Icon name="edit" /></button>
-                      <button className="prompt-icon" type="button" title="Дубликат" onClick={() => duplicateLorebookEntry(uid)}>⧉</button>
-                      <button className="prompt-icon danger" type="button" title="Удалить" onClick={() => deleteLorebookEntry(uid)}><Icon name="trash" /></button>
-                      <button className={disabled ? 'prompt-toggle' : 'prompt-toggle active'} type="button" onClick={() => updateLorebookEntry(uid, { disable: !disabled })} aria-label="Toggle entry"><i /></button>
+                      <button className="prompt-icon" type="button" title={t('common.edit')} onClick={() => setEditingLoreEntryUid(isEditing ? '' : uid)}><Icon name="edit" /></button>
+                      <button className="prompt-icon" type="button" title={t('common.duplicate')} onClick={() => duplicateLorebookEntry(uid)}>⧉</button>
+                      <button className="prompt-icon danger" type="button" title={t('common.delete')} onClick={() => deleteLorebookEntry(uid)}><Icon name="trash" /></button>
+                      <button className={disabled ? 'prompt-toggle' : 'prompt-toggle active'} type="button" onClick={() => updateLorebookEntry(uid, { disable: !disabled })} aria-label={t('common.toggle')}><i /></button>
                     </div>
                     {isEditing ? (
                       <div className="prompt-edit-panel">
                         <div className="prompt-edit-header">
                           <div>
                             <h4>{String(entry.comment || `Entry ${uid}`)}</h4>
-                            <small>Все поля сохраняются обратно в ST-compatible `entries[uid]`. {entryTokenCount(entry)} ток.</small>
+                            <small>{t('lorebooks.entryFieldsHelp')} {entryTokenCount(entry)} {t('message.tokens')}</small>
                           </div>
-                          <button className="ghost-button" type="button" onClick={() => setEditingLoreEntryUid('')}>Закрыть</button>
+                          <button className="ghost-button" type="button" onClick={() => setEditingLoreEntryUid('')}>{t('common.close')}</button>
                         </div>
                         <div className="prompt-edit-grid">
                           <EditableField label="Comment / Memo" value={String(entry.comment || '')} onChange={(value) => updateLorebookEntry(uid, { comment: value })} />
@@ -5383,49 +5522,49 @@ function SettingsSection({
                         />
                         <EditableTextArea label="Content" value={String(entry.content || '')} onChange={(value) => updateLorebookEntry(uid, { content: value })} />
                         <div className="prompt-option-list">
-                          <PromptOptionRow title="Enabled" text="Инверсия ST `disable`: выключенная запись не активируется." checked={!disabled} onChange={(checked) => updateLorebookEntry(uid, { disable: !checked })} />
-                          <PromptOptionRow title="Constant" text="Всегда активировать запись без ключей." checked={Boolean(entry.constant)} onChange={(checked) => updateLorebookEntry(uid, { constant: checked })} />
-                          <PromptOptionRow title="Selective" text="Требовать secondary key после primary key." checked={Boolean(entry.selective)} onChange={(checked) => updateLorebookEntry(uid, { selective: checked })} />
-                          <PromptOptionRow title="Use Probability" text="Применять шанс активации." checked={Boolean(entry.useProbability)} onChange={(checked) => updateLorebookEntry(uid, { useProbability: checked })} />
-                          <PromptOptionRow title="Add Memo" text="ST addMemo, сохраняется в JSON." checked={entry.addMemo !== false} onChange={(checked) => updateLorebookEntry(uid, { addMemo: checked })} />
-                          <PromptOptionRow title="Group Override" text="Перекрытие группы, как в Tavern." checked={Boolean(entry.groupOverride)} onChange={(checked) => updateLorebookEntry(uid, { groupOverride: checked })} />
-                          <PromptOptionRow title="Use Group Scoring" text="null в ST означает глобальную настройку." checked={entry.useGroupScoring === true} onChange={(checked) => updateLorebookEntry(uid, { useGroupScoring: checked ? true : null })} />
-                          <PromptOptionRow title="Case Sensitive" text="null в ST означает глобальную настройку." checked={entry.caseSensitive === true} onChange={(checked) => updateLorebookEntry(uid, { caseSensitive: checked ? true : null })} />
-                          <PromptOptionRow title="Match Whole Words" text="null в ST означает глобальную настройку." checked={entry.matchWholeWords === true} onChange={(checked) => updateLorebookEntry(uid, { matchWholeWords: checked ? true : null })} />
-                          <PromptOptionRow title="Vectorized" text="Сохраняется для совместимости ST vector storage." checked={Boolean(entry.vectorized)} onChange={(checked) => updateLorebookEntry(uid, { vectorized: checked })} />
-                          <PromptOptionRow title="Exclude Recursion" text="Исключить запись из recursive scan." checked={Boolean(entry.excludeRecursion)} onChange={(checked) => updateLorebookEntry(uid, { excludeRecursion: checked })} />
-                          <PromptOptionRow title="Prevent Recursion" text="Запрещать рекурсию после активации." checked={Boolean(entry.preventRecursion)} onChange={(checked) => updateLorebookEntry(uid, { preventRecursion: checked })} />
-                          <PromptOptionRow title="Delay Until Recursion" text="Отложить до recursive pass." checked={Boolean(entry.delayUntilRecursion)} onChange={(checked) => updateLorebookEntry(uid, { delayUntilRecursion: checked })} />
+                          <PromptOptionRow title="Enabled" text={t('lorebooks.enabledHelp')} checked={!disabled} onChange={(checked) => updateLorebookEntry(uid, { disable: !checked })} />
+                          <PromptOptionRow title="Constant" text={t('lorebooks.constantHelp')} checked={Boolean(entry.constant)} onChange={(checked) => updateLorebookEntry(uid, { constant: checked })} />
+                          <PromptOptionRow title="Selective" text={t('lorebooks.selectiveHelp')} checked={Boolean(entry.selective)} onChange={(checked) => updateLorebookEntry(uid, { selective: checked })} />
+                          <PromptOptionRow title="Use Probability" text={t('lorebooks.useProbabilityHelp')} checked={Boolean(entry.useProbability)} onChange={(checked) => updateLorebookEntry(uid, { useProbability: checked })} />
+                          <PromptOptionRow title="Add Memo" text={t('lorebooks.addMemoHelp')} checked={entry.addMemo !== false} onChange={(checked) => updateLorebookEntry(uid, { addMemo: checked })} />
+                          <PromptOptionRow title="Group Override" text={t('lorebooks.groupOverrideHelp')} checked={Boolean(entry.groupOverride)} onChange={(checked) => updateLorebookEntry(uid, { groupOverride: checked })} />
+                          <PromptOptionRow title="Use Group Scoring" text={t('lorebooks.nullGlobalHelp')} checked={entry.useGroupScoring === true} onChange={(checked) => updateLorebookEntry(uid, { useGroupScoring: checked ? true : null })} />
+                          <PromptOptionRow title="Case Sensitive" text={t('lorebooks.nullGlobalHelp')} checked={entry.caseSensitive === true} onChange={(checked) => updateLorebookEntry(uid, { caseSensitive: checked ? true : null })} />
+                          <PromptOptionRow title="Match Whole Words" text={t('lorebooks.nullGlobalHelp')} checked={entry.matchWholeWords === true} onChange={(checked) => updateLorebookEntry(uid, { matchWholeWords: checked ? true : null })} />
+                          <PromptOptionRow title="Vectorized" text={t('lorebooks.vectorizedHelp')} checked={Boolean(entry.vectorized)} onChange={(checked) => updateLorebookEntry(uid, { vectorized: checked })} />
+                          <PromptOptionRow title="Exclude Recursion" text={t('lorebooks.excludeRecursionHelp')} checked={Boolean(entry.excludeRecursion)} onChange={(checked) => updateLorebookEntry(uid, { excludeRecursion: checked })} />
+                          <PromptOptionRow title="Prevent Recursion" text={t('lorebooks.preventRecursionHelp')} checked={Boolean(entry.preventRecursion)} onChange={(checked) => updateLorebookEntry(uid, { preventRecursion: checked })} />
+                          <PromptOptionRow title="Delay Until Recursion" text={t('lorebooks.delayUntilRecursionHelp')} checked={Boolean(entry.delayUntilRecursion)} onChange={(checked) => updateLorebookEntry(uid, { delayUntilRecursion: checked })} />
                         </div>
                       </div>
                     ) : null}
                   </article>
                 );
-              }) : <p className="empty-library">Записей пока нет. Нажми `Добавить entry` или импортируй ST World Info JSON.</p>}
-            </div> : <p className="prompt-list-collapsed">Entries скрыты. JSON лорбука остается загруженным и сохранится без изменений.</p>}
+              }) : <p className="empty-library">{t('lorebooks.emptyEntries')}</p>}
+            </div> : <p className="prompt-list-collapsed">{t('lorebooks.entriesCollapsed')}</p>}
           </section>
           <section className="preset-card-section">
             <div className="preset-title-row">
               <div>
-                <h3>Привязки</h3>
-                <small>Один лорбук можно привязать к нескольким чатам, карточкам, персонам или сделать global.</small>
+                <h3>{t('lorebooks.bindings')}</h3>
+                <small>{t('lorebooks.bindingsHelp')}</small>
               </div>
-              <button type="button" onClick={() => void addLorebookBinding()}>Добавить привязку</button>
+              <button type="button" onClick={() => void addLorebookBinding()}>{t('lorebooks.addBinding')}</button>
             </div>
             <div className="prompt-edit-grid">
               <label className="field-preview">
-                <span>Лорбук</span>
+                <span>{t('lorebooks.title')}</span>
                 <select value={lorebookBindingDraft.book || selectedLorebookName} onChange={(event) => setLorebookBindingDraft({ ...lorebookBindingDraft, book: event.target.value })}>
-                  <option value="">Выбрать</option>
+                  <option value="">{t('common.select')}</option>
                   {lorebooks.map((book) => <option value={book.name} key={book.filename}>{book.name}</option>)}
                 </select>
               </label>
-              <SelectChoicesField label="Цель" value={lorebookBindingDraft.target_type} options={[["global", "Global"], ["card", "Карточка"], ["chat", "Чат"], ["persona", "Персона"]]} onChange={(value) => setLorebookBindingDraft({ ...lorebookBindingDraft, target_type: value as LorebookBinding['target_type'], target_id: '' })} />
-              {lorebookBindingDraft.target_type === 'global' ? <div className="relative-position-help"><span>Global</span><small>Активен в любом чате.</small></div> : (
+              <SelectChoicesField label={t('lorebooks.target')} value={lorebookBindingDraft.target_type} options={[["global", "Global"], ["card", t('lorebooks.targetCard')], ["chat", t('lorebooks.targetChat')], ["persona", t('lorebooks.targetPersona')]]} onChange={(value) => setLorebookBindingDraft({ ...lorebookBindingDraft, target_type: value as LorebookBinding['target_type'], target_id: '' })} />
+              {lorebookBindingDraft.target_type === 'global' ? <div className="relative-position-help"><span>Global</span><small>{t('lorebooks.globalHelp')}</small></div> : (
                 <label className="field-preview">
-                  <span>ID цели</span>
+                  <span>{t('lorebooks.targetId')}</span>
                   <select value={lorebookBindingDraft.target_id} onChange={(event) => setLorebookBindingDraft({ ...lorebookBindingDraft, target_id: event.target.value })}>
-                    <option value="">Выбрать</option>
+                    <option value="">{t('common.select')}</option>
                     {bindingTargetOptions.map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}
                   </select>
                 </label>
@@ -5439,20 +5578,20 @@ function SettingsSection({
                     <strong>{binding.book}</strong>
                     <small>{binding.target_type}{binding.target_id ? ` · ${binding.target_id}` : ''}</small>
                   </div>
-                  <button className="prompt-icon danger" type="button" title="Удалить привязку" onClick={() => void removeLorebookBinding(index)}><Icon name="trash" /></button>
+                  <button className="prompt-icon danger" type="button" title={t('lorebooks.removeBinding')} onClick={() => void removeLorebookBinding(index)}><Icon name="trash" /></button>
                 </article>
-              )) : <p className="empty-library">Привязок пока нет.</p>}
+              )) : <p className="empty-library">{t('lorebooks.noBindings')}</p>}
             </div>
           </section>
           <details className="raw-preset-details" open>
-            <summary>Raw JSON лорбука</summary>
+            <summary>{t('lorebooks.rawJson')}</summary>
             <EditableTextArea label="World Info JSON" value={lorebookJsonDraft} onChange={setLorebookJsonDraft} />
           </details>
           {lorebookMessage ? <p className="library-message">{lorebookMessage}</p> : null}
           <div className="preset-actions">
-            <button type="button" onClick={() => void saveLorebook()}>Сохранить лорбук</button>
-            <button type="button" onClick={() => void exportLorebook()}>Экспорт ST JSON</button>
-            <button type="button" onClick={() => void deleteLorebook()}>Удалить</button>
+            <button type="button" onClick={() => void saveLorebook()}>{t('lorebooks.save')}</button>
+            <button type="button" onClick={() => void exportLorebook()}>{t('lorebooks.export')}</button>
+            <button type="button" onClick={() => void deleteLorebook()}>{t('common.delete')}</button>
           </div>
         </>}
       </div>
@@ -5465,42 +5604,42 @@ function SettingsSection({
         <section className="library-column library-list-panel">
           <div className="panel-heading compact-heading">
             <div>
-              <span className="eyebrow">Карточки</span>
-              <strong>{cards.length ? `${cards.length} в библиотеке` : 'Пустая библиотека'}</strong>
+              <span className="eyebrow">{t('cards.title')}</span>
+              <strong>{cards.length ? `${cards.length} ${t('common.inLibrary')}` : t('common.emptyLibrary')}</strong>
             </div>
           </div>
 
           {accessDenied.cards ? <AccessDeniedNotice /> : <>
           <details className="create-card-panel">
-            <summary>Новая / импорт</summary>
+            <summary>{t('cards.import')}</summary>
             <div className="form-stack">
               <label className="upload-card">
-                <span>Импорт ST PNG / JSON</span>
-                <small>PNG с metadata или JSON character card; JSON будет сохранен как PNG-заглушка с metadata.</small>
+                <span>{t('cards.importST')}</span>
+                <small>{t('cards.importHelp')}</small>
                 <input type="file" accept="image/png,application/json,.json" onChange={(event) => { void importCard(event.target.files?.[0] ?? null); event.target.value = ''; }} />
               </label>
               <TwoColumns
-                left={<EditableField label="Имя" value={cardDraft.name} onChange={(name) => setCardDraft({ ...cardDraft, name })} />}
-                right={<EditableField label="Теги" value={cardDraft.tags} onChange={(tags) => setCardDraft({ ...cardDraft, tags })} />}
+                left={<EditableField label={t('personas.name')} value={cardDraft.name} onChange={(name) => setCardDraft({ ...cardDraft, name })} />}
+                right={<EditableField label={t('common.tags')} value={cardDraft.tags} onChange={(tags) => setCardDraft({ ...cardDraft, tags })} />}
               />
-              <EditableTextArea label="Описание" value={cardDraft.description} onChange={(description) => setCardDraft({ ...cardDraft, description })} />
+              <EditableTextArea label={t('personas.description')} value={cardDraft.description} onChange={(description) => setCardDraft({ ...cardDraft, description })} />
               <TwoColumns
                 left={<EditableTextArea label="Personality" value={cardDraft.personality} onChange={(personality) => setCardDraft({ ...cardDraft, personality })} />}
                 right={<EditableTextArea label="Scenario" value={cardDraft.scenario} onChange={(scenario) => setCardDraft({ ...cardDraft, scenario })} />}
               />
               <EditableTextArea label="First message" value={cardDraft.firstMessage} onChange={(firstMessage) => setCardDraft({ ...cardDraft, firstMessage })} />
               <AlternateGreetingsEditor value={cardDraft.alternateGreetings} onChange={(alternateGreetings) => setCardDraft({ ...cardDraft, alternateGreetings })} />
-              <TokenBadge count={cardDraftTokenCount(cardDraft)} label="токенов карточки" />
+              <TokenBadge count={cardDraftTokenCount(cardDraft)} label={t('cards.tokens')} />
               <TwoColumns
                 left={<EditableTextArea label="Example dialogue" value={cardDraft.messageExample} onChange={(messageExample) => setCardDraft({ ...cardDraft, messageExample })} />}
                 right={<EditableField label="Creator" value={cardDraft.creator} onChange={(creator) => setCardDraft({ ...cardDraft, creator })} />}
               />
               <TwoColumns
-                left={<button className="compact-action-button" type="button" onClick={() => void createCard()}>Создать PNG</button>}
+                left={<button className="compact-action-button" type="button" onClick={() => void createCard()}>{t('cards.create')}</button>}
                 right={(
                   <label className="upload-card compact-upload">
-                    <span>PNG аватарка</span>
-                    <small>Если файл не выбран, будет PNG-заглушка.</small>
+                    <span>{t('cards.pngAvatar')}</span>
+                    <small>{t('cards.avatarFallback')}</small>
                     <input type="file" accept="image/png" onChange={(event) => setCardAvatar(event.target.files?.[0] ?? null)} />
                   </label>
                 )}
@@ -5511,7 +5650,7 @@ function SettingsSection({
           <div className="compact-card-list">
             {cards.length ? cards.map((card) => (
               <CharacterCardView active={activeCard?.id === card.id} editing={editingCardId === card.id} card={card} key={card.filename} onSelect={selectBotCard} onEdit={startEditCard} onDelete={deleteCard} openImagePreview={openImagePreview} imageSrc={imageSrc} deleteLocked={deletionLocks.cards.includes(card.id)} admin={Boolean(authUser?.is_admin)} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleDeleteLock={() => void toggleDeletionLock('cards', card.id)} />
-            )) : <EmptyLibrary text="Карточек пока нет. Создай PNG карточку или импортируй character card из SillyTavern." />}
+            )) : <EmptyLibrary text={t('cards.emptyLibrary')} />}
           </div>
           </>}
         </section>
@@ -5522,11 +5661,11 @@ function SettingsSection({
           <article className="active-bot-panel">
             <button className="avatar-preview-button card-image-button" type="button" onClick={() => openImagePreview(activeCard.image_url, activeCard.name)}><img src={imageSrc(activeCard.image_url)} alt="" loading="lazy" /></button>
             <div>
-              <span className="eyebrow">Выбранная карточка</span>
+              <span className="eyebrow">{t('cards.selected')}</span>
                 <strong>{activeCard.name}</strong>
-                <TokenBadge count={cardTokenCount(activeCard)} label="токенов" />
-              <p>{activeCard.description || activeCard.first_message || 'Описание отсутствует.'}</p>
-              <button type="button" onClick={() => void createBotChat()}>Новый чат с этой карточкой</button>
+                <TokenBadge count={cardTokenCount(activeCard)} label={t('common.tokens')} />
+              <p>{activeCard.description || activeCard.first_message || t('cards.noDescription')}</p>
+              <button type="button" onClick={() => void createBotChat()}>{t('cards.newChatWithCard')}</button>
             </div>
           </article>
         ) : null}
@@ -5537,57 +5676,57 @@ function SettingsSection({
               <div className="editing-card-heading">
                 <button className="avatar-preview-button card-image-button" type="button" onClick={() => openImagePreview(editingCard.image_url, editingCard.name)}><img src={imageSrc(editingCard.image_url)} alt="" loading="lazy" /></button>
                 <div>
-                <span className="eyebrow">Редактирование PNG metadata</span>
+                <span className="eyebrow">{t('cards.editingMetadata')}</span>
                 <strong>{editingCard.name}</strong>
                 </div>
               </div>
-              <button className="ghost-button" type="button" onClick={() => setEditingCardId('')}>Закрыть</button>
+              <button className="ghost-button" type="button" onClick={() => setEditingCardId('')}>{t('common.close')}</button>
             </div>
             <TwoColumns
-              left={<EditableField label="Имя" value={cardEditDraft.name} onChange={(name) => setCardEditDraft({ ...cardEditDraft, name })} />}
-              right={<EditableField label="Теги" value={cardEditDraft.tags} onChange={(tags) => setCardEditDraft({ ...cardEditDraft, tags })} />}
+              left={<EditableField label={t('personas.name')} value={cardEditDraft.name} onChange={(name) => setCardEditDraft({ ...cardEditDraft, name })} />}
+              right={<EditableField label={t('common.tags')} value={cardEditDraft.tags} onChange={(tags) => setCardEditDraft({ ...cardEditDraft, tags })} />}
             />
-            <EditableTextArea label="Описание" value={cardEditDraft.description} onChange={(description) => setCardEditDraft({ ...cardEditDraft, description })} />
+            <EditableTextArea label={t('personas.description')} value={cardEditDraft.description} onChange={(description) => setCardEditDraft({ ...cardEditDraft, description })} />
             <TwoColumns
               left={<EditableTextArea label="Personality" value={cardEditDraft.personality} onChange={(personality) => setCardEditDraft({ ...cardEditDraft, personality })} />}
               right={<EditableTextArea label="Scenario" value={cardEditDraft.scenario} onChange={(scenario) => setCardEditDraft({ ...cardEditDraft, scenario })} />}
             />
             <EditableTextArea label="First message" value={cardEditDraft.firstMessage} onChange={(firstMessage) => setCardEditDraft({ ...cardEditDraft, firstMessage })} />
             <AlternateGreetingsEditor value={cardEditDraft.alternateGreetings} onChange={(alternateGreetings) => setCardEditDraft({ ...cardEditDraft, alternateGreetings })} />
-            <TokenBadge count={cardDraftTokenCount(cardEditDraft)} label="токенов карточки" />
+            <TokenBadge count={cardDraftTokenCount(cardEditDraft)} label={t('cards.tokens')} />
             <TwoColumns
               left={<EditableTextArea label="Example dialogue" value={cardEditDraft.messageExample} onChange={(messageExample) => setCardEditDraft({ ...cardEditDraft, messageExample })} />}
               right={<EditableField label="Creator" value={cardEditDraft.creator} onChange={(creator) => setCardEditDraft({ ...cardEditDraft, creator })} />}
             />
             <label className="upload-card compact-upload">
-              <span>Заменить PNG аватарку</span>
-              <small>Metadata карточки сохранится, заменится только картинка PNG.</small>
+              <span>{t('cards.replaceAvatar')}</span>
+              <small>{t('cards.replaceAvatarHelp')}</small>
               <input type="file" accept="image/png" onChange={(event) => { void uploadCardAvatar(editingCard, event.target.files?.[0] ?? null); event.target.value = ''; }} />
             </label>
             <div className="preset-actions">
-              <button type="button" onClick={() => void saveEditingCard()}>Сохранить карточку</button>
-              <button className="ghost-button" type="button" onClick={() => { setEditingCardId(''); setCardEditDraft(emptyCardDraft); }}>Отмена</button>
+              <button type="button" onClick={() => void saveEditingCard()}>{t('cards.save')}</button>
+              <button className="ghost-button" type="button" onClick={() => { setEditingCardId(''); setCardEditDraft(emptyCardDraft); }}>{t('common.cancel')}</button>
             </div>
           </section>
-        ) : <EmptyLibrary text="Выбери карточку слева или нажми `Править`, чтобы открыть редактор metadata." />}
+        ) : <EmptyLibrary text={t('cards.selectOrEdit')} />}
 
         <section className="chat-list">
-          <h3>Чаты выбранной карточки</h3>
+          <h3>{t('cards.chatsOfSelected')}</h3>
           {accessDenied.chats ? <AccessDeniedNotice /> : botChats.length ? botChats.map((chat) => (
             <article className={activeChat?.id === chat.id ? 'chat-row active' : 'chat-row'} key={chat.id}>
               <button type="button" onClick={() => void selectChat(chat.id)}>
                 <strong>{chat.title}</strong>
-                <small>{chat.message_count} сообщений · {new Date(chat.updated_at).toLocaleString()}</small>
+                <small>{chat.message_count} {t('chat.messages')} · {new Date(chat.updated_at).toLocaleString()}</small>
               </button>
               <div className="chat-row-actions">
-                <input aria-label="Новое имя чата" value={chatRenameDrafts[chat.id] ?? ''} placeholder="Новое имя" onChange={(event) => setChatRenameDrafts({ ...chatRenameDrafts, [chat.id]: event.target.value })} />
-                <button type="button" onClick={() => void copyChat(chat.id)}>Копия</button>
+                <input aria-label={t('chat.newName')} value={chatRenameDrafts[chat.id] ?? ''} placeholder={t('chat.newName')} onChange={(event) => setChatRenameDrafts({ ...chatRenameDrafts, [chat.id]: event.target.value })} />
+                <button type="button" onClick={() => void copyChat(chat.id)}>{t('common.copy')}</button>
                 <button type="button" onClick={() => void exportChat(chat.id)}>ST .jsonl</button>
-                <button type="button" onClick={() => void renameChat(chat)}>Имя</button>
+                <button type="button" onClick={() => void renameChat(chat)}>{t('chat.rename')}</button>
                 <DeleteConfirmButton itemKey={`chat:${chat.id}`} locked={Boolean(activeCard && deletionLocks.chats.includes(`${activeCard.id}:${chat.id}`))} admin={Boolean(authUser?.is_admin)} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={() => activeCard ? void toggleDeletionLock('chats', `${activeCard.id}:${chat.id}`) : undefined} onConfirm={() => void deleteChat(chat.id)} />
               </div>
             </article>
-          )) : <EmptyLibrary text="Выбери карточку, чтобы увидеть или создать ее чаты." />}
+          )) : <EmptyLibrary text={t('cards.noCardForChats')} />}
         </section>
         </section>
       </div>
@@ -5600,19 +5739,19 @@ function SettingsSection({
         <section className="library-column library-list-panel">
           <div className="panel-heading compact-heading">
             <div>
-              <span className="eyebrow">Персоны</span>
-              <strong>{personas.length ? `${personas.length} профилей` : 'Профилей нет'}</strong>
+              <span className="eyebrow">{t('personas.title')}</span>
+              <strong>{personas.length ? `${personas.length} ${t('personas.profiles')}` : t('personas.none')}</strong>
             </div>
           </div>
 
           {accessDenied.personas ? <AccessDeniedNotice /> : <>
           <details className="create-card-panel">
-            <summary>Новая персона</summary>
+            <summary>{t('personas.create')}</summary>
             <div className="form-stack">
-              <EditableField label="Имя" value={personaDraft.name} onChange={(name) => setPersonaDraft({ ...personaDraft, name })} />
+              <EditableField label={t('personas.name')} value={personaDraft.name} onChange={(name) => setPersonaDraft({ ...personaDraft, name })} />
               <EditableTextArea label="Persona prompt" value={personaDraft.description} onChange={(description) => setPersonaDraft({ ...personaDraft, description })} />
-              <TokenBadge count={personaTokenCount(personaDraft)} label="токенов персоны" />
-              <button type="button" onClick={() => void createPersona()}>Создать</button>
+              <TokenBadge count={personaTokenCount(personaDraft)} label={t('personas.tokens')} />
+              <button type="button" onClick={() => void createPersona()}>{t('common.create')}</button>
             </div>
           </details>
 
@@ -5624,19 +5763,19 @@ function SettingsSection({
                     {persona.avatar_url ? <button className="avatar-preview-button persona-image-button" type="button" onClick={() => openImagePreview(persona.avatar_url, persona.name)}><img src={imageSrc(persona.avatar_url)} alt="" loading="lazy" /></button> : <i className="persona-avatar-fallback">{persona.name.slice(0, 1) || '?'}</i>}
                     <div>
                       <strong>{persona.name}</strong>
-                      <small>{selectedPersonaId === persona.id ? 'Выбрана здесь' : 'Не выбрана'}</small>
-                      <TokenBadge count={personaTokenCount(persona)} label="токенов" />
-                      <p>{persona.description || 'Persona prompt пустой.'}</p>
+                      <small>{selectedPersonaId === persona.id ? t('personas.selectedHere') : t('personas.notSelected')}</small>
+                      <TokenBadge count={personaTokenCount(persona)} label={t('message.tokens')} />
+                      <p>{persona.description || t('personas.emptyPrompt')}</p>
                     </div>
                   </div>
                 </div>
                 <div className="card-row-actions">
-                  <button type="button" onClick={() => selectLocalPersona(persona.id)}>{selectedPersonaId === persona.id ? 'Выбрана' : 'Выбр.'}</button>
-                  <button className="ghost-button" type="button" onClick={() => setEditingPersonaId(persona.id)}>Прав.</button>
-                  <DeleteConfirmButton itemKey={`persona:${persona.id}`} label="Удал." locked={deletionLocks.personas.includes(persona.id)} admin={Boolean(authUser?.is_admin)} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={() => void toggleDeletionLock('personas', persona.id)} onConfirm={() => void deletePersona(persona)} />
+                  <button type="button" onClick={() => selectLocalPersona(persona.id)}>{selectedPersonaId === persona.id ? t('personas.selected') : t('common.select')}</button>
+                  <button className="ghost-button" type="button" onClick={() => setEditingPersonaId(persona.id)}>{t('common.edit')}</button>
+                  <DeleteConfirmButton itemKey={`persona:${persona.id}`} label={t('common.delete')} locked={deletionLocks.personas.includes(persona.id)} admin={Boolean(authUser?.is_admin)} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={() => void toggleDeletionLock('personas', persona.id)} onConfirm={() => void deletePersona(persona)} />
                 </div>
               </article>
-            )) : <EmptyLibrary text="Персон пока нет. Создай профиль игрока для prompt-а." />}
+            )) : <EmptyLibrary text={t('personas.empty')} />}
           </div>
           </>}
         </section>
@@ -5648,22 +5787,22 @@ function SettingsSection({
               <div className="persona-heading">
                 {editingPersona.avatar_url ? <button className="avatar-preview-button persona-image-button" type="button" onClick={() => openImagePreview(editingPersona.avatar_url, editingPersona.name)}><img src={imageSrc(editingPersona.avatar_url)} alt="" loading="lazy" /></button> : <span>{editingPersona.name.slice(0, 1) || '?'}</span>}
                 <div>
-                  <input aria-label="Имя персоны" value={editingPersona.name} onChange={(event) => editPersona(editingPersona.id, { name: event.target.value })} />
-                  <small>{selectedPersonaId === editingPersona.id ? 'Локально выбрана в этом браузере' : 'Не выбрана локально'}</small>
-                  <TokenBadge count={personaTokenCount(editingPersona)} label="токенов" />
+                  <input aria-label={t('personas.name')} value={editingPersona.name} onChange={(event) => editPersona(editingPersona.id, { name: event.target.value })} />
+                  <small>{selectedPersonaId === editingPersona.id ? t('personas.selectedLocal') : t('personas.notSelectedLocal')}</small>
+                  <TokenBadge count={personaTokenCount(editingPersona)} label={t('message.tokens')} />
                 </div>
               </div>
-              <EditableTextArea label="Описание / persona prompt" value={editingPersona.description} onChange={(description) => editPersona(editingPersona.id, { description })} />
+              <EditableTextArea label={t('personas.descriptionPrompt')} value={editingPersona.description} onChange={(description) => editPersona(editingPersona.id, { description })} />
               <div className="persona-actions">
-                <button type="button" onClick={() => void updatePersona(editingPersona)}>Сохранить</button>
-                <button className="ghost-button" type="button" onClick={() => selectLocalPersona(editingPersona.id)}>{selectedPersonaId === editingPersona.id ? 'Выбрана' : 'Выбр.'}</button>
-                <DeleteConfirmButton itemKey={`persona:${editingPersona.id}:edit`} label="Удал." locked={deletionLocks.personas.includes(editingPersona.id)} admin={Boolean(authUser?.is_admin)} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={() => void toggleDeletionLock('personas', editingPersona.id)} onConfirm={() => void deletePersona(editingPersona)} />
+                <button type="button" onClick={() => void updatePersona(editingPersona)}>{t('common.save')}</button>
+                <button className="ghost-button" type="button" onClick={() => selectLocalPersona(editingPersona.id)}>{selectedPersonaId === editingPersona.id ? t('personas.selected') : t('common.select')}</button>
+                <DeleteConfirmButton itemKey={`persona:${editingPersona.id}:edit`} label={t('common.delete')} locked={deletionLocks.personas.includes(editingPersona.id)} admin={Boolean(authUser?.is_admin)} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={() => void toggleDeletionLock('personas', editingPersona.id)} onConfirm={() => void deletePersona(editingPersona)} />
                 <label className="avatar-upload">
                   <input type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => void uploadPersonaAvatar(editingPersona.id, event.target.files?.[0] ?? null)} />
                 </label>
               </div>
             </article>
-          ) : <EmptyLibrary text="Выбери персону слева или создай новую." />}
+          ) : <EmptyLibrary text={t('personas.selectOrCreate')} />}
         </section>
       </div>
     );
@@ -5674,32 +5813,32 @@ function SettingsSection({
       <section className="preset-card-section">
         <div className="preset-title-row">
           <div>
-            <span className="eyebrow">Аккаунт</span>
-            <h3>{authUser ? `${authUser.is_admin ? '♛ ' : ''}${authUser.username}` : 'Гость'}</h3>
+            <span className="eyebrow">{t('security.account')}</span>
+            <h3>{authUser ? `${authUser.is_admin ? '♛ ' : ''}${authUser.username}` : t('auth.guest')}</h3>
           </div>
-          {authUser ? <button className="ghost-button" type="button" onClick={() => void logout()}>Выйти</button> : null}
+          {authUser ? <button className="ghost-button" type="button" onClick={() => void logout()}>{t('auth.logout')}</button> : null}
         </div>
         {!authUser ? (
           <div className="form-stack">
             <TwoColumns
-              left={<EditableField label="Ник" value={authDraft.username} onChange={(username) => setAuthDraft({ ...authDraft, username })} />}
-              right={<EditableField label="Пароль" type="password" value={authDraft.password} onChange={(password) => setAuthDraft({ ...authDraft, password })} />}
+              left={<EditableField label={t('auth.username')} value={authDraft.username} onChange={(username) => setAuthDraft({ ...authDraft, username })} />}
+              right={<EditableField label={t('auth.password')} type="password" value={authDraft.password} onChange={(password) => setAuthDraft({ ...authDraft, password })} />}
             />
             <div className="preset-actions">
-              <button type="button" onClick={() => void login()}>Войти</button>
-              {registrationAllowed ? <button className="ghost-button" type="button" onClick={() => void register()}>Регистрация</button> : null}
+              <button type="button" onClick={() => void login()}>{t('auth.login')}</button>
+              {registrationAllowed ? <button className="ghost-button" type="button" onClick={() => void register()}>{t('auth.register')}</button> : null}
             </div>
-            {!registrationAllowed ? <p className="helper-text">Регистрация на сервере отключена администратором.</p> : null}
+            {!registrationAllowed ? <p className="helper-text">{t('auth.registerDisabled')}</p> : null}
           </div>
         ) : (
           <div className="form-stack">
-            <p className="helper-text">Токен сохранен локально в браузере, следующий вход будет автоматическим.</p>
+            <p className="helper-text">{t('auth.tokenSaved')}</p>
             {!authUser.is_admin ? (
               <TwoColumns
-                left={<EditableField label="Код админа" type="password" value={authDraft.adminCode} onChange={(adminCode) => setAuthDraft({ ...authDraft, adminCode })} />}
-                right={<button type="button" onClick={() => void claimAdmin()}>Получить админ-права</button>}
+                left={<EditableField label={t('auth.adminCode')} type="password" value={authDraft.adminCode} onChange={(adminCode) => setAuthDraft({ ...authDraft, adminCode })} />}
+                right={<button type="button" onClick={() => void claimAdmin()}>{t('auth.claimAdmin')}</button>}
               />
-            ) : <p className="library-message">Админ-права активны.</p>}
+            ) : <p className="library-message">{t('auth.adminActive')}</p>}
           </div>
         )}
         {authMessage ? <p className="library-message">{authMessage}</p> : null}
@@ -5708,8 +5847,8 @@ function SettingsSection({
       <section className="preset-card-section">
         <div className="preset-title-row">
           <div>
-            <span className="eyebrow">Ключи</span>
-            <h3>Менеджер ключей</h3>
+            <span className="eyebrow">{t('security.keys')}</span>
+            <h3>{t('keyManager.title')}</h3>
           </div>
         </div>
         <KeyManager />
@@ -5718,33 +5857,36 @@ function SettingsSection({
       <section className="preset-card-section">
         <div className="preset-title-row">
           <div>
-            <span className="eyebrow">Разрешения</span>
-            <h3>Кто может менять данные</h3>
+            <span className="eyebrow">{t('security.permissions')}</span>
+            <h3>{t('security.whoCanEdit')}</h3>
           </div>
-          <button type="button" onClick={() => void saveSecurityPermissions()}>Сохранить права</button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+            {securityDirty ? <span style={{ color: 'var(--danger)', fontSize: '0.85rem' }}>● {t('security.unsavedChanges')}</span> : null}
+            <button type="button" onClick={() => void saveSecurityPermissions()}>{t('security.savePermissions')}</button>
+          </div>
         </div>
-        <ToggleRow label="Требовать вход для просмотра контента" checked={authRequired} onChange={setAuthRequired} />
-        <ToggleRow label="Разрешить регистрацию" checked={registrationAllowed} onChange={setRegistrationAllowed} />
-        <ToggleRow label="Разрешить кнопку Ответ бота" checked={botReplyAllowed} onChange={setBotReplyAllowed} />
-        <p className="helper-text">Если включено, карточки, персоны, чаты, аватарки и пресеты не отдаются гостям. Для тонкой настройки используй права просмотра ниже.</p>
-        <ToggleRow label="Требовать отдельный пароль доступа к DoubleTrouble" checked={securityAccessPasswordRequiredDraft} onChange={setSecurityAccessPasswordRequiredDraft} />
-        {accessPasswordRequired !== securityAccessPasswordRequiredDraft ? <p className="helper-text">Изменение пароля доступа применится только после сохранения прав.</p> : null}
+        <ToggleRow label={t('security.requireAuth')} checked={authRequired} onChange={setAuthRequired} />
+        <ToggleRow label={t('security.allowRegistration')} checked={registrationAllowed} onChange={setRegistrationAllowed} />
+        <ToggleRow label={t('security.allowBotReply')} checked={botReplyAllowed} onChange={setBotReplyAllowed} />
+        <p className="helper-text">{t('security.requireAuthHelp')}</p>
+        <ToggleRow label={t('security.requireAccessPassword')} checked={securityAccessPasswordRequiredDraft} onChange={setSecurityAccessPasswordRequiredDraft} />
+        {accessPasswordRequired !== securityAccessPasswordRequiredDraft ? <p className="helper-text">{t('security.accessPasswordHint')}</p> : null}
         <TwoColumns
-          left={<EditableField label={accessPasswordConfigured ? 'Новый пароль доступа (оставь пустым, чтобы не менять)' : 'Пароль доступа'} type="password" value={securityAccessPasswordDraft} onChange={setSecurityAccessPasswordDraft} />}
-          right={<p className="helper-text">Этот пароль вводится до регистрации/логина и действует поверх аккаунтов. Смена пароля сбрасывает старые access-сессии.</p>}
+          left={<EditableField label={accessPasswordConfigured ? t('security.newAccessPassword') : t('security.accessPassword')} type="password" value={securityAccessPasswordDraft} onChange={setSecurityAccessPasswordDraft} />}
+          right={<p className="helper-text">{t('security.accessPasswordHelp')}</p>}
         />
         <div className="permission-grid">
-          {Object.entries(permissionLabels).map(([key, label]) => {
+          {Object.entries(getPermissionLabels(t)).map(([key, label]) => {
             const rule = securityPermissions[key] || defaultSecurityPermissions[key];
             return (
               <article className="permission-row" key={key}>
                 <strong>{label}</strong>
                 <select value={rule.mode} onChange={(event) => setSecurityPermissions({ ...securityPermissions, [key]: { ...rule, mode: event.target.value as PermissionMode } })}>
-                  <option value="everyone">Все</option>
-                  <option value="admins">Только админы</option>
-                  <option value="users">Админы + список</option>
+                  <option value="everyone">{t('security.everyone')}</option>
+                  <option value="admins">{t('security.adminsOnly')}</option>
+                  <option value="users">{t('security.adminsAndList')}</option>
                 </select>
-                <input value={rule.users.join(', ')} placeholder="ники через запятую" onChange={(event) => setSecurityPermissions({ ...securityPermissions, [key]: { ...rule, users: event.target.value.split(',').map((item) => item.trim()).filter(Boolean) } })} />
+                <input value={rule.users.join(', ')} placeholder={t('security.usernamesPlaceholder')} onChange={(event) => setSecurityPermissions({ ...securityPermissions, [key]: { ...rule, users: event.target.value.split(',').map((item) => item.trim()).filter(Boolean) } })} />
               </article>
             );
           })}
@@ -5791,44 +5933,47 @@ function ChatPicker({
   selectChat: (chatId: string) => Promise<void>;
   close: () => void;
 }) {
+  const { t } = useLocaleContext();
   return (
     <div className="chat-picker">
       <header>
-        <strong>Чаты карточки</strong>
+        <strong>{t('chat.cardChats')}</strong>
         <div className="chat-picker-header-actions">
-          <button type="button" onClick={() => void createBotChat()}>Новый</button>
-          <button className="ghost-button" type="button" onClick={close}>Закрыть</button>
+          <button type="button" onClick={() => void createBotChat()}>{t('common.new')}</button>
+          <button className="ghost-button" type="button" onClick={close}>{t('common.close')}</button>
         </div>
       </header>
       {botChats.length ? botChats.map((chat) => (
         <article className={activeChat?.id === chat.id ? 'chat-row active' : 'chat-row'} key={chat.id}>
           <button type="button" onClick={() => void selectChat(chat.id)}>
             <strong>{chat.title}</strong>
-            <small>{chat.message_count} сообщений</small>
+            <small>{chat.message_count} {t('chat.messages')}</small>
           </button>
           <div className="chat-row-actions">
-            <input aria-label="Новое имя чата" value={chatRenameDrafts[chat.id] ?? ''} placeholder="Новое имя" onChange={(event) => setChatRenameDrafts({ ...chatRenameDrafts, [chat.id]: event.target.value })} />
-            <button type="button" onClick={() => void copyChat(chat.id)}>Копия</button>
+            <input aria-label={t('chat.newName')} value={chatRenameDrafts[chat.id] ?? ''} placeholder={t('chat.newName')} onChange={(event) => setChatRenameDrafts({ ...chatRenameDrafts, [chat.id]: event.target.value })} />
+            <button type="button" onClick={() => void copyChat(chat.id)}>{t('common.copy')}</button>
             <button type="button" onClick={() => void exportChat(chat.id)}>ST .jsonl</button>
-            <button type="button" onClick={() => void renameChat(chat)}>Имя</button>
+            <button type="button" onClick={() => void renameChat(chat)}>{t('chat.rename')}</button>
             <DeleteConfirmButton itemKey={`composer-chat:${chat.id}`} locked={deleteLocks.chats.includes(`${activeCardId}:${chat.id}`)} admin={admin} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={() => toggleDeleteLock(`${activeCardId}:${chat.id}`)} onConfirm={() => void deleteChat(chat.id)} />
           </div>
         </article>
-      )) : <p className="empty-library">У выбранной карточки пока нет чатов.</p>}
+      )) : <p className="empty-library">{t('chat.noChats')}</p>}
     </div>
   );
 }
 
 function ComposerActionMenu({ activeChat, isGenerating, openChats, rerollLastBotMessage }: { activeChat: BotChat | null; isGenerating: boolean; openChats: () => void; rerollLastBotMessage: () => Promise<void> }) {
+  const { t } = useLocaleContext();
   return (
     <div className="composer-action-menu">
-      <button type="button" onClick={openChats}>Чаты</button>
-      <button type="button" disabled={!activeChat || isGenerating} onClick={() => void rerollLastBotMessage()}>Реролл</button>
+      <button type="button" onClick={openChats}>{t('composer.chats')}</button>
+      <button type="button" disabled={!activeChat || isGenerating} onClick={() => void rerollLastBotMessage()}>{t('message.reroll')}</button>
     </div>
   );
 }
 
 function ReasoningPresetPanel({ settings, assistantPrefill, update, updateAssistantPrefill }: { settings: ReasoningDisplaySettings; assistantPrefill: string; update: (patch: Partial<ReasoningDisplaySettings>) => void; updateAssistantPrefill: (value: string) => void }) {
+  const { t } = useLocaleContext();
   const applyTemplate = (name: string) => {
     const templates: Record<string, Pick<ReasoningDisplaySettings, 'prefix' | 'suffix' | 'separator'>> = {
       DeepSeek: { prefix: '<think>\n', suffix: '\n</think>', separator: '\n\n' },
@@ -5840,17 +5985,17 @@ function ReasoningPresetPanel({ settings, assistantPrefill, update, updateAssist
 
   return (
     <section className="preset-card-section reasoning-settings-panel">
-      <h3>Рассуждения / Reasoning</h3>
+      <h3>{t('reasoning.title')}</h3>
       <div className="reasoning-toggle-grid">
-        <label><input type="checkbox" checked={settings.autoParse} onChange={(event) => update({ autoParse: event.target.checked })} />Авто-парсинг</label>
-        <label><input type="checkbox" checked={settings.autoExpand} onChange={(event) => update({ autoExpand: event.target.checked })} />Разворачивать</label>
-        <label><input type="checkbox" checked={settings.showHidden} onChange={(event) => update({ showHidden: event.target.checked })} />Показывать скрытое</label>
-        <label><input type="checkbox" checked={settings.addToPrompts} onChange={(event) => update({ addToPrompts: event.target.checked })} />Добавлять в промпт</label>
-        <NumberInputField label="Макс." value={settings.maxAdditions} fallback={1} min={0} max={99} step={1} onChange={(value) => typeof value === 'number' && update({ maxAdditions: value })} />
+        <label><input type="checkbox" checked={settings.autoParse} onChange={(event) => update({ autoParse: event.target.checked })} />{t('reasoning.autoParse')}</label>
+        <label><input type="checkbox" checked={settings.autoExpand} onChange={(event) => update({ autoExpand: event.target.checked })} />{t('reasoning.autoExpand')}</label>
+        <label><input type="checkbox" checked={settings.showHidden} onChange={(event) => update({ showHidden: event.target.checked })} />{t('reasoning.showHidden')}</label>
+        <label><input type="checkbox" checked={settings.addToPrompts} onChange={(event) => update({ addToPrompts: event.target.checked })} />{t('reasoning.addToPrompts')}</label>
+        <NumberInputField label={t('common.max')} value={settings.maxAdditions} fallback={1} min={0} max={99} step={1} onChange={(value) => typeof value === 'number' && update({ maxAdditions: value })} />
       </div>
       <div className="reasoning-format-row">
         <label className="field-preview">
-          <span>Форматирование рассуждений</span>
+          <span>{t('reasoning.formatting')}</span>
           <select value={reasoningTemplateName(settings)} onChange={(event) => applyTemplate(event.target.value)}>
             <option value="Custom">Custom</option>
             <option value="DeepSeek">DeepSeek</option>
@@ -5860,28 +6005,31 @@ function ReasoningPresetPanel({ settings, assistantPrefill, update, updateAssist
         </label>
       </div>
       <div className="reasoning-text-grid">
-        <EditableTextArea label="Префикс" value={settings.prefix} onChange={(prefix) => update({ prefix })} />
-        <EditableTextArea label="Постфикс" value={settings.suffix} onChange={(suffix) => update({ suffix })} />
-        <EditableTextArea label="Разделитель" value={settings.separator} onChange={(separator) => update({ separator })} />
+        <EditableTextArea label={t('reasoning.prefix')} value={settings.prefix} onChange={(prefix) => update({ prefix })} />
+        <EditableTextArea label={t('reasoning.suffix')} value={settings.suffix} onChange={(suffix) => update({ suffix })} />
+        <EditableTextArea label={t('reasoning.separator')} value={settings.separator} onChange={(separator) => update({ separator })} />
       </div>
-      <EditableTextArea label="Начинать ответ с" value={assistantPrefill} onChange={updateAssistantPrefill} />
+      <EditableTextArea label={t('reasoning.assistantPrefill')} value={assistantPrefill} onChange={updateAssistantPrefill} />
     </section>
   );
 }
 
 function MessageContent({ content, reasoning, imagePending = false, renderPendingMarkersAsSpinner = false, isStreaming = false }: { content: string; reasoning: ReasoningDisplaySettings; imagePending?: boolean; renderPendingMarkersAsSpinner?: boolean; isStreaming?: boolean }) {
-  const parsed = reasoning.autoParse ? splitReasoning(content, reasoning) : { reasoning: '', visible: content, complete: false };
-  const formatOptions: ExtensionMessageFormatOptions = { forceImagePending: imagePending, renderPendingMarkersAsSpinner, reasoning };
-  const reasoningOpen = isStreaming ? Boolean(parsed.reasoning && !parsed.complete) : reasoning.autoExpand;
+  const { t } = useLocaleContext();
+  const regexedContent = getRegexedString(content, regex_placement.MD_DISPLAY, { isMarkdown: true });
+  const parsed = reasoning.autoParse ? splitReasoning(regexedContent, reasoning) : { reasoning: '', visible: regexedContent, complete: false };
+  const reasoningText = parsed.reasoning ? getRegexedString(parsed.reasoning, regex_placement.REASONING, { isMarkdown: true }) : '';
+  const formatOptions: ExtensionMessageFormatOptions = { forceImagePending: imagePending, renderPendingMarkersAsSpinner, reasoning, t };
+  const reasoningOpen = isStreaming ? Boolean(reasoningText && !parsed.complete) : reasoning.autoExpand;
   return (
     <div className="message-content mes_text">
-      {parsed.reasoning && !reasoning.showHidden ? (
+      {reasoningText && !reasoning.showHidden ? (
         <details className="reasoning-block" open={reasoningOpen}>
-          <summary>Какое-то время заняли размышления</summary>
-          <pre>{parsed.reasoning}</pre>
+          <summary>{t('reasoning.thinking')}</summary>
+          <pre>{reasoningText}</pre>
         </details>
       ) : null}
-      {parsed.reasoning && reasoning.showHidden ? <pre className="reasoning-visible">{parsed.reasoning}</pre> : null}
+      {reasoningText && reasoning.showHidden ? <pre className="reasoning-visible">{reasoningText}</pre> : null}
       {formatMessageText(parsed.visible, formatOptions)}
     </div>
   );
@@ -5952,10 +6100,11 @@ function findReasoningMarker(content: string, markers: string[], fromIndex: numb
 }
 
 function formatMessageText(content: string, options: ExtensionMessageFormatOptions = {}): ReactNode {
-  if (loadBuiltInExtensionSettings().noriMynInfoblock && /◈NORICORE◈/i.test(content)) {
-    return formatNoricoreMessageText(content, options);
+  const regexedContent = getRegexedString(content, regex_placement.MD_DISPLAY, { isMarkdown: true });
+  if (loadBuiltInExtensionSettings().noriMynInfoblock && /◈NORICORE◈/i.test(regexedContent)) {
+    return formatNoricoreMessageText(regexedContent, options);
   }
-  return formatMessageSegmentText(content, options);
+  return formatMessageSegmentText(regexedContent, options);
 }
 
 function formatMessageSegmentText(content: string, options: ExtensionMessageFormatOptions = {}): ReactNode {
@@ -6081,9 +6230,9 @@ function parseNoricoreBlock(raw: string): NoricoreData {
     if (!parts[0]) continue;
     data.characters.push({
       name: parts[0],
-      status: parts[1] || 'Присутствует',
+      status: parts[1] || 'Present',
       outfit: parts[2] || '—',
-      health: parts[3] || 'Здоров',
+      health: parts[3] || 'Healthy',
       mood: parts[4] || '—',
       feelings: parts[5] || '—',
       thoughts: stripOuterQuotes(parts[6] || ''),
@@ -6098,6 +6247,7 @@ function stripOuterQuotes(value: string) {
 }
 
 function NoricoreBlock({ data }: { data: NoricoreData }) {
+  const { t } = useLocaleContext();
   const scene = data.scene;
   if (!scene) return null;
   return (
@@ -6111,7 +6261,7 @@ function NoricoreBlock({ data }: { data: NoricoreData }) {
         </div>
       </header>
       <details className="noricore-section">
-        <summary><span>👥 ПЕРСОНАЖИ ({data.characters.length})</span></summary>
+        <summary><span>👥 {t('noricore.characters')} ({data.characters.length})</span></summary>
         <div className="noricore-character-list">
           {data.characters.map((character, index) => <NoricoreCharacterCard character={character} key={`${character.name}-${index}`} />)}
         </div>
@@ -6121,6 +6271,7 @@ function NoricoreBlock({ data }: { data: NoricoreData }) {
 }
 
 function NoricoreCharacterCard({ character }: { character: NoricoreCharacter }) {
+  const { t } = useLocaleContext();
   const status = character.status.toLowerCase();
   const away = status.includes('отсутств') || status.includes('away');
   const nearby = status.includes('рядом') || status.includes('nearby');
@@ -6131,13 +6282,13 @@ function NoricoreCharacterCard({ character }: { character: NoricoreCharacter }) 
         <small>{character.status}</small>
       </header>
       <div className="noricore-grid">
-        <NoricoreField label="Одежда" icon="👗" value={character.outfit} />
-        <NoricoreField label="Здоровье" icon={noricoreHealthIcon(character.health)} value={character.health} tone={noricoreHealthTone(character.health)} />
-        <NoricoreField label="Настроение" icon="🎭" value={character.mood} />
-        <NoricoreField label="Чувства" icon="💜" value={character.feelings} wide italic />
+        <NoricoreField label={t('noricore.outfit')} icon="👗" value={character.outfit} />
+        <NoricoreField label={t('noricore.health')} icon={noricoreHealthIcon(character.health)} value={character.health} tone={noricoreHealthTone(character.health)} />
+        <NoricoreField label={t('noricore.mood')} icon="🎭" value={character.mood} />
+        <NoricoreField label={t('noricore.feelings')} icon="💜" value={character.feelings} wide italic />
       </div>
       {character.thoughts && character.thoughts !== '—' ? (
-        <blockquote className="noricore-thought"><span>💭 Мысли</span>{character.thoughts}</blockquote>
+        <blockquote className="noricore-thought"><span>💭 {t('noricore.thoughts')}</span>{character.thoughts}</blockquote>
       ) : null}
     </article>
   );
@@ -6715,7 +6866,7 @@ function TwoColumns({ left, right }: { left: ReactNode; right: ReactNode }) {
   return <div className="two-columns">{left}{right}</div>;
 }
 
-function TokenBadge({ count, label = 'токенов' }: { count: number; label?: string }) {
+function TokenBadge({ count, label = 'tokens' }: { count: number; label?: string }) {
   return <small className="token-badge">{count} {label}</small>;
 }
 
@@ -6744,31 +6895,32 @@ function tokenCountForParts(parts: string[]) {
 }
 
 function AlternateGreetingsEditor({ value, onChange }: { value: string[]; onChange: (value: string[]) => void }) {
+  const { t } = useLocaleContext();
   const updateGreeting = (index: number, nextValue: string) => onChange(value.map((item, itemIndex) => itemIndex === index ? nextValue : item));
   const removeGreeting = (index: number) => onChange(value.filter((_, itemIndex) => itemIndex !== index));
   return (
     <section className="alternate-greetings-editor">
       <div className="alternate-greetings-header">
         <div>
-          <strong>Alternate greetings</strong>
-          <TokenBadge count={tokenCountForParts(value)} label="токенов" />
+          <strong>{t('cards.alternateGreetings')}</strong>
+          <TokenBadge count={tokenCountForParts(value)} label={t('common.tokens')} />
         </div>
-        <button className="ghost-button" type="button" onClick={() => onChange([...value, ''])}>Добавить greeting</button>
+        <button className="ghost-button" type="button" onClick={() => onChange([...value, ''])}>{t('cards.addGreeting')}</button>
       </div>
       {value.length ? value.map((greeting, index) => (
         <label className="field-preview" key={index}>
-          <span>Greeting #{index + 2}</span>
+          <span>{t('cards.greeting')} #{index + 2}</span>
           <textarea value={greeting} onChange={(event) => updateGreeting(index, event.target.value)} />
-          <button className="ghost-button danger-button" type="button" onClick={() => removeGreeting(index)}>Удалить greeting</button>
+          <button className="ghost-button danger-button" type="button" onClick={() => removeGreeting(index)}>{t('cards.deleteGreeting')}</button>
         </label>
-      )) : <p className="helper-text">Как в SillyTavern: основной First message остается первым swipe, эти приветствия станут следующими swipes нового чата.</p>}
+      )) : <p className="helper-text">{t('cards.alternateGreetingsHelp')}</p>}
     </section>
   );
 }
 
 function DeleteConfirmButton({
   itemKey,
-  label = 'Удалить',
+  label = 'Delete',
   locked,
   admin,
   pendingDeleteKey,
@@ -6785,19 +6937,20 @@ function DeleteConfirmButton({
   toggleLock?: () => void;
   onConfirm: () => void;
 }) {
+  const { t } = useLocaleContext();
   const pending = pendingDeleteKey === itemKey;
   return (
     <span className="delete-confirm-group">
       {pending ? (
         <>
-          <span className="delete-confirm-label">Точно?</span>
-          <button className="danger-button" type="button" onClick={() => { setPendingDeleteKey(''); onConfirm(); }}>Да</button>
-          <button className="ghost-button" type="button" onClick={() => setPendingDeleteKey('')}>Нет</button>
+          <span className="delete-confirm-label">{t('common.confirm')}</span>
+          <button className="danger-button" type="button" onClick={() => { setPendingDeleteKey(''); onConfirm(); }}>{t('common.yes')}</button>
+          <button className="ghost-button" type="button" onClick={() => setPendingDeleteKey('')}>{t('common.no')}</button>
         </>
       ) : (
         <span className="delete-confirm-main">
-          {admin && toggleLock ? <button className={locked ? 'ghost-button lock-button locked' : 'ghost-button lock-button'} type="button" title={locked ? 'Разблокировать удаление' : 'Заблокировать удаление'} onClick={toggleLock}>{locked ? '🔒' : '🔓'}</button> : null}
-          <button className="ghost-button danger-button" type="button" disabled={locked} title={locked ? 'Удаление заблокировано админом' : label} onClick={() => setPendingDeleteKey(itemKey)}>{label}</button>
+          {admin && toggleLock ? <button className={locked ? 'ghost-button lock-button locked' : 'ghost-button lock-button'} type="button" title={locked ? t('common.unlockDeletion') : t('common.lockDeletion')} onClick={toggleLock}>{locked ? '🔒' : '🔓'}</button> : null}
+          <button className="ghost-button danger-button" type="button" disabled={locked} title={locked ? t('common.deletionLocked') : label} onClick={() => setPendingDeleteKey(itemKey)}>{label}</button>
         </span>
       )}
     </span>
@@ -6814,6 +6967,7 @@ function Option({ title, text, active = false }: { title: string; text: string; 
 }
 
 function CharacterCardView({ active = false, editing = false, card, onSelect, onEdit, onDelete, openImagePreview, imageSrc = (src) => src, deleteLocked = false, admin = false, pendingDeleteKey = '', setPendingDeleteKey = () => undefined, toggleDeleteLock }: { active?: boolean; editing?: boolean; card: CharacterCard; onSelect?: (card: CharacterCard) => Promise<void>; onEdit?: (card: CharacterCard) => void; onDelete?: (card: CharacterCard) => Promise<void>; openImagePreview?: (src: string, title: string) => void; imageSrc?: (src: string) => string; deleteLocked?: boolean; admin?: boolean; pendingDeleteKey?: string; setPendingDeleteKey?: (key: string) => void; toggleDeleteLock?: () => void }) {
+  const { t } = useLocaleContext();
   const tags = card.tags.slice(0, 4);
   return (
     <article className={`${active ? 'character-card-view active' : 'character-card-view'}${editing ? ' editing' : ''}`}>
@@ -6823,12 +6977,12 @@ function CharacterCardView({ active = false, editing = false, card, onSelect, on
           <strong>{card.name}</strong>
           {tags.length ? <div className="card-tag-list card-title-tags">{tags.map((tag) => <span key={tag}>{tag}</span>)}</div> : null}
         </div>
-        <TokenBadge count={cardTokenCount(card)} label="токенов" />
-        <p>{card.description || card.first_message || 'Описание отсутствует.'}</p>
+        <TokenBadge count={cardTokenCount(card)} label={t('common.tokens')} />
+        <p>{card.description || card.first_message || t('cards.noDescription')}</p>
         <div className="card-row-actions">
-          {onSelect ? <button type="button" onClick={() => void onSelect(card)}>{active ? 'Открыта' : 'Откр.'}</button> : null}
-          {onEdit ? <button className="ghost-button" type="button" onClick={() => onEdit(card)}>{editing ? 'Правится' : 'Прав.'}</button> : null}
-          {onDelete ? <DeleteConfirmButton itemKey={`card:${card.id}`} label="Удал." locked={deleteLocked} admin={admin} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={toggleDeleteLock} onConfirm={() => void onDelete(card)} /> : null}
+          {onSelect ? <button type="button" onClick={() => void onSelect(card)}>{active ? t('cards.opened') : t('cards.open')}</button> : null}
+          {onEdit ? <button className="ghost-button" type="button" onClick={() => onEdit(card)}>{editing ? t('cards.editing') : t('cards.edit')}</button> : null}
+          {onDelete ? <DeleteConfirmButton itemKey={`card:${card.id}`} label={t('common.deleteShort')} locked={deleteLocked} admin={admin} pendingDeleteKey={pendingDeleteKey} setPendingDeleteKey={setPendingDeleteKey} toggleLock={toggleDeleteLock} onConfirm={() => void onDelete(card)} /> : null}
         </div>
       </div>
     </article>
@@ -6840,5 +6994,6 @@ function EmptyLibrary({ text }: { text: string }) {
 }
 
 function AccessDeniedNotice() {
-  return <p className="empty-library access-denied">{accessDeniedText}</p>;
+  const { t } = useLocaleContext();
+  return <p className="empty-library access-denied">{t('accessDenied.description')}</p>;
 }
