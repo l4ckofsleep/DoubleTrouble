@@ -264,6 +264,10 @@
   --teal-border: #7d3030;
 }
 
+:root[data-theme="noir"] .message-content q {
+  color: var(--teal);
+}
+
 :root[data-theme="cyberpunk"] {
   --bg: #10071f;
   --surface: #170b29;
@@ -1929,8 +1933,13 @@ textarea {
   color: var(--SmartThemeEmColor);
 }
 
+.message-content strong {
+  color: var(--muted);
+}
+
 .message-content q {
-  color: var(--SmartThemeQuoteColor);
+  color: var(--accent);
+  quotes: none;
 }
 
 .message-content q i,
@@ -1943,7 +1952,7 @@ textarea {
 }
 
 .message-content blockquote {
-  border-left: 3px solid var(--SmartThemeQuoteColor);
+  border-left: 3px solid var(--accent);
   margin: 0;
   padding-left: 0.7rem;
   background: color-mix(in srgb, var(--surface-2) 55%, transparent);
@@ -2664,12 +2673,48 @@ textarea {
 }
 
 .menu-list {
-  display: grid;
-  align-content: start;
+  display: flex;
+  flex-direction: column;
   gap: var(--ui-gap);
   overflow-y: auto;
   scrollbar-gutter: stable;
   padding: 0.15rem 0.3rem 0.15rem 0.15rem;
+}
+
+.language-selector {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.4rem;
+  margin-top: auto;
+  padding-top: 0.4rem;
+}
+
+.lang-button {
+  appearance: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 0.45rem 0.2rem;
+  cursor: pointer;
+  transition: background-color 160ms ease, border-color 160ms ease, color 140ms ease, box-shadow 200ms ease;
+  box-shadow: inset 0 1px 0 var(--inset-highlight);
+}
+
+.lang-button:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+  background: var(--surface-3);
+}
+
+.lang-button.active {
+  border-color: var(--accent-muted-border);
+  background: var(--accent-bg);
+  color: var(--accent);
+  box-shadow: inset 0 1px 0 var(--inset-highlight), 0 0 0 3px var(--accent-glow);
 }
 
 .menu-card {
@@ -5353,6 +5398,271 @@ a:focus-visible,
 :root[data-theme="morning"],
 :root[data-theme="paper"] {
   --inset-shadow: color-mix(in srgb, var(--text) 8%, transparent);
-  --shadow-soft: 0 6px 18px rgba(0, 0, 0, 0.08), 0 2px 4px rgba(0, 0, 0, 0.05);
-  --shadow-strong: 0 24px 56px rgba(0, 0, 0, 0.16), 0 8px 18px rgba(0, 0, 0, 0.08);
+}
+
+/* --- Regex Settings UI --- */
+.regex-settings {
+  padding: var(--panel-pad);
+  display: flex;
+  flex-direction: column;
+  gap: var(--ui-gap);
+}
+
+.regex-settings-header h3 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.regex-allow-toggles {
+  display: flex;
+  gap: 1.2rem;
+  flex-wrap: wrap;
+}
+
+.regex-allow-toggles label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.regex-script-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  padding: var(--card-pad);
+  background: var(--surface-2);
+}
+
+.regex-script-list h4 {
+  margin: 0 0 0.25rem;
+  font-size: 0.95rem;
+}
+
+.regex-empty {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin: 0.25rem 0;
+}
+
+.regex-script-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.45rem 0.5rem;
+  border-radius: var(--radius-control);
+  background: var(--surface-3);
+}
+
+.regex-script-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+  flex: 1;
+  min-width: 0;
+}
+
+.regex-script-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.9rem;
+}
+
+.regex-script-meta small {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.regex-script-actions {
+  display: flex;
+  gap: 0.3rem;
+  flex-shrink: 0;
+}
+
+.regex-script-actions button {
+  padding: 0.25rem 0.45rem;
+  font-size: 0.8rem;
+  border-radius: var(--radius-control);
+}
+
+.regex-add-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.regex-add-row button {
+  font-size: 0.85rem;
+}
+
+.regex-editor-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--scrim);
+  backdrop-filter: blur(6px) saturate(120%);
+  -webkit-backdrop-filter: blur(6px) saturate(120%);
+  display: grid;
+  place-items: center;
+  z-index: 1000;
+  padding: 1rem;
+}
+
+.regex-editor-panel {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-panel);
+  padding: var(--panel-pad);
+  width: min(720px, 100%);
+  max-height: 90vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--ui-gap);
+  box-shadow: var(--shadow-strong);
+}
+
+.regex-editor-panel h3 {
+  margin: 0;
+}
+
+.regex-editor-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.regex-editor-fields label,
+.regex-editor-fields .regex-placements,
+.regex-editor-fields .regex-checkboxes,
+.regex-editor-fields .regex-depth-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.88rem;
+}
+
+.regex-editor-fields input,
+.regex-editor-fields textarea,
+.regex-editor-fields select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  padding: 0.45rem 0.6rem;
+  color: var(--text);
+  font-size: 0.9rem;
+}
+
+.regex-editor-fields textarea {
+  resize: vertical;
+}
+
+.regex-checkboxes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1.2rem !important;
+  flex-direction: row !important;
+}
+
+.regex-checkboxes label {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 0.35rem;
+  cursor: pointer;
+}
+
+.regex-depth-row {
+  flex-direction: row !important;
+  gap: 1rem;
+}
+
+.regex-depth-row label {
+  flex: 1;
+}
+
+.regex-placements {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem !important;
+  flex-direction: row !important;
+  align-items: center;
+}
+
+.regex-placements span {
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.regex-placements label {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 0.35rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.regex-editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+/* --- Regex Preset Manager --- */
+.regex-preset-manager {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  padding: var(--card-pad);
+  background: var(--surface-2);
+  margin-top: 0.5rem;
+}
+
+.regex-preset-manager h4 {
+  margin: 0 0 0.25rem;
+  font-size: 0.95rem;
+}
+
+.regex-preset-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.45rem 0.5rem;
+  border-radius: var(--radius-control);
+  background: var(--surface-3);
+}
+
+.regex-preset-name {
+  font-size: 0.9rem;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.regex-preset-meta {
+  color: var(--muted);
+  font-size: 0.75rem;
+  flex-shrink: 0;
+}
+
+.regex-preset-actions {
+  display: flex;
+  gap: 0.3rem;
+  flex-shrink: 0;
+}
+
+.regex-preset-actions button {
+  padding: 0.25rem 0.45rem;
+  font-size: 0.8rem;
+  border-radius: var(--radius-control);
 }

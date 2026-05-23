@@ -200,5 +200,6 @@
     "continue_prefill": false,
     "continue_postfix": " ",
     "seed": -1,
-    "n": 1
+    "n": 1,
+    "show_thoughts": true
 }
