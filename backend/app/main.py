@@ -129,6 +129,24 @@ class ExtensionFileUpload(BaseModel):
     data: str
 
 
+class MagicTranslationRequest(BaseModel):
+    text: str
+    prompt: str
+    target_language: str
+    filter_code_block: bool = True
+    max_tokens: int = 4096
+    temperature: float = 0.3
+    chat_context: list[dict[str, str]] = Field(default_factory=list)
+    message_name: str = ""
+    # Optional connection profile override
+    provider: str = ""
+    base_url: str = ""
+    model: str = ""
+    api_key: str = ""
+    timeout_seconds: float = 60.0
+    source_settings: dict[str, Any] = Field(default_factory=dict)
+
+
 async def _broadcast_chat(card_id: str, chat_id: str) -> None:
     chat = bot_chats_service.get_chat(card_id, chat_id)
     await connection_manager.broadcast(
@@ -1438,6 +1456,50 @@ def _image_models_provider_error(response: httpx.Response, url: str) -> dict[str
         reason = response.reason_phrase or "HTTP error"
         detail = f"{response.status_code} {reason}"
     return {"status_code": response.status_code, "error": f"Провайдер не отдал список моделей ({detail}) для {url}"}
+
+
+@app.post("/api/magic-translation/translate")
+async def magic_translation_translate(payload: MagicTranslationRequest, request: Request) -> dict[str, object]:
+    _require_permission(request, "generate")
+    try:
+        from backend.app.llm.base import ChatMessage
+        from backend.app.config import GenerationConfig
+        chat_messages = [ChatMessage(role="user", content=payload.text)]
+        if payload.prompt:
+            rendered = payload.prompt.replace("{{prompt}}", payload.text).replace("{{language}}", payload.target_language)
+            if payload.chat_context:
+                for i, ctx in enumerate(payload.chat_context[-3:]):
+                    rendered = rendered.replace(f"{{chat_{i + 1}}}", ctx.get("mes", ""))
+            rendered = rendered.replace("{{name}}", payload.message_name or "User")
+            chat_messages = [ChatMessage(role="user", content=rendered)]
+        if payload.provider:
+            profile_config = GenerationConfig(
+                provider=payload.provider,
+                base_url=payload.base_url,
+                model=payload.model,
+                api_key_secret="magic_translation_api_key",
+                api_key_env="",
+                temperature=payload.temperature,
+                max_tokens=payload.max_tokens,
+                timeout_seconds=payload.timeout_seconds,
+                source_settings=payload.source_settings,
+            )
+            if payload.api_key:
+                secret_store.write("magic_translation_api_key", payload.api_key)
+            response_text = await generation_service.raw_generate_with_config(chat_messages, profile_config)
+        else:
+            response_text = await generation_service.raw_generate(chat_messages, max_tokens=payload.max_tokens, temperature=payload.temperature)
+        if payload.filter_code_block:
+            code_block_match = re.search(r"^(?:[^`]*?)\n?```[\s\S]*?\n([\s\S]*?)```(?!\s*```)", response_text)
+            if code_block_match:
+                response_text = code_block_match.group(1).strip()
+        return {"ok": True, "text": response_text}
+    except httpx.HTTPStatusError as error:
+        raise HTTPException(status_code=502, detail=f"Provider returned {error.response.status_code}: {error.response.text}") from error
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=502, detail=f"Provider error: {error}") from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Translation failed: {error}") from error
 
 
 @app.get("/api/presets/types")

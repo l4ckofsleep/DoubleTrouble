@@ -33,6 +33,51 @@ class GenerationService:
             return {"ok": False, "provider": self.config.provider, "error": "generation provider is disabled"}
         return await self._provider().status()
 
+    async def raw_generate(self, messages: list[ChatMessage], max_tokens: int | None = None, temperature: float | None = None) -> str:
+        if not self.is_enabled():
+            raise RuntimeError("Generation provider is disabled. Configure it in the frontend settings first.")
+
+        request = GenerationRequest(
+            model=self.config.model,
+            messages=messages,
+            temperature=temperature if temperature is not None else self.config.temperature,
+            max_tokens=max_tokens if max_tokens is not None else self.config.max_tokens,
+            parameters=self.config.parameters,
+        )
+        return await self._provider().generate(request)
+
+    async def raw_generate_with_config(self, messages: list[ChatMessage], config: GenerationConfig) -> str:
+        request = GenerationRequest(
+            model=config.model,
+            messages=messages,
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
+            parameters=config.parameters,
+        )
+        provider = self._build_provider_for_config(config)
+        return await provider.generate(request)
+
+    def _build_provider_for_config(self, config: GenerationConfig):
+        if config.provider == "disabled":
+            raise RuntimeError("Unsupported generation provider: disabled")
+        source_id = config.chat_completion_source or resolve_source_id(config.provider)
+        source = get_source(source_id)
+        api_key = ""
+        if source and source.secret_key_name:
+            api_key = self.secret_store.read(source.secret_key_name, source.api_key_env)
+        if not api_key:
+            api_key = self.secret_store.read(config.api_key_secret, config.api_key_env)
+        proxy_password = self.secret_store.read(config.proxy_password_secret, "") if config.reverse_proxy else ""
+        return build_provider(
+            source_id,
+            base_url=config.base_url,
+            api_key=api_key,
+            timeout_seconds=config.timeout_seconds,
+            extra_settings=(config.source_settings or {}).get(source_id, {}),
+            reverse_proxy=config.reverse_proxy,
+            proxy_password=proxy_password,
+        )
+
     async def generate_reply(self, session_id: str) -> Message:
         if not self.is_enabled():
             raise RuntimeError("Generation provider is disabled. Configure it in the frontend settings first.")
