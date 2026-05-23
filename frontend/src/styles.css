@@ -5666,3 +5666,69 @@ a:focus-visible,
   font-size: 0.8rem;
   border-radius: var(--radius-control);
 }
+
+/* --- Magic Translation Settings UI --- */
+.magic-translation-settings {
+  padding: var(--panel-pad);
+  display: flex;
+  flex-direction: column;
+  gap: var(--ui-gap);
+}
+
+.magic-translation-settings-header h3 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.magic-translation-settings label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.9rem;
+}
+
+.magic-translation-settings select,
+.magic-translation-settings textarea {
+  font-size: 0.9rem;
+}
+
+.magic-translation-preset-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.magic-translation-preset-manager {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.magic-translation-preset-manager select {
+  width: 100%;
+}
+
+.preset-actions {
+  display: flex;
+  gap: 0.3rem;
+  flex-wrap: wrap;
+}
+
+.title-restorable {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+
+.magic-translation-prompt {
+  font-family: monospace;
+  resize: vertical;
+}
+
+.magic-translation-settings .checkbox_label {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+}

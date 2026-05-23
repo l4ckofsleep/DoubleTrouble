@@ -1,0 +1,12 @@
+{
+    "display_name": "Magic Translation",
+    "loading_order": 300,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "bmen25124 (builtin port)",
+    "version": "0.1.1-builtin",
+    "homePage": "https://github.com/bmen25124/SillyTavern-Magic-Translation",
+    "auto_update": false
+}

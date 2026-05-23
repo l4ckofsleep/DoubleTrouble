@@ -2,7 +2,9 @@ import { Fragment, useEffect, useRef, useState, type MouseEvent, type ReactNode 
 import { createPortal } from 'react-dom';
 import { emitSillyTavernChatChanged, emitSillyTavernMessageRendered, emitSillyTavernMessageSwiped, formatExtensionMessageHtml, initSillyTavernExtensions, updateSillyTavernExtensionSettings, updateSillyTavernRuntime, type ExtensionMessageFormatOptions } from './sillyTavernExtensions';
 import { getRegexedString, getRegexScripts, regex_placement, setRegexContext, setRegexNames } from './regexEngine';
-import { RegexSettings } from './RegexSettings';
+import { RegexSettingsPortal } from './RegexSettings';
+import { MagicTranslationSettingsPortal } from './MagicTranslationSettings';
+import { loadMagicTranslationSettings, translateText } from './magicTranslationEngine';
 import { useLocaleContext, type Language } from './localization';
 
 type MenuSection = 'presets' | 'connection' | 'visual' | 'personas' | 'security' | 'lorebooks' | 'cards' | 'extensions';
@@ -73,6 +75,7 @@ type ChatMessage = {
   username: string;
   is_admin: boolean;
   content: string;
+  display_text: string;
   hidden: boolean;
   swipes?: string[];
   active_swipe_index?: number;
@@ -209,7 +212,7 @@ type PermissionRule = { mode: PermissionMode; users: string[] };
 type SecurityPermissions = Record<string, PermissionRule>;
 type AccessDeniedState = { cards: boolean; personas: boolean; chats: boolean; presets: boolean; lorebooks: boolean };
 type DeletionLocks = { cards: string[]; personas: string[]; chats: string[] };
-type BuiltInExtensionSettings = { noriMynInfoblock: boolean };
+type BuiltInExtensionSettings = { noriMynInfoblock: boolean; magicTranslation: boolean };
 type ImageExtensionSettings = { apiType: string; endpoint: string; model: string; apiKey: string };
 type ImageEndpointPreset = { name: string; apiType: string; endpoint: string; model: string };
 type ImageKeyRecord = { id: string; name: string; value: string; active: boolean };
@@ -328,7 +331,7 @@ function getPermissionLabels(t: (key: string) => string): Record<string, string>
 const defaultSecurityPermissionKeys = ['view_cards', 'view_personas', 'view_chats', 'view_presets', 'view_lorebooks', 'edit_cards', 'delete_cards', 'edit_personas', 'delete_personas', 'manage_chats', 'edit_messages', 'delete_messages', 'generate', 'manage_presets', 'manage_lorebooks', 'manage_extensions', 'manage_keys', 'manage_security'];
 const defaultSecurityPermissions: SecurityPermissions = Object.fromEntries(defaultSecurityPermissionKeys.map((key) => [key, { mode: key === 'manage_security' || key === 'manage_keys' ? 'admins' : 'everyone', users: [] }])) as SecurityPermissions;
 const defaultDeletionLocks: DeletionLocks = { cards: [], personas: [], chats: [] };
-const defaultBuiltInExtensionSettings: BuiltInExtensionSettings = { noriMynInfoblock: true };
+const defaultBuiltInExtensionSettings: BuiltInExtensionSettings = { noriMynInfoblock: true, magicTranslation: true };
 const defaultImageExtensionSettings: ImageExtensionSettings = { apiType: 'openai', endpoint: '', model: '', apiKey: '' };
 const EXTENSION_SETTINGS_STORAGE_KEY = 'doubletrouble.sillyTavernExtensionSettings';
 const IMAGE_ENDPOINTS_STORAGE_KEY = 'doubletrouble.imageEndpoints';
@@ -529,6 +532,8 @@ function getSlashCommands(t: (key: string) => string) {
     { command: '/reroll', hint: '', description: t('commands.rerollLast') },
     { command: '/copy', hint: '0-5', description: t('commands.copyMessages') },
     { command: '/help', hint: '', description: t('commands.showHelp') },
+    { command: '/magic-translate', hint: '0', description: t('commands.magicTranslate') },
+    { command: '/magic-translate-text', hint: '<text>', description: t('commands.magicTranslateText') },
   ];
 }
 
@@ -2590,7 +2595,18 @@ export default function App() {
     if (!activeCard || !activeChat) {
       return;
     }
-    const content = getRegexedString(chatInput, regex_placement.USER_INPUT);
+    let content = getRegexedString(chatInput, regex_placement.USER_INPUT);
+    const mtSettings = loadMagicTranslationSettings();
+    if (mtSettings.autoMode === 'inputs' || mtSettings.autoMode === 'both') {
+      try {
+        const translated = await translateText(content, mtSettings, activeMessages.map((m) => ({ name: m.author, mes: m.content })), selectedPersona?.name || 'Player');
+        if (translated) {
+          content = translated;
+        }
+      } catch {
+        // silently fall back to original content on translation failure
+      }
+    }
     setChatInput('');
     const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/messages`, {
       method: 'POST',
@@ -2725,7 +2741,55 @@ export default function App() {
       setLibraryMessage(t('message.copied'));
       return;
     }
-      setLibraryMessage(t('commands.unknown'));
+    if (command === '/magic-translate') {
+      const msgIndex = argText ? Number(argText) : activeMessages.length - 1;
+      const message = activeMessages[msgIndex];
+      if (!message) {
+        setLibraryMessage(t('commands.messageNotFound'));
+        return;
+      }
+      setChatInput('');
+      setLibraryMessage(t('commands.translating'));
+      try {
+        const settings = loadMagicTranslationSettings();
+        const translated = await translateText(message.content, settings, activeMessages.map((m) => ({ name: m.author, mes: m.content })), message.author);
+        if (translated) {
+          if (message.role === 'user') {
+            await updateMessageContent(message.id, translated);
+          } else {
+            await updateMessageDisplayText(message.id, translated);
+          }
+          setLibraryMessage(t('commands.translated'));
+        } else {
+          setLibraryMessage(t('commands.translateFailed'));
+        }
+      } catch (error) {
+        setLibraryMessage(`${t('commands.translateFailed')}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    if (command === '/magic-translate-text') {
+      if (!argText) {
+        setLibraryMessage(t('commands.provideText'));
+        return;
+      }
+      setChatInput('');
+      setLibraryMessage(t('commands.translating'));
+      try {
+        const settings = loadMagicTranslationSettings();
+        const translated = await translateText(argText, settings);
+        if (translated) {
+          setChatInput(translated);
+          setLibraryMessage(t('commands.translated'));
+        } else {
+          setLibraryMessage(t('commands.translateFailed'));
+        }
+      } catch (error) {
+        setLibraryMessage(`${t('commands.translateFailed')}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    setLibraryMessage(t('commands.unknown'));
   };
 
   const startEditMessage = (message: ChatMessage) => {
@@ -2757,6 +2821,61 @@ export default function App() {
     setActiveChat(data.chat);
     setEditingMessageId('');
     setEditingMessageText('');
+  };
+
+  const handleMagicTranslateMessage = async (message: ChatMessage) => {
+    if (!activeCard || !activeChat) return;
+    if (message.display_text) {
+      await updateMessageDisplayText(message.id, '');
+      return;
+    }
+    setLibraryMessage(t('commands.translating'));
+    try {
+      const settings = loadMagicTranslationSettings();
+      const translated = await translateText(message.content, settings, activeMessages.map((m) => ({ name: m.author, mes: m.content })), message.author);
+      if (translated) {
+        if (message.role === 'user') {
+          await updateMessageContent(message.id, translated);
+        } else {
+          await updateMessageDisplayText(message.id, translated);
+        }
+        setLibraryMessage(t('commands.translated'));
+      } else {
+        setLibraryMessage(t('commands.translateFailed'));
+      }
+    } catch (error) {
+      setLibraryMessage(`${t('commands.translateFailed')}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const updateMessageContent = async (messageId: string, content: string) => {
+    if (!activeCard || !activeChat) return;
+    const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/messages/${encodeURIComponent(messageId)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', ...actorHeaders() },
+      body: JSON.stringify({ content }),
+    });
+    if (!response.ok) {
+      setLibraryMessage(t('message.error.edit'));
+      return;
+    }
+    const data = await response.json() as { chat: BotChat };
+    setActiveChat(data.chat);
+  };
+
+  const updateMessageDisplayText = async (messageId: string, displayText: string) => {
+    if (!activeCard || !activeChat) return;
+    const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/messages/${encodeURIComponent(messageId)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', ...actorHeaders() },
+      body: JSON.stringify({ display_text: displayText }),
+    });
+    if (!response.ok) {
+      setLibraryMessage(t('message.error.edit'));
+      return;
+    }
+    const data = await response.json() as { chat: BotChat };
+    setActiveChat(data.chat);
   };
 
   const toggleMessageHidden = async (message: ChatMessage) => {
@@ -2845,6 +2964,31 @@ export default function App() {
       const data = await response.json() as { chat: BotChat };
       setActiveChat(data.chat);
       setLibraryMessage(replaceMessageId ? t('message.rerollAdded') : t('message.botReplyAdded'));
+      const mtSettings = loadMagicTranslationSettings();
+      if ((mtSettings.autoMode === 'responses' || mtSettings.autoMode === 'both') && data.chat) {
+        const lastBotMessage = [...data.chat.messages].reverse().find((m) => m.role === 'assistant');
+        if (lastBotMessage && activeCard) {
+          try {
+            const translated = await translateText(lastBotMessage.content, mtSettings, data.chat.messages.map((m) => ({ name: m.author, mes: m.content })), lastBotMessage.author);
+            if (translated) {
+              await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(data.chat.id)}/messages/${encodeURIComponent(lastBotMessage.id)}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', ...actorHeaders() },
+                body: JSON.stringify({ display_text: translated }),
+              });
+              setActiveChat((current) => {
+                if (!current || current.id !== data.chat.id) return current;
+                return {
+                  ...current,
+                  messages: current.messages.map((m) => m.id === lastBotMessage.id ? { ...m, display_text: translated } : m),
+                };
+              });
+            }
+          } catch {
+            // silently ignore auto translation failure
+          }
+        }
+      }
     } finally {
       activeGenerationRef.current = false;
       setIsGenerating(false);
@@ -3055,7 +3199,8 @@ export default function App() {
               const swipeCount = message.swipes?.length ?? 0;
               const canSwipe = message.role === 'assistant' && swipeCount > 1;
               const isImagePending = Boolean(activeCard && activeChat && imagePendingMessages[imagePendingKey(activeCard.id, activeChat.id, message.id)]);
-              const visibleMessageContent = generationReplaceMessageId === message.id && generationStreamText ? generationStreamText : message.content;
+              const displayContent = message.display_text || message.content;
+              const visibleMessageContent = generationReplaceMessageId === message.id && generationStreamText ? generationStreamText : displayContent;
               return (
                <article
                  className={messageClass}
@@ -3100,6 +3245,7 @@ export default function App() {
                   {canSwipe ? <small className="swipe-counter">{(message.active_swipe_index ?? 0) + 1}/{swipeCount}</small> : null}
                   {message.role === 'assistant' ? <button className="mes_button" type="button" title={t('message.swipe.new')} onClick={() => void requestBotReply(message.id)}>↻</button> : null}
                   {isImagePending ? <button className="mes_button" type="button" title={t('message.cancelImage')} onClick={() => cancelImageGeneration(messageIndex, message)}><Icon name="x" /></button> : null}
+                  <button className="mes_button" type="button" title={t('message.translate')} onClick={() => void handleMagicTranslateMessage(message)}>🌐</button>
                   <button className="mes_button" type="button" title={t('message.edit')} onClick={() => startEditMessage(message)}><Icon name="edit" /></button>
                   <button className="mes_button" type="button" title={message.hidden ? t('common.show') : t('common.hide')} onClick={() => void toggleMessageHidden(message)}><Icon name={message.hidden ? 'eye' : 'eyeOff'} /></button>
                   <button className="mes_button" type="button" title={t('message.delete')} onClick={() => void deleteChatMessage(message)}><Icon name="trash" /></button>
@@ -4278,6 +4424,14 @@ function ExtensionsManager() {
           return nextSettings;
         });
       }
+      const magicTranslationExtension = data.extensions.find((extension) => extension.name === 'magic-translation' || extension.external_name.includes('magic-translation'));
+      if (magicTranslationExtension) {
+        setBuiltInSettings((current) => {
+          const nextSettings = { ...current, magicTranslation: magicTranslationExtension.enabled };
+          window.localStorage.setItem(BUILT_IN_EXTENSIONS_STORAGE_KEY, JSON.stringify(nextSettings));
+          return nextSettings;
+        });
+      }
       setMessage('');
     } finally {
       setLoading(false);
@@ -4321,6 +4475,16 @@ function ExtensionsManager() {
       return;
     }
     const nextSettings = { ...builtInSettings, noriMynInfoblock: enabled };
+    setBuiltInSettings(nextSettings);
+    window.localStorage.setItem(BUILT_IN_EXTENSIONS_STORAGE_KEY, JSON.stringify(nextSettings));
+    setMessage(`${enabled ? t('common.enabled') : t('common.disabled')}. ${t('extensions.newMessagesApply')}`);
+  };
+
+  const setMagicTranslationEnabled = async (extension: ExtensionSummary | null, enabled: boolean) => {
+    if (extension && !(await setEnabled(extension, enabled))) {
+      return;
+    }
+    const nextSettings = { ...builtInSettings, magicTranslation: enabled };
     setBuiltInSettings(nextSettings);
     window.localStorage.setItem(BUILT_IN_EXTENSIONS_STORAGE_KEY, JSON.stringify(nextSettings));
     setMessage(`${enabled ? t('common.enabled') : t('common.disabled')}. ${t('extensions.newMessagesApply')}`);
@@ -4400,9 +4564,11 @@ function ExtensionsManager() {
   };
 
   const inlineImageExtension = extensions.find((extension) => extension.name === 'sillyimages' || extension.external_name.includes('sillyimages')) || null;
+  const magicTranslationExtension = extensions.find((extension) => extension.name === 'magic-translation' || extension.external_name.includes('magic-translation')) || null;
+  const magicTranslationEnabled = magicTranslationExtension?.enabled ?? builtInSettings.magicTranslation;
   const noriMynExtension = extensions.find((extension) => extension.name === 'norimyn-infoblock' || extension.external_name.includes('norimyn-infoblock')) || null;
   const noriMynEnabled = noriMynExtension?.enabled ?? builtInSettings.noriMynInfoblock;
-  const thirdPartyExtensions = extensions.filter((extension) => extension.type !== 'system' && extension !== inlineImageExtension && extension !== noriMynExtension);
+  const thirdPartyExtensions = extensions.filter((extension) => extension.type !== 'system' && extension !== inlineImageExtension && extension !== magicTranslationExtension && extension !== noriMynExtension);
 
   return (
     <section className="extensions-manager">
@@ -4475,6 +4641,18 @@ function ExtensionsManager() {
           saveImageSettings={saveImageSettings}
           applyImageKey={applyImageKey}
         />
+        <article className={magicTranslationEnabled ? 'extension-row enabled' : 'extension-row'}>
+          <div className="extension-row-main">
+            <strong>Magic Translation</strong>
+            <small>{t('extensions.magicTranslationDesc')}</small>
+          </div>
+          <div className="extension-row-actions">
+            <span className={magicTranslationEnabled ? 'extension-status enabled' : 'extension-status'}>{magicTranslationEnabled ? t('common.enabled') : t('common.disabled')}</span>
+            <button className="ghost-button" type="button" disabled={loading || !magicTranslationEnabled} onClick={() => window.dispatchEvent(new CustomEvent('doubletrouble:extension-settings-open', { detail: { name: 'magic-translation' } }))}>{t('common.settings')}</button>
+            <button type="button" disabled={loading} onClick={() => void setMagicTranslationEnabled(magicTranslationExtension, !magicTranslationEnabled)}>{magicTranslationEnabled ? t('common.disable') : t('common.enable')}</button>
+          </div>
+        </article>
+        <MagicTranslationSettingsPortal />
         <article className={noriMynEnabled ? 'extension-row enabled' : 'extension-row'}>
           <div className="extension-row-main">
             <strong>NoriMyn Infoblock</strong>
@@ -4492,9 +4670,10 @@ function ExtensionsManager() {
           </div>
           <div className="extension-row-actions">
             <span className="extension-status enabled">{t('extensions.alwaysEnabled')}</span>
+            <button className="ghost-button" type="button" onClick={() => window.dispatchEvent(new CustomEvent('doubletrouble:extension-settings-open', { detail: { name: 'regex' } }))}>{t('common.settings')}</button>
           </div>
         </article>
-        <RegexSettings />
+        <RegexSettingsPortal />
       </div>
     </section>
   );

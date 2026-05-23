@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   type RegexScript,
   type RegexPreset,
@@ -465,5 +466,24 @@ function PresetManager({ onApply }: { onApply: () => void }) {
         </div>
       )}
     </div>
+  );
+}
+
+export function RegexSettingsPortal() {
+  const [host, setHost] = useState<HTMLElement | null>(null);
+
+  useEffect(() => {
+    setHost(document.getElementById('extensions_settings'));
+  }, []);
+
+  if (!host) {
+    return null;
+  }
+
+  return createPortal(
+    <div className="regex-settings image-extension-settings-portal" data-dt-extension-owner="regex">
+      <RegexSettings />
+    </div>,
+    host,
   );
 }
