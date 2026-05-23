@@ -18,6 +18,7 @@ data/**/*.jpeg
 data/**/*.webp
 
 # Local config and secrets
+config/
 config/*.yaml
 config/*.yml
 TODO.md
