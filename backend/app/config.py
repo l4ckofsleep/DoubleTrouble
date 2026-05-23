@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal
 
+import secrets
+
 from pydantic import AliasChoices, BaseModel, Field
 import yaml
 
@@ -50,6 +52,9 @@ class GenerationConfig(BaseModel):
 class SecurityConfig(BaseModel):
     allow_key_checking: bool = True
     allow_external_connections: bool = False
+    cookie_auth: bool = False
+    cookie_secure: bool = False
+    cookie_samesite: Literal["strict", "lax", "none"] = "strict"
 
 
 class AppConfig(BaseModel):
@@ -79,6 +84,15 @@ def save_config(config: AppConfig, path: Path = DEFAULT_CONFIG_PATH) -> None:
 
     with path.open("w", encoding="utf-8") as config_file:
         yaml.safe_dump(data, config_file, sort_keys=False, allow_unicode=True)
+
+
+def ensure_admin_code(config: AppConfig, path: Path = DEFAULT_CONFIG_PATH) -> str | None:
+    if config.auth.admin_code and config.auth.admin_code != "123456":
+        return None
+    new_code = secrets.token_urlsafe(12)
+    config.auth.admin_code = new_code
+    save_config(config, path)
+    return new_code
 
 
 def _relative_to_project(path: Path) -> str:

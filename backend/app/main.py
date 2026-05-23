@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import asyncio
+import logging
 import re
 import time
 
@@ -15,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from backend.app.config import PROJECT_ROOT, load_config
+from backend.app.config import PROJECT_ROOT, ensure_admin_code, load_config
 from backend.app.models import ClientEvent, JoinSessionRequest, SendMessageRequest
 from pydantic import BaseModel, Field
 
@@ -24,6 +25,7 @@ from backend.app.services.character_cards_service import CharacterCardCreate, Ch
 from backend.app.realtime.connection_manager import ConnectionManager
 from backend.app.secrets import SecretStore
 from backend.app.services.generation_service import GenerationService
+from backend.app.services.regex_service import RegexService
 from backend.app.services.lorebooks_service import LorebookBindingPayload, LorebookPayload, LorebooksService
 from backend.app.services.extensions_service import ExtensionInstallRequest, ExtensionsService
 from backend.app.llm.chat_completion_sources import build_provider, get_source, list_sources_payload, resolve_source_id
@@ -37,6 +39,12 @@ from backend.app.storage.file_storage import FileStorage
 
 
 config = load_config()
+generated_admin_code = ensure_admin_code(config, PROJECT_ROOT / "config" / "config.yaml")
+if generated_admin_code:
+    logging.getLogger(__name__).warning("Generated new admin code: %s", generated_admin_code)
+    admin_code_file = PROJECT_ROOT / "config" / ".admin_code.txt"
+    admin_code_file.write_text(f"Admin code: {generated_admin_code}\n", encoding="utf-8")
+    logging.getLogger(__name__).warning("Admin code written to: %s", admin_code_file)
 storage = FileStorage(config.storage.data_root, config.storage.default_user)
 session_service = SessionService(storage)
 secret_store = SecretStore(storage.user_root / "secrets.yaml")
@@ -75,6 +83,7 @@ class BotReplyRequest(BaseModel):
     persona_name: str | None = None
     persona_description: str | None = None
     participants: list[GenerationParticipantRequest] = Field(default_factory=list)
+    regex_scripts: list[dict[str, object]] = Field(default_factory=list)
 
 
 class AuthRequest(BaseModel):
@@ -187,7 +196,32 @@ def _access_token_from_request(request: Request) -> str:
     return request.headers.get("x-doubletrouble-access", "").strip() or str(request.cookies.get("doubletrouble_access") or "").strip()
 
 
+AUTH_RATE_LIMIT_MAX = 5
+AUTH_RATE_LIMIT_WINDOW = 60.0
+_auth_rate_limit_store: dict[str, list[float]] = {}
+
+
+def _check_auth_rate_limit(client_ip: str) -> None:
+    now = time.time()
+    _auth_rate_limit_store.setdefault(client_ip, [t for t in _auth_rate_limit_store.get(client_ip, []) if now - t < AUTH_RATE_LIMIT_WINDOW])
+    if len(_auth_rate_limit_store[client_ip]) >= AUTH_RATE_LIMIT_MAX:
+        raise HTTPException(status_code=429, detail="Too many auth attempts")
+    _auth_rate_limit_store[client_ip].append(now)
+
+
+def _check_csrf(request: Request) -> None:
+    if not config.security.cookie_auth or request.method in ("GET", "HEAD", "OPTIONS"):
+        return
+    origin = request.headers.get("origin", "")
+    if not origin:
+        return
+    expected = str(request.base_url).rstrip("/")
+    if origin != expected:
+        raise HTTPException(status_code=403, detail="Invalid origin")
+
+
 def _require_access_password(request: Request) -> None:
+    _check_csrf(request)
     if settings_service.access_password_required() and not settings_service.verify_access_token(_access_token_from_request(request)):
         raise HTTPException(status_code=403, detail="Access password required")
 
@@ -410,6 +444,21 @@ class UploadSizeLimitMiddleware:
         await self.app(scope, receive, send)
 
 
+class ExternalConnectionsMiddleware:
+    def __init__(self, app, **kwargs) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            client = scope.get("client")
+            client_ip = client[0] if client else "unknown"
+            if not config.security.allow_external_connections and client_ip not in ("127.0.0.1", "::1", "localhost"):
+                await send({"type": "http.response.start", "status": 403, "headers": [[b"content-type", b"text/plain"]]})
+                await send({"type": "http.response.body", "body": b"External connections are disabled", "more_body": False})
+                return
+        await self.app(scope, receive, send)
+
+
 class RateLimitMiddleware:
     def __init__(self, app, **kwargs) -> None:
         self.app = app
@@ -435,6 +484,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(ExternalConnectionsMiddleware)
 app.add_middleware(UploadSizeLimitMiddleware)
 app.add_middleware(RateLimitMiddleware)
 
@@ -941,6 +991,7 @@ async def public_config() -> dict[str, object]:
 
 @app.post("/api/auth/register")
 async def auth_register(payload: AuthRequest, request: Request, response: Response) -> dict[str, object]:
+    _check_auth_rate_limit(request.client.host if request.client else "unknown")
     _require_access_password(request)
     if not settings_service.registration_allowed():
         raise HTTPException(status_code=403, detail="Registration is disabled")
@@ -948,18 +999,35 @@ async def auth_register(payload: AuthRequest, request: Request, response: Respon
         user, token = auth_service.register(payload.username, payload.password)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    response.set_cookie("doubletrouble_auth_token", token, httponly=True, samesite="lax", path="/")
+    if config.security.cookie_auth:
+        response.set_cookie(
+            "doubletrouble_auth_token",
+            token,
+            httponly=True,
+            secure=config.security.cookie_secure,
+            samesite=config.security.cookie_samesite,
+            path="/",
+        )
     return {"token": token, "user": auth_service.public_user(user)}
 
 
 @app.post("/api/auth/login")
 async def auth_login(payload: AuthRequest, request: Request, response: Response) -> dict[str, object]:
+    _check_auth_rate_limit(request.client.host if request.client else "unknown")
     _require_access_password(request)
     try:
         user, token = auth_service.login(payload.username, payload.password)
     except ValueError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
-    response.set_cookie("doubletrouble_auth_token", token, httponly=True, samesite="lax", path="/")
+    if config.security.cookie_auth:
+        response.set_cookie(
+            "doubletrouble_auth_token",
+            token,
+            httponly=True,
+            secure=config.security.cookie_secure,
+            samesite=config.security.cookie_samesite,
+            path="/",
+        )
     return {"token": token, "user": auth_service.public_user(user)}
 
 
@@ -1003,6 +1071,15 @@ async def get_security_permissions() -> dict[str, object]:
     }
 
 
+@app.get("/api/security/config")
+async def get_security_config() -> dict[str, object]:
+    return {
+        "cookie_auth": config.security.cookie_auth,
+        "cookie_secure": config.security.cookie_secure,
+        "cookie_samesite": config.security.cookie_samesite,
+    }
+
+
 @app.get("/api/security/access")
 async def get_access_password_status(request: Request) -> dict[str, object]:
     required = settings_service.access_password_required()
@@ -1010,12 +1087,21 @@ async def get_access_password_status(request: Request) -> dict[str, object]:
 
 
 @app.post("/api/security/access")
-async def unlock_access_password(payload: AccessPasswordRequest, response: Response) -> dict[str, object]:
+async def unlock_access_password(payload: AccessPasswordRequest, request: Request, response: Response) -> dict[str, object]:
+    _check_auth_rate_limit(request.client.host if request.client else "unknown")
     try:
         token = settings_service.verify_access_password(payload.password)
     except ValueError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
-    response.set_cookie("doubletrouble_access", token, httponly=True, samesite="lax", path="/")
+    if config.security.cookie_auth:
+        response.set_cookie(
+            "doubletrouble_access",
+            token,
+            httponly=True,
+            secure=config.security.cookie_secure,
+            samesite=config.security.cookie_samesite,
+            path="/",
+        )
     return {"ok": True, "required": settings_service.access_password_required(), "token": token}
 
 
@@ -1646,6 +1732,11 @@ async def update_character_card(card_id: str, payload: CharacterCardUpdate, requ
         raise HTTPException(status_code=404, detail="Card not found") from error
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    for chat_summary in bot_chats_service.list_chats(card_id):
+        chat = bot_chats_service.get_chat(card_id, chat_summary.id)
+        if not any(message.role == "user" for message in chat.messages):
+            updated_chat = _ensure_card_first_message(card_id, chat.id)
+            await _broadcast_chat(card_id, updated_chat.id)
     await _broadcast_notification(f"обновил карточку: {card.name}", actor=_actor_from_request(request))
     return {"card": card.model_dump(mode="json")}
 
@@ -1844,7 +1935,27 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
         openai_preset = request.openai_preset if request and isinstance(request.openai_preset, dict) else _active_openai_preset()
         character_data = character_cards_service.card_data(card_id)
         persona_name, persona_description, multi_user_mode, persona_id = _generation_persona_context(request)
+        regex_scripts = request.regex_scripts if request else []
+        user_name = persona_name or "Player"
+        char_name = chat.character_name or "Bot"
+        if regex_scripts:
+            history = [
+                message.model_copy(update={"content": RegexService.get_regexed_string(message.content, RegexService.PLACEMENT_AI_OUTPUT, regex_scripts, is_prompt=True, user_name=user_name, char_name=char_name)})
+                for message in history
+            ]
         lorebook_context = lorebooks_service.active_context([message.content for message in history if not message.hidden], card_id, chat_id, persona_id or "")
+        if regex_scripts:
+            lorebook_context = lorebook_context.model_copy(update={
+                "worldInfoBefore": RegexService.get_regexed_string(lorebook_context.worldInfoBefore, RegexService.PLACEMENT_WORLD_INFO, regex_scripts, is_prompt=True, user_name=user_name, char_name=char_name),
+                "worldInfoAfter": RegexService.get_regexed_string(lorebook_context.worldInfoAfter, RegexService.PLACEMENT_WORLD_INFO, regex_scripts, is_prompt=True, user_name=user_name, char_name=char_name),
+                "depthPrompts": [
+                    {
+                        **dp,
+                        "content": RegexService.get_regexed_string(str(dp.get("content", "")), RegexService.PLACEMENT_WORLD_INFO, regex_scripts, is_prompt=True, user_name=user_name, char_name=char_name),
+                    }
+                    for dp in lorebook_context.depthPrompts
+                ],
+            })
         async def broadcast_stream(content: str) -> None:
             await _broadcast_generation_state(card_id, chat_id, "generation.stream", content, replace_message_id)
 
@@ -1858,6 +1969,8 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
         reply = await task
         if streaming_enabled:
             await _broadcast_generation_state(card_id, chat_id, "generation.stream", reply, replace_message_id)
+        if regex_scripts:
+            reply = RegexService.get_regexed_string(reply, RegexService.PLACEMENT_AI_OUTPUT, regex_scripts, is_prompt=False, user_name=user_name, char_name=char_name)
         avatar_url = next((card.image_url for card in character_cards_service.list_cards() if card.id == card_id), "")
         if replace_message_id:
             chat = bot_chats_service.replace_bot_message(card_id, chat_id, replace_message_id, chat.character_name, reply, avatar_url, reset_swipes)
