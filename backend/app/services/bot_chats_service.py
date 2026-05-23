@@ -22,6 +22,7 @@ class BotChatMessage(BaseModel):
     username: str = ""
     is_admin: bool = False
     content: str
+    display_text: str = ""
     hidden: bool = False
     swipes: list[str] = Field(default_factory=list)
     active_swipe_index: int = 0
@@ -69,6 +70,7 @@ class ChatMessageCreate(BaseModel):
 
 class ChatMessageUpdate(BaseModel):
     content: str | None = None
+    display_text: str | None = None
     hidden: bool | None = None
 
 
@@ -200,6 +202,8 @@ class BotChatsService:
                     if not content:
                         raise ValueError("Message content is required")
                     message.content = content
+                if request.display_text is not None:
+                    message.display_text = request.display_text.strip()
                 if request.hidden is not None:
                     message.hidden = request.hidden
                 message.updated_at = utc_now()
