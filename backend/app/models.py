@@ -42,7 +42,8 @@ class Message(BaseModel):
 class TurnState(BaseModel):
     current_participant_id: str | None = None
     order: list[str] = Field(default_factory=list)
-
+    mode: str = "free"
+    ready_participant_ids: list[str] = Field(default_factory=list)
 
 class Session(BaseModel):
     id: str
@@ -50,7 +51,8 @@ class Session(BaseModel):
     participants: dict[str, Participant] = Field(default_factory=dict)
     messages: list[Message] = Field(default_factory=list)
     turn: TurnState = Field(default_factory=TurnState)
-
+    active_card_id: str = ""
+    active_chat_id: str = ""
 
 class JoinSessionRequest(BaseModel):
     participant_id: str | None = None
@@ -76,3 +78,6 @@ class ClientEvent(BaseModel):
     avatar_url: str | None = None
     username: str | None = None
     is_admin: bool | None = None
+    is_typing: bool | None = None
+    turn_mode: str | None = None
+    ready: bool | None = None

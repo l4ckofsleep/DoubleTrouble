@@ -1,26 +1,41 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import asyncio
 import logging
+import os
 import re
 import time
 
 import httpx
 from pathlib import Path
-from urllib.parse import quote
-
+from typing import Any
+from urllib.parse import quote, unquote, urlparse
+from uuid import uuid4
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from backend.app.config import PROJECT_ROOT, ensure_admin_code, load_config
+from backend.app.config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, ensure_admin_code, load_config
 from backend.app.models import ClientEvent, JoinSessionRequest, SendMessageRequest
 from pydantic import BaseModel, Field
 
-from backend.app.services.bot_chats_service import BotChatsService, ChatCreate, ChatMessageCreate, ChatMessageUpdate, ChatSwipeRequest, ChatUpdate
+from backend.app.services.bot_chats_service import (
+    BotChatsService,
+    ChatBranchRequest,
+    ChatCreate,
+    ChatDiceRollRequest,
+    ChatMemoryUpdate,
+    ChatMessageCreate,
+    ChatMessageUpdate,
+    ChatSwipeRequest,
+    ChatSwipeVoteRequest,
+    ChatUpdate,
+    PartyHudState,
+)
 from backend.app.services.character_cards_service import CharacterCardCreate, CharacterCardsService, CharacterCardUpdate
 from backend.app.realtime.connection_manager import ConnectionManager
 from backend.app.secrets import SecretStore
@@ -33,16 +48,23 @@ from backend.app.llm.openai_compatible import OpenAICompatibleProvider
 from backend.app.services.personas_service import PersonaCreate, PersonasService, PersonaUpdate
 from backend.app.services.auth_service import AuthService, AuthUser
 from backend.app.services.presets_service import PresetPayload, PresetsService
-from backend.app.services.settings_service import GenerationPresetSave, GenerationSettingsUpdate, SecuritySettingsPayload, SettingsService
+from backend.app.services.settings_service import (
+    GenerationPresetSave,
+    GenerationSettingsUpdate,
+    SecuritySettingsPayload,
+    SettingsService,
+    SummaryMemorySettingsUpdate,
+)
 from backend.app.services.session_service import DEFAULT_SESSION_ID, SessionService
 from backend.app.storage.file_storage import FileStorage
 
 
 config = load_config()
-generated_admin_code = ensure_admin_code(config, PROJECT_ROOT / "config" / "config.yaml")
+generated_admin_code = ensure_admin_code(config, DEFAULT_CONFIG_PATH)
 if generated_admin_code:
     logging.getLogger(__name__).warning("Generated new admin code: %s", generated_admin_code)
-    admin_code_file = PROJECT_ROOT / "config" / ".admin_code.txt"
+    admin_code_file = DEFAULT_CONFIG_PATH.parent / ".admin_code.txt"
+    admin_code_file.parent.mkdir(parents=True, exist_ok=True)
     admin_code_file.write_text(f"Admin code: {generated_admin_code}\n", encoding="utf-8")
     logging.getLogger(__name__).warning("Admin code written to: %s", admin_code_file)
 storage = FileStorage(config.storage.data_root, config.storage.default_user)
@@ -84,7 +106,7 @@ class BotReplyRequest(BaseModel):
     persona_description: str | None = None
     participants: list[GenerationParticipantRequest] = Field(default_factory=list)
     regex_scripts: list[dict[str, object]] = Field(default_factory=list)
-
+    extension_prompts: list[dict[str, object]] = Field(default_factory=list)
 
 class AuthRequest(BaseModel):
     username: str
@@ -147,13 +169,45 @@ class MagicTranslationRequest(BaseModel):
     source_settings: dict[str, Any] = Field(default_factory=dict)
 
 
-async def _broadcast_chat(card_id: str, chat_id: str) -> None:
-    chat = bot_chats_service.get_chat(card_id, chat_id)
-    await connection_manager.broadcast(
-        DEFAULT_SESSION_ID,
-        {"type": "chat.updated", "card_id": card_id, "chat": chat.model_dump(mode="json")},
-    )
+def _session_id_from_request(request: Request | None = None) -> str:
+    if request is None:
+        return DEFAULT_SESSION_ID
+    header_sid = unquote(request.headers.get("x-doubletrouble-session", "").strip())
+    if header_sid:
+        return header_sid
+    query_sid = str(request.query_params.get("session_id") or "").strip()
+    return query_sid or DEFAULT_SESSION_ID
 
+def _target_sessions_for_chat(card_id: str, chat_id: str, primary_session_id: str = DEFAULT_SESSION_ID, switch_active: bool = False) -> set[str]:
+    targets = {primary_session_id or DEFAULT_SESSION_ID}
+    if not switch_active:
+        for sid, sess in session_service.sessions.items():
+            if sess.active_card_id == card_id and (not sess.active_chat_id or sess.active_chat_id == chat_id):
+                targets.add(sid)
+    return targets
+
+
+def _active_generation_keys() -> list[str]:
+    return [key for key, task in generation_tasks.items() if not task.done()]
+
+
+async def _broadcast_chat(card_id: str, chat_id: str, switch_active: bool = False, session_id: str = DEFAULT_SESSION_ID, chat: Any = None) -> None:
+    session_service.set_active_chat(session_id, card_id, chat_id)
+    resolved_chat = chat if chat is not None else bot_chats_service.get_chat(card_id, chat_id)
+    payload = {
+        "type": "chat.updated",
+        "card_id": card_id,
+        "chat": resolved_chat.model_dump(mode="json"),
+        "switch_active": switch_active,
+        "active_generations": _active_generation_keys(),
+    }
+    for target_sid in _target_sessions_for_chat(card_id, chat_id, session_id, switch_active):
+        await connection_manager.broadcast(target_sid, payload)
+def _card_avatar_url(card_id: str) -> str:
+    try:
+        return character_cards_service.get_card(card_id).image_url
+    except FileNotFoundError:
+        return ""
 
 def _ensure_card_first_message(card_id: str, chat_id: str) -> object:
     chat = bot_chats_service.get_chat(card_id, chat_id)
@@ -171,33 +225,59 @@ def _ensure_card_first_message(card_id: str, chat_id: str) -> object:
     greeting_swipes = [first_message, *alternate_greetings]
     if chat.messages:
         return bot_chats_service.sync_first_assistant_swipes(card_id, chat_id, greeting_swipes)
-    avatar_url = next((card.image_url for card in character_cards_service.list_cards() if card.id == card_id), "")
-    return bot_chats_service.add_bot_message(card_id, chat_id, chat.character_name, first_message, avatar_url, greeting_swipes)
+    return bot_chats_service.add_bot_message(card_id, chat_id, chat.character_name, first_message, _card_avatar_url(card_id), greeting_swipes)
 
-
-async def _broadcast_generation_state(card_id: str, chat_id: str, event_type: str, message: str = "", replace_message_id: str | None = None, streaming: bool | None = None) -> None:
+async def _broadcast_generation_state(card_id: str, chat_id: str, event_type: str, message: str = "", replace_message_id: str | None = None, streaming: bool | None = None, session_id: str = DEFAULT_SESSION_ID) -> None:
     event: dict[str, object] = {"type": event_type, "card_id": card_id, "chat_id": chat_id, "replace_message_id": replace_message_id}
     if message:
         event["message"] = message
     if streaming is not None:
         event["streaming"] = streaming
-    await connection_manager.broadcast(DEFAULT_SESSION_ID, event)
+    for target_sid in _target_sessions_for_chat(card_id, chat_id, session_id, False):
+        await connection_manager.broadcast(target_sid, event)
+
+def _frontend_build_info() -> tuple[str, str]:
+    index_path = PROJECT_ROOT / "frontend" / "dist" / "index.html"
+    if not index_path.exists():
+        return "dev", ""
+    try:
+        raw = index_path.read_text(encoding="utf-8")
+        build_id = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+        match = re.search(r'src="[^"]*/(index-[^"/]+\.js)"', raw)
+        return build_id, (match.group(1) if match else "")
+    except OSError:
+        return "dev", ""
+
+
+def _apply_cache_bust_headers(request: Request, response: Response) -> str:
+    build_id, _ = _frontend_build_info()
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    response.headers["CDN-Cache-Control"] = "no-store"
+    response.headers["Cloudflare-CDN-Cache-Control"] = "no-store"
+    if build_id and request.cookies.get("dt_build_id") != build_id:
+        response.headers["Clear-Site-Data"] = '"cache"'
+        response.set_cookie("dt_build_id", build_id, path="/", max_age=31536000, samesite="lax")
+    return build_id
 
 
 async def _broadcast_presence(session_id: str = DEFAULT_SESSION_ID) -> None:
+    session_service.prune_disconnected(session_id, connection_manager.active_participant_ids(session_id))
     await connection_manager.broadcast(
         session_id,
-        {"type": "presence.updated", "session": session_service.snapshot(session_id)},
+        {
+            "type": "presence.updated",
+            "session": session_service.snapshot(session_id),
+            "active_generations": _active_generation_keys(),
+        },
     )
-
-
 def _actor_from_request(request: Request) -> str:
-    actor = request.headers.get("x-doubletrouble-actor", "").strip()
+    actor = unquote(request.headers.get("x-doubletrouble-actor", "").strip())
     user = _auth_user_from_request(request)
     if user:
         return user.username
     return actor
-
 
 def _token_from_request(request: Request) -> str:
     authorization = request.headers.get("authorization", "")
@@ -211,12 +291,26 @@ def _auth_user_from_request(request: Request) -> AuthUser | None:
 
 
 def _access_token_from_request(request: Request) -> str:
-    return request.headers.get("x-doubletrouble-access", "").strip() or str(request.cookies.get("doubletrouble_access") or "").strip()
+    return (
+        request.headers.get("x-doubletrouble-access", "").strip()
+        or str(request.cookies.get("doubletrouble_access") or "").strip()
+        or str(request.query_params.get("access_token") or "").strip()
+    )
 
 
-AUTH_RATE_LIMIT_MAX = 5
+AUTH_RATE_LIMIT_MAX = 15
 AUTH_RATE_LIMIT_WINDOW = 60.0
 _auth_rate_limit_store: dict[str, list[float]] = {}
+
+
+def _request_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if forwarded:
+        return forwarded
+    real_ip = request.headers.get("x-real-ip", "").strip()
+    if real_ip:
+        return real_ip
+    return request.client.host if request.client else "unknown"
 
 
 def _check_auth_rate_limit(client_ip: str) -> None:
@@ -230,13 +324,21 @@ def _check_auth_rate_limit(client_ip: str) -> None:
 def _check_csrf(request: Request) -> None:
     if not config.security.cookie_auth or request.method in ("GET", "HEAD", "OPTIONS"):
         return
-    origin = request.headers.get("origin", "")
+    if (
+        request.headers.get("authorization")
+        or request.headers.get("x-doubletrouble-access")
+        or request.headers.get("x-doubletrouble-actor")
+    ):
+        return
+    origin = request.headers.get("origin", "").strip()
     if not origin:
         return
+    origin_host = urlparse(origin).netloc.lower()
+    forwarded_host = request.headers.get("x-forwarded-host", "").split(",")[0].strip().lower()
+    request_host = (forwarded_host or request.headers.get("host", "")).strip().lower()
     expected = str(request.base_url).rstrip("/")
-    if origin != expected:
+    if origin != expected and (not origin_host or origin_host != request_host):
         raise HTTPException(status_code=403, detail="Invalid origin")
-
 
 def _require_access_password(request: Request) -> None:
     _check_csrf(request)
@@ -249,6 +351,8 @@ def _require_permission(request: Request, action: str) -> None:
     user = _auth_user_from_request(request)
     if settings_service.auth_required() and not user:
         raise HTTPException(status_code=401, detail="Authentication required")
+    if not settings_service.auth_required() and not user:
+        return
     permissions = settings_service.security_permissions().model_dump()
     rule = permissions.get(action, {"mode": "everyone", "users": []})
     mode = str(rule.get("mode") or "everyone")
@@ -257,12 +361,11 @@ def _require_permission(request: Request, action: str) -> None:
         return
     if not user:
         raise HTTPException(status_code=401, detail="Authentication required")
-    if mode == "admins" and user.is_admin:
+    if mode == "admins" and (user.is_admin or not any(u.is_admin for u in auth_service.state.users)):
         return
     if mode == "users" and (user.is_admin or user.username.lower() in allowed_users):
         return
     raise HTTPException(status_code=403, detail="Not enough permissions")
-
 
 def _notification_text(message: str, actor: str = "") -> str:
     return f"{actor}: {message}" if actor else message
@@ -338,12 +441,12 @@ def _active_openai_preset() -> dict[str, object] | None:
         return None
 
 
-def _generation_persona_context(request: BotReplyRequest | None) -> tuple[str | None, str | None, bool, str]:
-    if request is None:
-        return None, None, False, ""
-    known_personas = {persona.id: persona for persona in personas_service.list_personas()}
-    participants: list[GenerationParticipantRequest] = list(request.participants or [])
-    if request.persona_id or request.persona_name or request.persona_description:
+def _generation_persona_context(request: BotReplyRequest | None, history: list[Any] | None = None) -> tuple[str | None, str | None, bool, list[str]]:
+    known_list = personas_service.list_all_personas()
+    known_personas = {persona.id: persona for persona in known_list}
+    known_by_name = {persona.name.strip().lower(): persona for persona in known_list if persona.name.strip()}
+    participants: list[GenerationParticipantRequest] = list((request.participants if request else None) or [])
+    if request and (request.persona_id or request.persona_name or request.persona_description):
         participants.append(
             GenerationParticipantRequest(
                 persona_id=request.persona_id or "",
@@ -351,31 +454,58 @@ def _generation_persona_context(request: BotReplyRequest | None) -> tuple[str | 
                 persona_description=request.persona_description or "",
             )
         )
+    history_user_authors: list[str] = []
+    for msg in history or []:
+        if getattr(msg, "role", "") == "user" and not getattr(msg, "hidden", False) and not getattr(msg, "is_ooc", False):
+            author = str(getattr(msg, "author", "") or "").strip()
+            if author and author not in history_user_authors:
+                history_user_authors.append(author)
 
     by_key: dict[str, tuple[str, str]] = {}
-    primary_name = (request.persona_name or "").strip() or None
-    primary_id = (request.persona_id or "").strip()
+    persona_ids: list[str] = []
+    primary_name = ((request.persona_name if request else "") or "").strip() or None
+    primary_id = ((request.persona_id if request else "") or "").strip()
+    if primary_id and primary_id not in persona_ids:
+        persona_ids.append(primary_id)
     for participant in participants:
-        stored = known_personas.get(participant.persona_id)
-        name = (participant.persona_name or stored.name if stored else participant.persona_name).strip()
-        description = (participant.persona_description or stored.description if stored else participant.persona_description).strip()
+        stored = known_personas.get(participant.persona_id) or known_by_name.get(participant.persona_name.strip().lower())
+        name = (participant.persona_name or (stored.name if stored else "")).strip()
+        description = (participant.persona_description or (stored.description if stored else "")).strip()
         if not name:
             continue
-        key = participant.persona_id.strip() or participant.participant_id.strip() or name.lower()
+        pid = participant.persona_id.strip() or (stored.id if stored else "")
+        if pid and pid not in persona_ids:
+            persona_ids.append(pid)
+        key = pid or participant.participant_id.strip() or name.lower()
         by_key[key] = (name, description)
         if primary_id and participant.persona_id == primary_id:
             primary_name = name
+    active_participant_count = len(by_key)
+    for author in history_user_authors:
+        if author.lower() == "player" and by_key:
+            continue
+        if any(existing_name.lower() == author.lower() for existing_name, _ in by_key.values()):
+            continue
+        if active_participant_count <= 1 and len(by_key) >= 1:
+            continue
+        stored = known_by_name.get(author.lower())
+        pid = stored.id if stored else ""
+        if pid and pid not in persona_ids:
+            persona_ids.append(pid)
+        by_key[pid or author.lower()] = (author, (stored.description if stored else "").strip())
 
     personas = list(by_key.values())
     if not personas:
-        return primary_name, (request.persona_description or "").strip() or None, False, primary_id
+        return primary_name, ((request.persona_description if request else "") or "").strip() or None, False, persona_ids
     if len(personas) == 1:
-        return primary_name or personas[0][0], personas[0][1], False, primary_id
-    combined = "Active player personas in this DoubleTrouble chat:\n" + "\n".join(
-        f"- {name}: {description or 'No persona description provided.'}" for name, description in personas
+        return primary_name or personas[0][0], personas[0][1], False, persona_ids
+    names_str = ", ".join(name for name, _ in personas)
+    combined = (
+        f"Active player personas in this multiplayer roleplay ({names_str}):\n"
+        + "\n".join(f"- {name}: {description or 'No persona description provided.'}" for name, description in personas)
+        + "\nEach user message in the chat history is prefixed with the speaker's name (e.g. 'Name: message'). Respond only as {{char}} and do not write dialogue or actions on behalf of any player persona."
     )
-    return primary_name or " and ".join(name for name, _ in personas), combined, True, primary_id
-
+    return names_str, combined, True, persona_ids
 
 def _managed_key_payload(key_id: str, meta: dict[str, str]) -> dict[str, object]:
     env_name = meta.get("env_name") or ""
@@ -442,7 +572,7 @@ def _provider_key_payloads() -> list[dict[str, object]]:
     ]
 
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024
-RATE_LIMIT_MAX = 30
+RATE_LIMIT_MAX = 240
 RATE_LIMIT_WINDOW = 60.0
 _rate_limit_store: dict[str, list[float]] = {}
 
@@ -483,8 +613,10 @@ class RateLimitMiddleware:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope["method"] in ("POST", "PUT", "DELETE", "PATCH"):
+            headers = {k.lower(): v.decode("latin1", errors="ignore") for k, v in scope.get("headers", [])}
+            forwarded = headers.get(b"x-forwarded-for", "").split(",")[0].strip()
             client = scope.get("client")
-            client_ip = client[0] if client else "unknown"
+            client_ip = forwarded or headers.get(b"x-real-ip", "").strip() or (client[0] if client else "unknown")
             now = time.time()
             _rate_limit_store.setdefault(client_ip, [t for t in _rate_limit_store.get(client_ip, []) if now - t < RATE_LIMIT_WINDOW])
             if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_MAX:
@@ -523,6 +655,20 @@ def _decode_base64_payload(value: str) -> bytes:
 async def on_startup() -> None:
     storage.ensure_layout()
     session_service.get_or_create_session(DEFAULT_SESSION_ID)
+    logging.getLogger("uvicorn.error").info("DoubleTrouble admin code: %s", config.auth.admin_code)
+
+    env_access_pw = (os.environ.get("DOUBLE_TROUBLE_ACCESS_PASSWORD") or os.environ.get("ACCESS_PASSWORD") or "").strip()
+    env_auth_req = (os.environ.get("DOUBLE_TROUBLE_AUTH_REQUIRED") or os.environ.get("AUTH_REQUIRED") or "").strip().lower()
+    if env_access_pw or env_auth_req in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+        sec_payload = settings_service.security_settings_payload()
+        if env_access_pw and len(env_access_pw) >= 4:
+            sec_payload.access_password = env_access_pw
+            sec_payload.access_password_required = True
+        if env_auth_req in {"1", "true", "yes", "on"}:
+            sec_payload.auth_required = True
+        elif env_auth_req in {"0", "false", "no", "off"}:
+            sec_payload.auth_required = False
+        settings_service.update_security_settings(sec_payload)
 
     # Bootstrap built-in default presets on first run (only if user has none yet)
     if not any(presets_service.list_presets("openai")):
@@ -531,8 +677,6 @@ async def on_startup() -> None:
     # Activate the built-in Default OpenAI preset if no active preset is set
     if not settings_service.active_preset_settings().get("openai"):
         settings_service.set_active_preset("openai", "Default")
-
-
 @app.get("/api/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -546,10 +690,36 @@ async def sillytavern_version() -> dict[str, str]:
 @app.post("/api/settings/get")
 async def sillytavern_settings_get(request: Request) -> dict[str, object]:
     _require_permission(request, "view_presets")
+    ext_settings = extensions_service.get_settings()
+    gen_settings = settings_service.generation_settings()
     return {
-        "world_names": [book.name for book in lorebooks_service.list_lorebooks()],
-        "settings": settings_service.generation_settings(),
+        "world_names": [book.name for book in lorebooks_service.list_books()],
+        "settings": {**gen_settings, "extension_settings": ext_settings},
+        "extension_settings": ext_settings,
     }
+
+
+@app.post("/api/settings/save")
+async def sillytavern_settings_save(payload: dict[str, Any], request: Request) -> dict[str, object]:
+    ext_patch = payload.get("extension_settings") if isinstance(payload.get("extension_settings"), dict) else payload
+    if isinstance(ext_patch, dict):
+        extensions_service.save_settings(ext_patch, merge=True)
+        await _broadcast_shared_settings("extension_settings")
+    return {"ok": True}
+
+
+@app.get("/api/extensions/settings")
+async def get_extension_settings() -> dict[str, object]:
+    return {"extension_settings": extensions_service.get_settings()}
+
+
+@app.put("/api/extensions/settings")
+async def put_extension_settings(payload: dict[str, Any], request: Request) -> dict[str, object]:
+    patch = payload.get("extension_settings") if isinstance(payload.get("extension_settings"), dict) else payload
+    merge = bool(payload.get("merge", True)) if isinstance(payload, dict) else True
+    saved = extensions_service.save_settings(patch if isinstance(patch, dict) else {}, merge=merge)
+    await _broadcast_shared_settings("extension_settings")
+    return {"ok": True, "extension_settings": saved}
 
 
 @app.get("/api/extensions/discover")
@@ -564,9 +734,53 @@ async def list_extensions(request: Request) -> dict[str, object]:
 
 
 @app.post("/api/extensions/install")
-async def install_extension(_payload: ExtensionInstallRequest, request: Request) -> dict[str, object]:
+async def install_extension(payload: ExtensionInstallRequest, request: Request) -> dict[str, object]:
     _require_permission(request, "manage_extensions")
-    raise HTTPException(status_code=403, detail="Extension installation is temporarily disabled")
+    try:
+        extension = await asyncio.to_thread(extensions_service.install, payload)
+    except FileExistsError as error:
+        raise HTTPException(status_code=409, detail=f"Extension already exists: {error}") from error
+    except (ValueError, FileNotFoundError, RuntimeError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_shared_settings("extensions")
+    await _broadcast_notification(f"установил расширение: {extension.name}", actor=_actor_from_request(request))
+    return {"extension": extension.model_dump(mode="json")}
+
+
+@app.post("/api/extensions/upload")
+async def upload_extension_zip(
+    request: Request,
+    file: UploadFile = File(...),
+    name: str = Form(""),
+    overwrite: bool = Form(True),
+) -> dict[str, object]:
+    _require_permission(request, "manage_extensions")
+    if not file.filename or not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip extension archives are supported")
+    content = await file.read()
+    try:
+        extension = await asyncio.to_thread(extensions_service.install_zip, file.filename, content, name, True, overwrite)
+    except FileExistsError as error:
+        raise HTTPException(status_code=409, detail=f"Extension already exists: {error}") from error
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_shared_settings("extensions")
+    await _broadcast_notification(f"загрузил расширение из ZIP: {extension.name}", actor=_actor_from_request(request))
+    return {"extension": extension.model_dump(mode="json")}
+
+
+@app.post("/api/extensions/{name}/update")
+async def update_extension(name: str, request: Request) -> dict[str, object]:
+    _require_permission(request, "manage_extensions")
+    try:
+        extension = await asyncio.to_thread(extensions_service.update, name)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Extension not found") from error
+    except (ValueError, RuntimeError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_shared_settings("extensions")
+    await _broadcast_notification(f"обновил расширение: {extension.name}", actor=_actor_from_request(request))
+    return {"extension": extension.model_dump(mode="json")}
 
 
 @app.put("/api/extensions/{name}/enabled")
@@ -595,14 +809,15 @@ async def delete_extension(name: str, request: Request) -> dict[str, object]:
 
 @app.get("/scripts/extensions/{extension_path:path}")
 @app.head("/scripts/extensions/{extension_path:path}")
-async def extension_asset(extension_path: str, request: Request) -> Response:
-    _require_permission(request, "manage_extensions")
+async def extension_asset(extension_path: str) -> Response:
     if extension_path == "extensions.js":
         return await extension_compat_module()
     if extension_path == "regex/engine.js":
         return _compat_javascript("""
-export const regex_placement = { RAW: 0, USER_INPUT: 1, AI_OUTPUT: 2, SLASH_COMMAND: 3 };
-export const getRegexedString = (value) => String(value ?? '');
+const dtRegex = () => globalThis.DoubleTroubleRegex || {};
+export const regex_placement = { MD_DISPLAY: 0, RAW: 0, USER_INPUT: 1, AI_OUTPUT: 2, SLASH_COMMAND: 3, WORLD_INFO: 5, REASONING: 6 };
+export const getRegexedString = (value, placement = 2, params = {}) => dtRegex().getRegexedString ? dtRegex().getRegexedString(String(value ?? ''), placement, params) : String(value ?? '');
+export const runRegexScript = (script, value, params = {}) => dtRegex().runRegexScript ? dtRegex().runRegexScript(script, String(value ?? ''), params) : String(value ?? '');
 """)
     try:
         path = extensions_service.file_path(extension_path)
@@ -621,14 +836,19 @@ export const modules = [];
 export const extensionTypes = { SYSTEM: 'system', LOCAL: 'local', GLOBAL: 'global', THIRD_PARTY: 'third-party' };
 export const getContext = () => ctx();
 export const getApiUrl = () => extension_settings.apiUrl || '';
-export const ModuleWorkerWrapper = class {};
-export const renderExtensionTemplateAsync = async (extensionName, templateId) => {
-  const response = await fetch(`/scripts/extensions/${extensionName}/${templateId}.html`);
+export const ModuleWorkerWrapper = class { constructor(fn) { this.fn = fn; } update(...args) { return this.fn?.(...args); } };
+export const renderExtensionTemplateAsync = async (extensionName, templateId, templateData = {}) => {
+  if (ctx().renderExtensionTemplateAsync) return await ctx().renderExtensionTemplateAsync(extensionName, templateId, templateData);
+  const cleanId = String(templateId || '').replace(/\\.html$/i, '');
+  const response = await fetch(`/scripts/extensions/${extensionName}/${cleanId}.html`);
   return response.ok ? await response.text() : '';
 };
-export const renderExtensionTemplate = () => '';
-export const saveMetadataDebounced = () => {};
-export const writeExtensionField = async () => {};
+export const renderExtensionTemplate = (extensionName, templateId, templateData = {}) => {
+  if (ctx().renderExtensionTemplate) return ctx().renderExtensionTemplate(extensionName, templateId, templateData);
+  return '';
+};
+export const saveMetadataDebounced = () => ctx().saveMetadataDebounced?.();
+export const writeExtensionField = async (characterId, key, value) => ctx().writeExtensionField?.(characterId, key, value);
 export const doExtrasFetch = (endpoint, args = {}) => fetch(endpoint, args);
 """.strip()
     return Response(content=content, media_type="text/javascript; charset=utf-8")
@@ -643,52 +863,69 @@ def _transparent_png() -> bytes:
 
 
 @app.get("/script.js")
-async def script_compat_module() -> Response:
-    content = """
+async def script_compat_module(request: Request) -> Response:
+    _, expected_bundle = _frontend_build_info()
+    bundle_guard = f"""
+const __dtExpectedBundle = {json.dumps(expected_bundle)};
+if (__dtExpectedBundle && typeof document !== 'undefined' && !Array.from(document.scripts).some((s) => (s.src || '').includes(__dtExpectedBundle))) {{
+  if (!globalThis.location?.search?.includes('_v=' + __dtExpectedBundle)) {{
+    globalThis.location?.replace?.(globalThis.location.pathname + '?_v=' + encodeURIComponent(__dtExpectedBundle));
+  }}
+}}
+""".strip()
+    content = bundle_guard + "\n" + """
 const ctx = () => globalThis.SillyTavern?.getContext?.() || {};
 export const eventSource = ctx().eventSource;
 export const event_types = ctx().event_types || ctx().eventTypes || {};
-export const saveSettingsDebounced = ctx().saveSettingsDebounced || (() => {});
+export const saveSettingsDebounced = (...args) => ctx().saveSettingsDebounced?.(...args);
 export const saveSettings = saveSettingsDebounced;
-export const getRequestHeaders = ctx().getRequestHeaders || (() => ({}));
-export const messageFormatting = ctx().messageFormatting || ((text) => text);
-export const saveChatConditional = ctx().saveChat || (async () => {});
+export const getRequestHeaders = () => (ctx().getRequestHeaders ? ctx().getRequestHeaders() : { 'Content-Type': 'application/json' });
+export const messageFormatting = (...args) => (ctx().messageFormatting ? ctx().messageFormatting(...args) : String(args[0] ?? ''));
+export const saveChatConditional = () => (ctx().saveChat ? ctx().saveChat() : Promise.resolve());
+export const saveChatDebounced = saveChatConditional;
 export const chat = [];
 export const characters = [];
 export const personas = [];
-export const chat_metadata = {};
-export const extension_prompts = {};
+export const chat_metadata = ctx().chatMetadata || {};
+export const extension_prompts = ctx().extensionPrompts || {};
+export let name1 = ctx().name1 || 'User';
+export let name2 = ctx().name2 || 'Char';
+export let this_chid = ctx().characterId ?? 0;
+export let user_avatar = ctx().selectedPersona?.avatar || '';
 const sync = () => {
-  chat.splice(0, chat.length, ...(ctx().chat || []));
-  characters.splice(0, characters.length, ...(ctx().characters || []));
-  personas.splice(0, personas.length, ...(ctx().personas || []));
+  const c = ctx();
+  chat.splice(0, chat.length, ...(c.chat || []));
+  characters.splice(0, characters.length, ...(c.characters || []));
+  personas.splice(0, personas.length, ...(c.personas || []));
+  name1 = c.name1 || 'User';
+  name2 = c.name2 || 'Char';
+  this_chid = c.characterId ?? 0;
+  user_avatar = c.selectedPersona?.avatar || '';
 };
 sync();
-globalThis.setInterval?.(sync, 250);
-export const name1 = ctx().name1 || 'User';
-export const name2 = ctx().name2 || 'Char';
-export const this_chid = ctx().characterId ?? 0;
-export const user_avatar = ctx().selectedPersona?.avatar || '';
+globalThis.setInterval?.(sync, 200);
 export const system_avatar = 'system.png';
 export const default_avatar = 'default.png';
 export const is_send_press = false;
 export const main_api = 'openai';
 export const online_status = 'connected';
 export const MAX_INJECTION_DEPTH = 1000;
-export const system_message_types = { NARRATOR: 'narrator', COMMENT: 'comment' };
+export const system_message_types = { NARRATOR: 'narrator', COMMENT: 'comment', GENERIC: 'generic' };
 export const extension_prompt_roles = { SYSTEM: 0, USER: 1, ASSISTANT: 2 };
-export const extension_prompt_types = { IN_CHAT: 0, BEFORE_PROMPT: 1, IN_PROMPT: 2, AFTER_PROMPT: 3 };
-export const getCurrentChatId = () => 'default';
+export const extension_prompt_types = { NONE: -1, IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2, AFTER_PROMPT: 3 };
+export const getCurrentChatId = () => ctx().chatId || 'default';
 export const getThumbnailUrl = (_type, file) => file?.startsWith?.('/') ? file : `/api/personas/avatars/${encodeURIComponent(file || 'default.png')}`;
-export const reloadMarkdownProcessor = () => ({ makeHtml: (text) => String(text ?? '') });
+export const reloadMarkdownProcessor = () => ({ makeHtml: (text) => messageFormatting(text) });
 export const clearChat = async () => {};
 export const printMessages = async () => {};
-export const addOneMessage = async () => {};
+export const addOneMessage = async (mes, opts) => ctx().addOneMessage?.(mes, opts);
+export const sendSystemMessage = async (type, text, extra) => ctx().sendSystemMessage?.(type, text, extra);
+export const deleteLastMessage = async () => ctx().deleteLastMessage?.();
 export const getPastCharacterChats = async () => [];
 export const showSwipeButtons = () => {};
-export const substituteParams = (text) => String(text ?? '').replaceAll('{{user}}', ctx().name1 || 'User').replaceAll('{{char}}', ctx().name2 || 'Char');
-export const substituteParamsExtended = substituteParams;
-export const saveMetadata = async () => {};
+export const substituteParams = (text, ...rest) => ctx().substituteParams ? ctx().substituteParams(text, ...rest) : String(text ?? '').replaceAll('{{user}}', ctx().name1 || 'User').replaceAll('{{char}}', ctx().name2 || 'Char');
+export const substituteParamsExtended = (text, ...rest) => ctx().substituteParamsExtended ? ctx().substituteParamsExtended(text, ...rest) : substituteParams(text);
+export const saveMetadata = async () => ctx().saveMetadata?.();
 export const saveCharacterDebounced = () => {};
 export const getOneCharacter = (id) => characters[Number(id)] || characters[0] || null;
 export const selectCharacterById = async () => {};
@@ -697,26 +934,29 @@ export const unshallowCharacter = async (character) => character;
 export const deleteCharacter = async () => {};
 export const getCharacters = async () => characters;
 export const scrollChatToBottom = () => globalThis.scrollTo?.({ top: document.body.scrollHeight, behavior: 'smooth' });
-export const reloadCurrentChat = async () => {};
+export const reloadCurrentChat = async () => ctx().reloadCurrentChat?.();
 export const activateSendButtons = () => {};
 export const deactivateSendButtons = () => {};
 export const setGenerationProgress = () => {};
-export const setExtensionPrompt = (name, value) => { extension_prompts[name] = value; };
-export const baseChatReplace = (text) => text;
+export const setExtensionPrompt = (key, value, position = 1, depth = 4, scan = false, role = 0) => ctx().setExtensionPrompt ? ctx().setExtensionPrompt(key, value, position, depth, scan, role) : (extension_prompts[key] = { value, position, depth, scan, role });
+export const baseChatReplace = (text) => substituteParams(text);
 export const getCharacterCardFields = () => ({});
 export const getBiasStrings = () => [];
 export const getExtensionPromptRoleByName = (role) => extension_prompt_roles[String(role).toUpperCase()] ?? extension_prompt_roles.SYSTEM;
-export const getMaxContextSize = () => 8192;
-export const getExtensionPromptByName = (name) => extension_prompts[name] || '';
+export const getMaxContextSize = () => ctx().maxContext || 8192;
+export const getExtensionPromptByName = (name) => extension_prompts[name]?.value ?? extension_prompts[name] ?? '';
 export const cleanUpMessage = (text) => String(text ?? '');
 export const isOdd = (value) => Number(value) % 2 !== 0;
 export const countOccurrences = (text, value) => String(text ?? '').split(String(value ?? '')).length - 1;
-export const stopGeneration = async () => {};
-export const Generate = async () => '';
+export const stopGeneration = async () => ctx().stopGeneration?.();
+export const generateQuietPrompt = async (...args) => ctx().generateQuietPrompt ? await ctx().generateQuietPrompt(...args) : '';
+export const generateRaw = async (...args) => ctx().generateRaw ? await ctx().generateRaw(...args) : '';
+export const Generate = async (type, opts = {}) => ctx().Generate ? await ctx().Generate(type, opts) : await generateQuietPrompt(opts?.quiet_prompt || '');
 export default {};
 """.strip()
-    return Response(content=content, media_type="text/javascript; charset=utf-8")
-
+    resp = Response(content=content, media_type="text/javascript; charset=utf-8")
+    _apply_cache_bust_headers(request, resp)
+    return resp
 
 @app.get("/scripts/{module_path:path}")
 async def scripts_compat_module(module_path: str) -> Response:
@@ -893,14 +1133,20 @@ export class PromptCollection extends Array {}
 """,
         "sse-stream.js": "export const getEventSourceStream = async () => null;",
         "slash-commands.js": """
-export const slashCommandRegistry = new Map();
-export const executeSlashCommandsWithOptions = async (text) => String(text ?? '');
+const ctx = () => globalThis.SillyTavern?.getContext?.() || {};
+export const slashCommandRegistry = globalThis.__dtSlashCommands ?? (globalThis.__dtSlashCommands = new Map());
+export const registerSlashCommand = (name, callback, aliases = [], helpString = '') => {
+  if (ctx().registerSlashCommand) return ctx().registerSlashCommand(name, callback, aliases, helpString);
+  slashCommandRegistry.set(String(name), { name, callback, aliases, helpString });
+};
+export const executeSlashCommands = async (text, ...rest) => ctx().executeSlashCommands ? await ctx().executeSlashCommands(text, ...rest) : String(text ?? '');
+export const executeSlashCommandsWithOptions = async (text, opts = {}) => ctx().executeSlashCommandsWithOptions ? await ctx().executeSlashCommandsWithOptions(text, opts) : String(text ?? '');
 """,
         "slash-commands/SlashCommand.js": """
 export class SlashCommand { constructor(data = {}) { Object.assign(this, data); } static fromProps(data = {}) { return new SlashCommand(data); } }
 """,
         "slash-commands/SlashCommandArgument.js": """
-export const ARGUMENT_TYPE = { STRING: 'string', NUMBER: 'number', BOOLEAN: 'boolean', VARIABLE_NAME: 'variable_name' };
+export const ARGUMENT_TYPE = { STRING: 'string', NUMBER: 'number', BOOLEAN: 'boolean', VARIABLE_NAME: 'variable_name', LIST: 'list', DICTIONARY: 'dictionary', SUBCOMMAND: 'subcommand' };
 export class SlashCommandArgument { constructor(data = {}) { Object.assign(this, data); } static fromProps(data = {}) { return new SlashCommandArgument(data); } }
 export class SlashCommandNamedArgument extends SlashCommandArgument {}
 """,
@@ -915,20 +1161,70 @@ export const commonEnumProviders = {
 };
 """,
         "slash-commands/SlashCommandEnumValue.js": """
-export const enumTypes = { enum: 'enum' };
+export const enumTypes = { enum: 'enum', name: 'name', command: 'command' };
 export class SlashCommandEnumValue { constructor(value, description = '', type = enumTypes.enum, icon = '') { this.value = value; this.description = description || ''; this.type = type; this.icon = icon || ''; } }
 """,
         "slash-commands/SlashCommandParser.js": """
-export class SlashCommandParser { static addCommandObject(command) { globalThis.__dtSlashCommands ??= new Map(); globalThis.__dtSlashCommands.set(command?.name || command?.command || String(globalThis.__dtSlashCommands.size), command); } static parse(text) { return { command: String(text ?? ''), args: [] }; } }
+export class SlashCommandParser {
+  static get commands() { globalThis.__dtSlashCommands ??= new Map(); return Object.fromEntries(globalThis.__dtSlashCommands); }
+  static addCommandObject(command) {
+    globalThis.__dtSlashCommands ??= new Map();
+    const name = command?.name || command?.command;
+    if (name) {
+      globalThis.__dtSlashCommands.set(String(name), command);
+      if (Array.isArray(command?.aliases)) {
+        command.aliases.forEach((alias) => alias && globalThis.__dtSlashCommands.set(String(alias), command));
+      }
+    }
+  }
+  static parse(text) { return { command: String(text ?? ''), args: [] }; }
+}
 """,
         "popup.js": """
-export const POPUP_TYPE = { TEXT: 0, CONFIRM: 1, INPUT: 2, DISPLAY: 3 };
-export const callGenericPopup = async (content, _type, _input, options = {}) => { if (options?.okButton) return true; return content; };
+const ctx = () => globalThis.SillyTavern?.getContext?.() || {};
+export const POPUP_TYPE = { TEXT: 1, CONFIRM: 2, INPUT: 3, DISPLAY: 4, CROP: 5 };
+export const POPUP_RESULT = { AFFIRMATIVE: 1, NEGATIVE: 0, CANCELLED: null };
+export const callGenericPopup = async (content, type = 1, inputValue = '', options = {}) => {
+  if (ctx().callGenericPopup) return await ctx().callGenericPopup(content, type, inputValue, options);
+  if (type === POPUP_TYPE.CONFIRM) return globalThis.confirm?.(typeof content === 'string' ? content.replace(/<[^>]+>/g, '') : 'Confirm?') ? 1 : 0;
+  if (type === POPUP_TYPE.INPUT) return globalThis.prompt?.(typeof content === 'string' ? content.replace(/<[^>]+>/g, '') : 'Input:', String(inputValue ?? ''));
+  return 1;
+};
+export const callPopup = callGenericPopup;
+export class Popup {
+  constructor(content, type = 1, inputValue = '', options = {}) {
+    this.content = content;
+    this.type = type;
+    this.inputValue = inputValue;
+    this.options = options;
+    this.value = inputValue;
+    this.result = 1;
+  }
+  async show() {
+    const out = await callGenericPopup(this.content, this.type, this.inputValue, this.options);
+    this.value = out;
+    this.result = out ? 1 : 0;
+    return out;
+  }
+  static get util() { return { POPUP_TYPE, POPUP_RESULT }; }
+}
 """,
-        "tokenizers.js": "export const getTokenCountAsync = async (text) => Math.ceil(String(text ?? '').length / 4);",
+        "tokenizers.js": "export const getTokenCountAsync = async (text) => Math.ceil(String(text ?? '').length / 4); export const getTokenCount = (text) => Math.ceil(String(text ?? '').length / 4);",
+        "templates.js": """
+const ctx = () => globalThis.SillyTavern?.getContext?.() || {};
+export const renderTemplateAsync = async (templateId, data = {}) => ctx().renderExtensionTemplateAsync ? await ctx().renderExtensionTemplateAsync('', templateId, data) : '';
+export const renderTemplate = (templateId, data = {}) => ctx().renderExtensionTemplate ? ctx().renderExtensionTemplate('', templateId, data) : '';
+""",
+        "group-chats.js": "export const groups = []; export const selected_group = null; export const is_group_generating = false; export const getGroupAvatar = () => '';",
+        "tags.js": "export const tags = []; export const tag_map = {}; export const getTagsList = () => [];",
+        "chats.js": "export const saveChat = async () => globalThis.SillyTavern?.getContext?.().saveChat?.();",
+        "char-data.js": "export const char_data = {};",
+        "custom-request.js": "export class CustomRequest { async send() { return {}; } }",
     }
     if module_path in modules:
         return _compat_javascript(modules[module_path])
+    if module_path.startswith("extensions/"):
+        return await extension_asset(module_path.removeprefix("extensions/"))
     raise HTTPException(status_code=404, detail="Compatibility script not found")
 
 
@@ -967,11 +1263,50 @@ async def extension_image(folder: str, filename: str, request: Request) -> FileR
 
 @app.get("/user/files/{filename}")
 @app.head("/user/files/{filename}")
-async def extension_file(filename: str, request: Request) -> FileResponse:
+async def extension_file(filename: str) -> FileResponse:
     path = storage.user_root / "user" / "files" / Path(filename).name
     if not path.exists():
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path)
+
+
+@app.post("/api/backends/chat-completions/generate")
+@app.post("/api/extensions/generate")
+async def extension_chat_completions_generate(payload: dict[str, Any], request: Request) -> dict[str, object]:
+    _require_permission(request, "generate")
+    from backend.app.llm.base import ChatMessage
+    raw_messages = payload.get("messages")
+    chat_messages: list[ChatMessage] = []
+    if isinstance(raw_messages, list) and raw_messages:
+        for item in raw_messages:
+            if isinstance(item, dict) and str(item.get("content") or "").strip():
+                role = str(item.get("role") or "user").lower()
+                if role not in {"system", "user", "assistant"}:
+                    role = "user"
+                chat_messages.append(ChatMessage(role=role, content=str(item.get("content"))))
+    else:
+        sys_prompt = str(payload.get("system_prompt") or payload.get("systemPrompt") or "").strip()
+        if sys_prompt:
+            chat_messages.append(ChatMessage(role="system", content=sys_prompt))
+        prompt_text = str(payload.get("prompt") or payload.get("quiet_prompt") or payload.get("quietPrompt") or "").strip()
+        if prompt_text:
+            chat_messages.append(ChatMessage(role="user", content=prompt_text))
+    if not chat_messages:
+        raise HTTPException(status_code=400, detail="Prompt or messages are required")
+    max_tokens_raw = payload.get("max_tokens") or payload.get("responseLength")
+    max_tokens = int(max_tokens_raw) if isinstance(max_tokens_raw, (int, float)) and int(max_tokens_raw) > 0 else None
+    temp_raw = payload.get("temperature")
+    temperature = float(temp_raw) if isinstance(temp_raw, (int, float)) else None
+    try:
+        text = await generation_service.raw_generate(chat_messages, max_tokens=max_tokens, temperature=temperature)
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    return {
+        "ok": True,
+        "text": text,
+        "content": text,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+    }
 
 
 @app.post("/api/avatars/get")
@@ -997,8 +1332,10 @@ async def extension_user_avatar(filename: str, request: Request) -> Response:
 
 
 @app.get("/api/config/public")
-async def public_config() -> dict[str, object]:
+async def public_config(request: Request, response: Response) -> dict[str, object]:
+    build_id = _apply_cache_bust_headers(request, response)
     return {
+        "build_id": build_id,
         "server": {"public_url": config.server.public_url},
         "auth": {"mode": config.auth.mode, "required": settings_service.auth_required()},
         "registration_allowed": settings_service.registration_allowed(),
@@ -1006,10 +1343,9 @@ async def public_config() -> dict[str, object]:
         "default_session_id": DEFAULT_SESSION_ID,
     }
 
-
 @app.post("/api/auth/register")
 async def auth_register(payload: AuthRequest, request: Request, response: Response) -> dict[str, object]:
-    _check_auth_rate_limit(request.client.host if request.client else "unknown")
+    _check_auth_rate_limit(_request_client_ip(request))
     _require_access_password(request)
     if not settings_service.registration_allowed():
         raise HTTPException(status_code=403, detail="Registration is disabled")
@@ -1017,35 +1353,37 @@ async def auth_register(payload: AuthRequest, request: Request, response: Respon
         user, token = auth_service.register(payload.username, payload.password)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    if config.security.cookie_auth:
-        response.set_cookie(
-            "doubletrouble_auth_token",
-            token,
-            httponly=True,
-            secure=config.security.cookie_secure,
-            samesite=config.security.cookie_samesite,
-            path="/",
-        )
+    personas_service.list_personas(owner=user.username, is_admin=user.is_admin)
+    response.set_cookie(
+        "doubletrouble_auth_token",
+        token,
+        httponly=True,
+        secure=config.security.cookie_secure,
+        samesite=config.security.cookie_samesite,
+        path="/",
+    )
     return {"token": token, "user": auth_service.public_user(user)}
-
 
 @app.post("/api/auth/login")
 async def auth_login(payload: AuthRequest, request: Request, response: Response) -> dict[str, object]:
-    _check_auth_rate_limit(request.client.host if request.client else "unknown")
+    _check_auth_rate_limit(_request_client_ip(request))
     _require_access_password(request)
     try:
-        user, token = auth_service.login(payload.username, payload.password)
+        if not auth_service.state.users and settings_service.registration_allowed():
+            user, token = auth_service.register(payload.username, payload.password)
+            personas_service.list_personas(owner=user.username, is_admin=user.is_admin)
+        else:
+            user, token = auth_service.login(payload.username, payload.password)
     except ValueError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
-    if config.security.cookie_auth:
-        response.set_cookie(
-            "doubletrouble_auth_token",
-            token,
-            httponly=True,
-            secure=config.security.cookie_secure,
-            samesite=config.security.cookie_samesite,
-            path="/",
-        )
+    response.set_cookie(
+        "doubletrouble_auth_token",
+        token,
+        httponly=True,
+        secure=config.security.cookie_secure,
+        samesite=config.security.cookie_samesite,
+        path="/",
+    )
     return {"token": token, "user": auth_service.public_user(user)}
 
 
@@ -1090,13 +1428,14 @@ async def get_security_permissions() -> dict[str, object]:
 
 
 @app.get("/api/security/config")
-async def get_security_config() -> dict[str, object]:
+async def get_security_config(request: Request, response: Response) -> dict[str, object]:
+    build_id = _apply_cache_bust_headers(request, response)
     return {
+        "build_id": build_id,
         "cookie_auth": config.security.cookie_auth,
         "cookie_secure": config.security.cookie_secure,
         "cookie_samesite": config.security.cookie_samesite,
     }
-
 
 @app.get("/api/security/access")
 async def get_access_password_status(request: Request) -> dict[str, object]:
@@ -1106,20 +1445,19 @@ async def get_access_password_status(request: Request) -> dict[str, object]:
 
 @app.post("/api/security/access")
 async def unlock_access_password(payload: AccessPasswordRequest, request: Request, response: Response) -> dict[str, object]:
-    _check_auth_rate_limit(request.client.host if request.client else "unknown")
+    _check_auth_rate_limit(_request_client_ip(request))
     try:
         token = settings_service.verify_access_password(payload.password)
     except ValueError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
-    if config.security.cookie_auth:
-        response.set_cookie(
-            "doubletrouble_access",
-            token,
-            httponly=True,
-            secure=config.security.cookie_secure,
-            samesite=config.security.cookie_samesite,
-            path="/",
-        )
+    response.set_cookie(
+        "doubletrouble_access",
+        token,
+        httponly=True,
+        secure=config.security.cookie_secure,
+        samesite=config.security.cookie_samesite,
+        path="/",
+    )
     return {"ok": True, "required": settings_service.access_password_required(), "token": token}
 
 
@@ -1265,6 +1603,12 @@ async def get_session(session_id: str, request: Request) -> dict[str, object]:
     return session_service.snapshot(session_id)
 
 
+
+@app.get("/api/rooms")
+async def list_rooms(request: Request) -> dict[str, object]:
+    _require_permission(request, "view_chats")
+    return {"rooms": session_service.list_rooms()}
+
 @app.post("/api/sessions/{session_id}/join")
 async def join_session(session_id: str, request: JoinSessionRequest, http_request: Request) -> dict[str, object]:
     _require_permission(http_request, "edit_messages")
@@ -1302,6 +1646,42 @@ async def update_generation_settings(request: GenerationSettingsUpdate, http_req
     await _broadcast_shared_settings("generation")
     return settings_service.generation_settings()
 
+
+
+@app.get("/api/settings/memory")
+async def get_summary_memory_settings(request: Request) -> dict[str, object]:
+    _require_permission(request, "view_presets")
+    return settings_service.summary_memory_settings()
+
+
+@app.put("/api/settings/memory")
+async def update_summary_memory_settings(request: SummaryMemorySettingsUpdate, http_request: Request) -> dict[str, object]:
+    _require_permission(http_request, "manage_presets")
+    settings_service.update_summary_memory_settings(request)
+    await _broadcast_shared_settings("memory")
+    return settings_service.summary_memory_settings()
+
+
+@app.post("/api/settings/memory/models")
+async def summary_memory_models(request: SummaryMemorySettingsUpdate, http_request: Request) -> dict[str, object]:
+    _require_permission(http_request, "manage_presets")
+    base_url = request.base_url.strip()
+    if base_url and not base_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="base_url must be http or https")
+    source_id = request.chat_completion_source or resolve_source_id(request.provider or "openai-compatible")
+    current_mem = settings_service.summary_memory_config()
+    api_key = request.api_key.strip() or secret_store.read(current_mem.api_key_secret, "")
+    if not api_key:
+        source = get_source(source_id)
+        if source and source.secret_key_name:
+            api_key = secret_store.read(source.secret_key_name, source.api_key_env)
+    provider = build_provider(
+        source_id,
+        base_url=base_url,
+        api_key=api_key,
+        timeout_seconds=30.0,
+    )
+    return await provider.status()
 
 @app.get("/api/generation/presets")
 async def generation_presets(request: Request) -> dict[str, object]:
@@ -1746,9 +2126,36 @@ async def import_character_card(request: Request, file: UploadFile = File(...)) 
         card = character_cards_service.import_card(file.filename, await file.read())
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    imported_regex_scripts: list[dict[str, Any]] = []
+    try:
+        card_data = character_cards_service.card_data(card.id)
+        char_book = card_data.get("character_book")
+        if isinstance(char_book, dict) and char_book.get("entries"):
+            book_name = str(char_book.get("name") or f"{card.name}_Lorebook").strip()
+            saved_book = lorebooks_service.save_book(LorebookPayload(name=book_name, book=char_book))
+            existing_bindings = lorebooks_service.bindings()
+            if not any(b.book == saved_book.name and b.target_type == "card" and b.target_id == card.id for b in existing_bindings):
+                from backend.app.services.lorebooks_service import LorebookBinding
+                lorebooks_service.save_bindings([*existing_bindings, LorebookBinding(book=saved_book.name, target_type="card", target_id=card.id)])
+                await _broadcast_shared_settings("lorebooks")
+        ext_data = card_data.get("extensions")
+        if isinstance(ext_data, dict) and isinstance(ext_data.get("regex_scripts"), list):
+            imported_regex_scripts = [item for item in ext_data["regex_scripts"] if isinstance(item, dict)]
+            if imported_regex_scripts:
+                ext_settings = extensions_service.get_settings()
+                regex_store = ext_settings.get("__dt_regex_store") if isinstance(ext_settings.get("__dt_regex_store"), dict) else {}
+                scoped_map = dict(regex_store.get("scoped")) if isinstance(regex_store.get("scoped"), dict) else {}
+                scoped_map[card.id] = imported_regex_scripts
+                allowed_list = list(regex_store.get("scopedAllowed")) if isinstance(regex_store.get("scopedAllowed"), list) else []
+                if card.id not in allowed_list:
+                    allowed_list.append(card.id)
+                extensions_service.save_settings({"__dt_regex_store": {**regex_store, "scoped": scoped_map, "scopedAllowed": allowed_list}}, merge=True)
+                await _broadcast_shared_settings("extension_settings")
+    except Exception:
+        pass
+    await _broadcast_shared_settings("cards")
     await _broadcast_notification(f"импортировал карточку: {card.name}", actor=_actor_from_request(request))
-    return {"card": card.model_dump(mode="json")}
-
+    return {"card": card.model_dump(mode="json"), "regex_scripts": imported_regex_scripts}
 
 @app.post("/api/cards")
 async def create_character_card(
@@ -1781,6 +2188,7 @@ async def create_character_card(
         card = character_cards_service.create_card(payload, avatar_content)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_shared_settings("cards")
     await _broadcast_notification(f"создал карточку: {card.name}", actor=_actor_from_request(http_request))
     return {"card": card.model_dump(mode="json")}
 
@@ -1799,6 +2207,7 @@ async def update_character_card(card_id: str, payload: CharacterCardUpdate, requ
         if not any(message.role == "user" for message in chat.messages):
             updated_chat = _ensure_card_first_message(card_id, chat.id)
             await _broadcast_chat(card_id, updated_chat.id)
+    await _broadcast_shared_settings("cards")
     await _broadcast_notification(f"обновил карточку: {card.name}", actor=_actor_from_request(request))
     return {"card": card.model_dump(mode="json")}
 
@@ -1814,6 +2223,7 @@ async def update_character_card_avatar(card_id: str, request: Request, file: Upl
         raise HTTPException(status_code=404, detail="Card not found") from error
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_shared_settings("cards")
     await _broadcast_notification(f"обновил аватар карточки: {card.name}", actor=_actor_from_request(request))
     return {"card": card.model_dump(mode="json")}
 
@@ -1845,19 +2255,21 @@ async def list_bot_chats(card_id: str, request: Request) -> dict[str, object]:
 @app.post("/api/cards/{card_id}/chats/current")
 async def current_bot_chat(card_id: str, request: ChatCreate, http_request: Request) -> dict[str, object]:
     _require_permission(http_request, "view_chats")
+    sid = _session_id_from_request(http_request)
     chat = bot_chats_service.current_or_create(card_id, request.character_name)
     chat = _ensure_card_first_message(card_id, chat.id)
+    session_service.set_active_chat(sid, card_id, chat.id)
     return {"chat": chat.model_dump(mode="json")}
 
 
 @app.post("/api/cards/{card_id}/chats")
 async def create_bot_chat(card_id: str, request: ChatCreate, http_request: Request) -> dict[str, object]:
     _require_permission(http_request, "manage_chats")
+    sid = _session_id_from_request(http_request)
     chat = bot_chats_service.create_chat(card_id, request)
     chat = _ensure_card_first_message(card_id, chat.id)
-    await _broadcast_chat(card_id, chat.id)
+    await _broadcast_chat(card_id, chat.id, switch_active=True, session_id=sid)
     return {"chat": chat.model_dump(mode="json")}
-
 
 @app.get("/api/cards/{card_id}/chats/{chat_id}")
 async def get_bot_chat(card_id: str, chat_id: str, request: Request) -> dict[str, object]:
@@ -1866,41 +2278,59 @@ async def get_bot_chat(card_id: str, chat_id: str, request: Request) -> dict[str
         chat = _ensure_card_first_message(card_id, chat_id)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Chat not found") from error
-    return {"chat": chat.model_dump(mode="json")}
+    task = generation_tasks.get(f"{card_id}:{chat_id}")
+    return {"chat": chat.model_dump(mode="json"), "is_generating": bool(task and not task.done())}
 
 
 @app.put("/api/cards/{card_id}/chats/{chat_id}")
 async def update_bot_chat(card_id: str, chat_id: str, request: ChatUpdate, http_request: Request) -> dict[str, object]:
     _require_permission(http_request, "manage_chats")
+    sid = _session_id_from_request(http_request)
     try:
         chat = bot_chats_service.update_chat(card_id, chat_id, request)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Chat not found") from error
-    await _broadcast_chat(card_id, chat_id)
+    await _broadcast_chat(card_id, chat_id, session_id=sid)
     return {"chat": chat.model_dump(mode="json")}
-
 
 @app.post("/api/cards/{card_id}/chats/{chat_id}/copy")
 async def copy_bot_chat(card_id: str, chat_id: str, request: Request) -> dict[str, object]:
     _require_permission(request, "manage_chats")
+    sid = _session_id_from_request(request)
     try:
         chat = bot_chats_service.copy_chat(card_id, chat_id)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Chat not found") from error
-    await _broadcast_chat(card_id, chat.id)
+    await _broadcast_chat(card_id, chat.id, switch_active=True, session_id=sid)
     return {"chat": chat.model_dump(mode="json")}
 
+
+@app.post("/api/cards/{card_id}/chats/{chat_id}/branch")
+async def branch_bot_chat(card_id: str, chat_id: str, payload: ChatBranchRequest, request: Request) -> dict[str, object]:
+    _require_permission(request, "manage_chats")
+    sid = _session_id_from_request(request)
+    try:
+        chat = bot_chats_service.branch_chat(card_id, chat_id, payload.up_to_message_id, payload.title)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Chat not found") from error
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Message not found") from error
+    await _broadcast_chat(card_id, chat.id, switch_active=True, session_id=sid)
+    await _broadcast_notification(f"создал ветку сюжета: {chat.title}", session_id=sid, actor=_actor_from_request(request))
+    return {"chat": chat.model_dump(mode="json")}
 
 @app.delete("/api/cards/{card_id}/chats/{chat_id}")
 async def delete_bot_chat(card_id: str, chat_id: str, request: Request) -> dict[str, object]:
     _require_permission(request, "manage_chats")
+    sid = _session_id_from_request(request)
     _require_delete_unlocked("chats", _chat_lock_key(card_id, chat_id))
     try:
         bot_chats_service.delete_chat(card_id, chat_id)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Chat not found") from error
     settings_service.clear_delete_lock("chats", _chat_lock_key(card_id, chat_id))
-    await connection_manager.broadcast(DEFAULT_SESSION_ID, {"type": "chat.deleted", "card_id": card_id, "chat_id": chat_id})
+    for target_sid in _target_sessions_for_chat(card_id, chat_id, sid, False):
+        await connection_manager.broadcast(target_sid, {"type": "chat.deleted", "card_id": card_id, "chat_id": chat_id})
     await _broadcast_delete_locks()
     return {"ok": True}
 
@@ -1920,18 +2350,88 @@ async def export_bot_chat_sillytavern(card_id: str, chat_id: str, request: Reque
     )
 
 
+@app.post("/api/cards/{card_id}/chats/import")
+async def import_bot_chat_sillytavern(card_id: str, request: Request, file: UploadFile = File(...)) -> dict[str, object]:
+    _require_permission(request, "manage_chats")
+    if not file.filename or not file.filename.lower().endswith((".jsonl", ".json")):
+        raise HTTPException(status_code=400, detail="Only .jsonl or .json chat files are supported")
+    try:
+        card_data = character_cards_service.card_data(card_id)
+        char_name = str(card_data.get("name") or "Character")
+    except FileNotFoundError:
+        char_name = "Character"
+    try:
+        raw_text = (await file.read()).decode("utf-8-sig")
+        chat = bot_chats_service.import_sillytavern_chat(card_id, char_name, file.filename, raw_text)
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    sid = _session_id_from_request(request)
+    await _broadcast_chat(card_id, chat.id, switch_active=True, session_id=sid)
+    await _broadcast_notification(f"импортировал чат: {chat.title}", session_id=sid, actor=_actor_from_request(request))
+    return {"chat": chat.model_dump(mode="json")}
 @app.post("/api/cards/{card_id}/chats/{chat_id}/messages")
 async def add_bot_chat_message(card_id: str, chat_id: str, request: ChatMessageCreate, http_request: Request) -> dict[str, object]:
     _require_permission(http_request, "edit_messages")
+    sid = _session_id_from_request(http_request)
+    raw_trimmed = request.content.strip()
     try:
-        chat = bot_chats_service.add_message(card_id, chat_id, request)
+        if re.match(r"^/(?:roll|r)\b", raw_trimmed, flags=re.IGNORECASE):
+            formula_part = re.sub(r"^/(?:roll|r)\s*", "", raw_trimmed, flags=re.IGNORECASE).strip() or "1d20"
+            chat = bot_chats_service.roll_dice_message(
+                card_id,
+                chat_id,
+                ChatDiceRollRequest(
+                    author=request.author,
+                    participant_id=request.participant_id,
+                    avatar_url=request.avatar_url,
+                    username=request.username,
+                    is_admin=request.is_admin,
+                    formula=formula_part,
+                ),
+            )
+        else:
+            chat = bot_chats_service.add_message(card_id, chat_id, request)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Chat not found") from error
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    await _broadcast_chat(card_id, chat_id)
-    return {"chat": chat.model_dump(mode="json")}
+    last_msg = chat.messages[-1] if chat.messages else None
+    all_ready = False
+    if request.participant_id:
+        if not (last_msg and (last_msg.is_ooc or last_msg.is_dice_roll)):
+            session_service.advance_turn(sid, request.participant_id, mark_ready=False)
+        await connection_manager.broadcast(
+            sid,
+            {"type": "typing.updated", "participant_id": request.participant_id, "name": request.author, "is_typing": False},
+        )
+        await _broadcast_presence(sid)
+    await _broadcast_chat(card_id, chat_id, session_id=sid)
+    if all_ready:
+        await connection_manager.broadcast(
+            sid,
+            {"type": "round.all_ready", "card_id": card_id, "chat_id": chat_id, "trigger_participant_id": request.participant_id},
+        )
+    return {"chat": chat.model_dump(mode="json"), "all_ready": all_ready}
 
+
+@app.post("/api/cards/{card_id}/chats/{chat_id}/roll")
+async def roll_bot_chat_dice(card_id: str, chat_id: str, request: ChatDiceRollRequest, http_request: Request) -> dict[str, object]:
+    _require_permission(http_request, "edit_messages")
+    sid = _session_id_from_request(http_request)
+    try:
+        chat = bot_chats_service.roll_dice_message(card_id, chat_id, request)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Chat not found") from error
+    all_ready = False
+    if request.participant_id:
+        await _broadcast_presence(sid)
+    await _broadcast_chat(card_id, chat_id, session_id=sid)
+    if all_ready:
+        await connection_manager.broadcast(
+            sid,
+            {"type": "round.all_ready", "card_id": card_id, "chat_id": chat_id, "trigger_participant_id": request.participant_id},
+        )
+    return {"chat": chat.model_dump(mode="json"), "all_ready": all_ready}
 
 @app.put("/api/cards/{card_id}/chats/{chat_id}/messages/{message_id}")
 async def update_bot_chat_message(card_id: str, chat_id: str, message_id: str, request: ChatMessageUpdate, http_request: Request) -> dict[str, object]:
@@ -1944,7 +2444,7 @@ async def update_bot_chat_message(card_id: str, chat_id: str, message_id: str, r
         raise HTTPException(status_code=404, detail="Message not found") from error
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    await _broadcast_chat(card_id, chat_id)
+    await _broadcast_chat(card_id, chat_id, session_id=_session_id_from_request(http_request))
     return {"chat": chat.model_dump(mode="json")}
 
 
@@ -1957,7 +2457,7 @@ async def delete_bot_chat_message(card_id: str, chat_id: str, message_id: str, r
         raise HTTPException(status_code=404, detail="Chat not found") from error
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Message not found") from error
-    await _broadcast_chat(card_id, chat_id)
+    await _broadcast_chat(card_id, chat_id, session_id=_session_id_from_request(request))
     return {"chat": chat.model_dump(mode="json")}
 
 
@@ -1972,14 +2472,87 @@ async def swipe_bot_chat_message(card_id: str, chat_id: str, message_id: str, re
         raise HTTPException(status_code=404, detail="Message not found") from error
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    await _broadcast_chat(card_id, chat_id)
+    await _broadcast_chat(card_id, chat_id, session_id=_session_id_from_request(http_request))
     return {"chat": chat.model_dump(mode="json")}
 
+
+
+@app.post("/api/cards/{card_id}/chats/{chat_id}/messages/{message_id}/vote")
+async def vote_bot_chat_swipe(card_id: str, chat_id: str, message_id: str, request: ChatSwipeVoteRequest, http_request: Request) -> dict[str, object]:
+    _require_permission(http_request, "view_chats")
+    sid = _session_id_from_request(http_request)
+    voter = request.voter.strip() or _actor_from_request(http_request) or "Player"
+    try:
+        chat = bot_chats_service.toggle_swipe_vote(card_id, chat_id, message_id, voter, request.swipe_index)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Chat not found") from error
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Message not found") from error
+    await _broadcast_chat(card_id, chat_id, session_id=sid)
+    return {"chat": chat.model_dump(mode="json")}
+
+
+@app.put("/api/cards/{card_id}/chats/{chat_id}/hud")
+async def update_bot_chat_hud(card_id: str, chat_id: str, payload: PartyHudState, request: Request) -> dict[str, object]:
+    _require_permission(request, "edit_messages")
+    sid = _session_id_from_request(request)
+    try:
+        chat = bot_chats_service.update_party_hud(card_id, chat_id, payload)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Chat not found") from error
+    await _broadcast_chat(card_id, chat_id, session_id=sid)
+    return {"chat": chat.model_dump(mode="json")}
+
+
+@app.put("/api/cards/{card_id}/chats/{chat_id}/memory")
+async def update_bot_chat_memory(card_id: str, chat_id: str, payload: ChatMemoryUpdate, request: Request) -> dict[str, object]:
+    _require_permission(request, "edit_messages")
+    sid = _session_id_from_request(request)
+    try:
+        chat = bot_chats_service.update_chat_memory(card_id, chat_id, payload.memory_summary, payload.memory_summarized_count)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Chat not found") from error
+    await _broadcast_chat(card_id, chat_id, session_id=sid)
+    return {"chat": chat.model_dump(mode="json")}
+
+
+async def _summarize_chat_now(card_id: str, chat_id: str, session_id: str = DEFAULT_SESSION_ID, force_full: bool = False) -> object:
+    chat = bot_chats_service.get_chat(card_id, chat_id)
+    mem_cfg = settings_service.summary_memory_config()
+    visible_msgs = [m for m in chat.messages if not m.hidden and not getattr(m, "is_ooc", False)]
+    start_idx = 0 if force_full else min(chat.memory_summarized_count, len(visible_msgs))
+    slice_to_summarize = visible_msgs[start_idx:]
+    if not slice_to_summarize and not force_full:
+        slice_to_summarize = visible_msgs[-min(len(visible_msgs), max(4, mem_cfg.every_n_messages)):]
+        existing = ""
+    else:
+        existing = "" if force_full else chat.memory_summary
+    new_summary = await generation_service.generate_chat_summary(mem_cfg, existing, slice_to_summarize, chat.character_name)
+    if new_summary:
+        chat = bot_chats_service.update_chat_memory(card_id, chat_id, new_summary, len(visible_msgs))
+        await _broadcast_chat(card_id, chat_id, session_id=session_id)
+    return chat
+
+
+@app.post("/api/cards/{card_id}/chats/{chat_id}/memory/summarize")
+async def summarize_bot_chat_memory(card_id: str, chat_id: str, request: Request) -> dict[str, object]:
+    _require_permission(request, "generate")
+    sid = _session_id_from_request(request)
+    try:
+        chat = await _summarize_chat_now(card_id, chat_id, session_id=sid, force_full=False)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Chat not found") from error
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Summary generation failed: {error}") from error
+    await _broadcast_notification("обновил хронику памяти чата (саммари)", session_id=sid, actor=_actor_from_request(request))
+    return {"chat": chat.model_dump(mode="json")}
 
 @app.post("/api/cards/{card_id}/chats/{chat_id}/bot/reply")
 async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Request, request: BotReplyRequest | None = None) -> dict[str, object]:
     _require_permission(http_request, "generate")
-    if not settings_service.bot_reply_allowed() and not (request and request.replace_message_id):
+    sid = _session_id_from_request(http_request)
+    req_user = _auth_user_from_request(http_request)
+    if not settings_service.bot_reply_allowed() and not (req_user and req_user.is_admin) and not (request and request.replace_message_id):
         raise HTTPException(status_code=403, detail="Bot reply button is disabled")
     task_key = f"{card_id}:{chat_id}"
     if task_key in generation_tasks:
@@ -1994,18 +2567,28 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
             if target_index < 0:
                 raise KeyError(replace_message_id)
             history = chat.messages[:target_index]
-        openai_preset = request.openai_preset if request and isinstance(request.openai_preset, dict) else _active_openai_preset()
+        openai_preset = request.openai_preset if (request and isinstance(request.openai_preset, dict) and request.openai_preset) else _active_openai_preset()
         character_data = character_cards_service.card_data(card_id)
-        persona_name, persona_description, multi_user_mode, persona_id = _generation_persona_context(request)
+        persona_name, persona_description, multi_user_mode, persona_ids = _generation_persona_context(request, history)
         regex_scripts = request.regex_scripts if request else []
         user_name = persona_name or "Player"
         char_name = chat.character_name or "Bot"
         if regex_scripts:
+            total_hist = len(history)
             history = [
-                message.model_copy(update={"content": RegexService.get_regexed_string(message.content, RegexService.PLACEMENT_AI_OUTPUT, regex_scripts, is_prompt=True, user_name=user_name, char_name=char_name)})
-                for message in history
+                message.model_copy(update={"content": RegexService.get_regexed_string(
+                    message.content,
+                    RegexService.PLACEMENT_USER_INPUT if message.role == "user" else RegexService.PLACEMENT_AI_OUTPUT,
+                    regex_scripts,
+                    is_prompt=True,
+                    depth=total_hist - 1 - idx,
+                    user_name=user_name,
+                    char_name=char_name,
+                )})
+                for idx, message in enumerate(history)
             ]
-        lorebook_context = lorebooks_service.active_context([message.content for message in history if not message.hidden], card_id, chat_id, persona_id or "")
+        char_book = character_data.get("character_book") if isinstance(character_data.get("character_book"), dict) else None
+        lorebook_context = lorebooks_service.active_context([message.content for message in history if not message.hidden and not getattr(message, "is_ooc", False)], card_id, chat_id, persona_ids, character_book=char_book)
         if regex_scripts:
             lorebook_context = lorebook_context.model_copy(update={
                 "worldInfoBefore": RegexService.get_regexed_string(lorebook_context.worldInfoBefore, RegexService.PLACEMENT_WORLD_INFO, regex_scripts, is_prompt=True, user_name=user_name, char_name=char_name),
@@ -2018,22 +2601,117 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
                     for dp in lorebook_context.depthPrompts
                 ],
             })
+        world_info_payload = lorebook_context.model_dump(mode="json")
+        extra_before: list[str] = []
+        mem_cfg = settings_service.summary_memory_config()
+        if mem_cfg.enabled and chat.memory_summary.strip():
+            extra_before.append(f"[Story Chronicle / Memory so far:\n{chat.memory_summary.strip()}]")
+        if chat.party_hud and chat.party_hud.enabled:
+            hud = chat.party_hud
+            hud_lines = ["[Current Party State (HUD):"]
+            if hud.location.strip():
+                hud_lines.append(f"- Location: {hud.location.strip()}")
+            if hud.time_of_day.strip():
+                hud_lines.append(f"- Time: {hud.time_of_day.strip()}")
+            if hud.quest.strip():
+                hud_lines.append(f"- Active Quest/Goal: {hud.quest.strip()}")
+            if hud.notes.strip():
+                hud_lines.append(f"- Notes: {hud.notes.strip()}")
+            for pl in hud.players:
+                if pl.name.strip():
+                    details = ", ".join(p for p in [f"HP: {pl.hp}" if pl.hp else "", f"Status: {pl.status}" if pl.status else "", f"Inventory: {pl.inventory}" if pl.inventory else ""] if p)
+                    hud_lines.append(f"- {pl.name.strip()}: {details or 'Active'}")
+            if getattr(hud, "auto_update", True):
+                hud_lines.append(
+                    "Instruction: If location, time, quest, notes, or any player's HP/status/inventory changes in this turn, append at the very end of your reply: "
+                    "[HUD: location=... | time=... | quest=... | PlayerName.hp=... | PlayerName.status=... | PlayerName.inv=+Item] (include only changed fields)."
+                )
+            if getattr(hud, "ai_roll_prompts", True):
+                hud_lines.append(
+                    "Dice checks: When a player attempts a risky or contested action without having rolled yet, ask for a roll at the end of your reply using: "
+                    "[ROLL: 1d20 | Проверка | DC 14] (or 2d20kh1 for advantage, 2d20kl1 for disadvantage)."
+                )
+            hud_lines.append("]")
+            extra_before.append("\n".join(hud_lines))
+        if extra_before:
+            existing_wb = str(world_info_payload.get("worldInfoBefore") or "").strip()
+            world_info_payload["worldInfoBefore"] = ("\n\n".join([*extra_before, existing_wb]) if existing_wb else "\n\n".join(extra_before))
+        if request and request.extension_prompts:
+            world_info_payload["extensionPrompts"] = request.extension_prompts
+        sid = _session_id_from_request(http_request)
+        session_service.reset_round_ready(sid)
+
+        last_stream_broadcast_at = 0.0
+
         async def broadcast_stream(content: str) -> None:
-            await _broadcast_generation_state(card_id, chat_id, "generation.stream", content, replace_message_id)
+            nonlocal last_stream_broadcast_at
+            now = time.monotonic()
+            if now - last_stream_broadcast_at < 0.032:
+                return
+            last_stream_broadcast_at = now
+            asyncio.create_task(_broadcast_generation_state(card_id, chat_id, "generation.stream", content, replace_message_id, session_id=sid))
 
         streaming_enabled = generation_service.should_stream_chat_reply(openai_preset)
         if streaming_enabled:
-            task = asyncio.create_task(generation_service.generate_chat_reply_stream(chat.character_name, history, openai_preset, character_data, persona_name, persona_description, lorebook_context.model_dump(mode="json"), multi_user_mode, broadcast_stream))
+            task = asyncio.create_task(generation_service.generate_chat_reply_stream(chat.character_name, history, openai_preset, character_data, persona_name, persona_description, world_info_payload, multi_user_mode, broadcast_stream))
         else:
-            task = asyncio.create_task(generation_service.generate_chat_reply(chat.character_name, history, openai_preset, character_data, persona_name, persona_description, lorebook_context.model_dump(mode="json"), multi_user_mode))
+            task = asyncio.create_task(generation_service.generate_chat_reply(chat.character_name, history, openai_preset, character_data, persona_name, persona_description, world_info_payload, multi_user_mode))
         generation_tasks[task_key] = task
-        await _broadcast_generation_state(card_id, chat_id, "generation.started", replace_message_id=replace_message_id, streaming=streaming_enabled)
+        asyncio.create_task(_broadcast_presence(sid))
+        asyncio.create_task(_broadcast_generation_state(card_id, chat_id, "generation.started", replace_message_id=replace_message_id, streaming=streaming_enabled, session_id=sid))
         reply = await task
         if streaming_enabled:
-            await _broadcast_generation_state(card_id, chat_id, "generation.stream", reply, replace_message_id)
+            asyncio.create_task(_broadcast_generation_state(card_id, chat_id, "generation.stream", reply, replace_message_id, session_id=sid))
         if regex_scripts:
             reply = RegexService.get_regexed_string(reply, RegexService.PLACEMENT_AI_OUTPUT, regex_scripts, is_prompt=False, user_name=user_name, char_name=char_name)
-        avatar_url = next((card.image_url for card in character_cards_service.list_cards() if card.id == card_id), "")
+        if chat.party_hud and chat.party_hud.enabled:
+            hud_matches = list(re.finditer(r"\[HUD:\s*([^\]]+)\]", reply, flags=re.IGNORECASE))
+            if hud_matches:
+                hud_copy = chat.party_hud.model_copy(deep=True)
+                for hm in hud_matches:
+                    for kv in hm.group(1).split("|"):
+                        if "=" not in kv:
+                            continue
+                        k, v = [s.strip() for s in kv.split("=", 1)]
+                        kl = k.lower()
+                        if kl in {"location", "локация"}:
+                            hud_copy.location = v
+                        elif kl in {"time", "time_of_day", "время"}:
+                            hud_copy.time_of_day = v
+                        elif kl in {"quest", "квест", "цель"}:
+                            hud_copy.quest = v
+                        elif kl in {"notes", "заметки"}:
+                            hud_copy.notes = v
+                        elif "." in k:
+                            p_name, p_field = [s.strip() for s in k.split(".", 1)]
+                            pf = p_field.lower()
+                            if not p_name:
+                                continue
+                            target_pl = next((pl for pl in hud_copy.players if pl.name.strip().lower() == p_name.lower()), None)
+                            if target_pl is None:
+                                from backend.app.services.bot_chats_service import PartyHudPlayer
+                                target_pl = PartyHudPlayer(name=p_name)
+                                hud_copy.players.append(target_pl)
+                            if pf in {"hp", "хп", "здоровье"}:
+                                target_pl.hp = v
+                            elif pf in {"status", "статус", "state"}:
+                                target_pl.status = v if v.lower() not in {"none", "нет", "-", "ok", "норма"} else ""
+                            elif pf in {"inv", "inventory", "инвентарь", "items"}:
+                                items = [it.strip() for it in target_pl.inventory.split(",") if it.strip()]
+                                if v.startswith("+"):
+                                    new_item = v[1:].strip()
+                                    if new_item and new_item.lower() not in {it.lower() for it in items}:
+                                        items.append(new_item)
+                                    target_pl.inventory = ", ".join(items)
+                                elif v.startswith("-"):
+                                    rem_item = v[1:].strip().lower()
+                                    items = [it for it in items if it.lower() != rem_item]
+                                    target_pl.inventory = ", ".join(items)
+                                else:
+                                    target_pl.inventory = v
+                bot_chats_service.update_party_hud(card_id, chat_id, hud_copy)
+                reply = re.sub(r"\[HUD:\s*[^\]]+\]\s*", "", reply, flags=re.IGNORECASE).strip() or reply
+        avatar_url = _card_avatar_url(card_id)
         if replace_message_id:
             chat = bot_chats_service.replace_bot_message(card_id, chat_id, replace_message_id, chat.character_name, reply, avatar_url, reset_swipes)
         else:
@@ -2043,15 +2721,15 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Message not found") from error
     except asyncio.CancelledError as error:
-        await _broadcast_generation_state(card_id, chat_id, "generation.cancelled", "Генерация отменена", replace_message_id)
+        await _broadcast_generation_state(card_id, chat_id, "generation.cancelled", "Генерация отменена", replace_message_id, session_id=sid)
         raise HTTPException(status_code=499, detail="Generation cancelled") from error
     except httpx.ReadTimeout as error:
         message = "Provider did not finish the response in time. Increase timeout or reduce max tokens/context."
-        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id)
+        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id, session_id=sid)
         raise HTTPException(status_code=504, detail=message) from error
     except httpx.RemoteProtocolError as error:
         message = f"Provider closed the connection before sending a response: {error}"
-        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id)
+        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id, session_id=sid)
         raise HTTPException(status_code=502, detail=message) from error
     except httpx.HTTPStatusError as error:
         try:
@@ -2059,30 +2737,42 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
         except httpx.ResponseNotRead:
             response_text = "<streaming response body was not read>"
         message = f"Provider returned {error.response.status_code}: {response_text}"
-        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id)
+        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id, session_id=sid)
         raise HTTPException(status_code=502, detail=message) from error
     except httpx.HTTPError as error:
         message = f"Provider request failed: {error}"
-        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id)
+        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id, session_id=sid)
         raise HTTPException(status_code=502, detail=message) from error
     except RuntimeError as error:
         message = str(error)
-        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id)
+        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id, session_id=sid)
         raise HTTPException(status_code=400, detail=message) from error
     finally:
         generation_tasks.pop(task_key, None)
-    await _broadcast_chat(card_id, chat_id)
-    await _broadcast_generation_state(card_id, chat_id, "generation.finished", replace_message_id=replace_message_id)
+    await _broadcast_chat(card_id, chat_id, session_id=sid)
+    await _broadcast_generation_state(card_id, chat_id, "generation.finished", replace_message_id=replace_message_id, session_id=sid)
+    mem_cfg = settings_service.summary_memory_config()
+    if mem_cfg.enabled and mem_cfg.auto_summarize:
+        visible_count = len([m for m in chat.messages if not m.hidden and not getattr(m, "is_ooc", False)])
+        if visible_count - chat.memory_summarized_count >= max(2, mem_cfg.every_n_messages):
+            async def _bg_summarize() -> None:
+                try:
+                    await _summarize_chat_now(card_id, chat_id, session_id=sid, force_full=False)
+                    await _broadcast_notification("📜 память чата автоматически обновлена (авто-саммари)", session_id=sid)
+                except Exception as exc:
+                    logging.getLogger(__name__).warning("Auto-summarize failed: %s", exc)
+            asyncio.create_task(_bg_summarize())
     return {"chat": chat.model_dump(mode="json")}
 
 
 @app.post("/api/cards/{card_id}/chats/{chat_id}/bot/cancel")
 async def cancel_card_bot_reply(card_id: str, chat_id: str, request: Request) -> dict[str, object]:
     _require_permission(request, "generate")
+    sid = _session_id_from_request(request)
     task = generation_tasks.get(f"{card_id}:{chat_id}")
     if task and not task.done():
         task.cancel()
-        await _broadcast_generation_state(card_id, chat_id, "generation.cancelled", "Генерация отменяется")
+        await _broadcast_generation_state(card_id, chat_id, "generation.cancelled", "Генерация отменяется", session_id=sid)
         return {"cancelled": True}
     return {"cancelled": False}
 
@@ -2100,25 +2790,30 @@ async def character_card_image(card_id: str, request: Request) -> FileResponse:
 @app.get("/api/personas")
 async def list_personas(request: Request) -> dict[str, object]:
     _require_permission(request, "view_personas")
-    return {"personas": [persona.model_dump(mode="json") for persona in personas_service.list_personas()]}
+    user = _auth_user_from_request(request)
+    owner = user.username if user else ""
+    is_admin = bool(user and user.is_admin)
+    return {"personas": [persona.model_dump(mode="json") for persona in personas_service.list_personas(owner=owner, is_admin=is_admin)]}
 
 
 @app.post("/api/personas")
 async def create_persona(payload: PersonaCreate, request: Request) -> dict[str, object]:
     _require_permission(request, "edit_personas")
-    persona = personas_service.create_persona(payload)
-    await _broadcast_notification(f"создал персону: {persona.name}", actor=_actor_from_request(request))
+    user = _auth_user_from_request(request)
+    persona = personas_service.create_persona(payload, owner=user.username if user else "")
+    await _broadcast_shared_settings("personas")
     return {"persona": persona.model_dump(mode="json")}
 
 
 @app.put("/api/personas/{persona_id}")
 async def update_persona(persona_id: str, payload: PersonaUpdate, request: Request) -> dict[str, object]:
     _require_permission(request, "edit_personas")
+    user = _auth_user_from_request(request)
     try:
-        persona = personas_service.update_persona(persona_id, payload)
+        persona = personas_service.update_persona(persona_id, payload, owner=user.username if user else "", is_admin=bool(user and user.is_admin))
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Persona not found") from error
-    await _broadcast_notification(f"обновил персону: {persona.name}", actor=_actor_from_request(request))
+    await _broadcast_shared_settings("personas")
     return {"persona": persona.model_dump(mode="json")}
 
 
@@ -2126,27 +2821,27 @@ async def update_persona(persona_id: str, payload: PersonaUpdate, request: Reque
 async def delete_persona(persona_id: str, request: Request) -> dict[str, object]:
     _require_permission(request, "delete_personas")
     _require_delete_unlocked("personas", persona_id)
+    user = _auth_user_from_request(request)
     try:
-        persona = personas_service.delete_persona(persona_id)
+        persona = personas_service.delete_persona(persona_id, owner=user.username if user else "", is_admin=bool(user and user.is_admin))
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Persona not found") from error
     settings_service.clear_delete_lock("personas", persona_id)
     await _broadcast_delete_locks()
-    await _broadcast_notification(f"удалил персону: {persona.name}", actor=_actor_from_request(request))
+    await _broadcast_shared_settings("personas")
     return {"ok": True, "persona": persona.model_dump(mode="json")}
 
 
 @app.put("/api/personas/{persona_id}/active")
 async def activate_persona(persona_id: str, request: Request) -> dict[str, object]:
     _require_permission(request, "edit_personas")
+    user = _auth_user_from_request(request)
     try:
-        persona = personas_service.activate_persona(persona_id)
+        persona = personas_service.activate_persona(persona_id, owner=user.username if user else "")
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Persona not found") from error
-    await _broadcast_notification(f"изменил активную персону: {persona.name}", actor=_actor_from_request(request))
+    await _broadcast_shared_settings("personas")
     return {"persona": persona.model_dump(mode="json")}
-
-
 @app.post("/api/personas/{persona_id}/avatar")
 async def upload_persona_avatar(persona_id: str, request: Request, file: UploadFile = File(...)) -> dict[str, object]:
     _require_permission(request, "edit_personas")
@@ -2158,6 +2853,7 @@ async def upload_persona_avatar(persona_id: str, request: Request, file: UploadF
         raise HTTPException(status_code=400, detail=str(error)) from error
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Persona not found") from error
+    await _broadcast_shared_settings("personas")
     await _broadcast_notification(f"обновил аватар персоны: {persona.name}", actor=_actor_from_request(request))
     return {"persona": persona.model_dump(mode="json")}
 
@@ -2224,47 +2920,99 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
         return
     participant_id: str | None = None
     try:
-        await websocket.send_json({"type": "session.snapshot", "session": session_service.snapshot(session_id)})
+        session_service.prune_disconnected(session_id, connection_manager.active_participant_ids(session_id))
+        await websocket.send_json({
+            "type": "session.snapshot",
+            "session": session_service.snapshot(session_id),
+            "active_generations": [key for key, task in generation_tasks.items() if not task.done()],
+        })
         while True:
             raw_event = await websocket.receive_json()
-            event = ClientEvent.model_validate(raw_event)
+            try:
+                event = ClientEvent.model_validate(raw_event)
+            except Exception:
+                continue
 
-            if event.type == "participant.join":
+            if event.type == "ping":
+                await websocket.send_json({"type": "pong"})
+                continue
+
+            if event.type in {"participant.join", "presence.update"}:
+                ws_user = auth_service.user_by_token(_token_from_websocket(websocket))
+                resolved_username = ws_user.username if ws_user else (event.username or "")
+                resolved_is_admin = bool(ws_user.is_admin) if ws_user else bool(event.is_admin)
+                incoming_pid = event.participant_id or participant_id
                 participant = session_service.join_session(
                     session_id,
                     event.name or event.persona_name or "Player",
-                    event.participant_id,
+                    incoming_pid,
                     event.persona_id or "",
                     event.persona_name or "",
                     event.avatar_url or "",
-                    event.username or "",
-                    bool(event.is_admin),
+                    resolved_username,
+                    resolved_is_admin,
                 )
+                if incoming_pid and incoming_pid != participant.id:
+                    connection_manager.rebind_participant(session_id, incoming_pid, participant.id)
                 participant_id = participant.id
+                connection_manager.bind_participant(session_id, websocket, participant.id)
                 await _broadcast_presence(session_id)
-
-            if event.type == "presence.update" and event.participant_id:
-                participant = session_service.update_presence(
-                    session_id,
-                    event.participant_id,
-                    event.name or event.persona_name or "Player",
-                    event.persona_id or "",
-                    event.persona_name or "",
-                    event.avatar_url or "",
-                    event.username or "",
-                    bool(event.is_admin),
-                )
-                participant_id = participant.id
-                await _broadcast_presence(session_id)
-
             if event.type == "card.select" and event.name:
+                if event.card_id:
+                    session_service.set_active_chat(session_id, event.card_id, event.chat_id or "")
+                    await connection_manager.broadcast(
+                        session_id,
+                        {
+                            "type": "card.select",
+                            "card_id": event.card_id,
+                            "chat_id": event.chat_id or "",
+                            "name": event.name,
+                            "source_participant_id": event.participant_id or participant_id or "",
+                        },
+                    )
                 actor = event.username or event.persona_name or event.name or ""
                 await _broadcast_notification(f"выбрал карточку: {event.name}", session_id, actor)
-
             if event.type == "notification" and event.content:
                 await _broadcast_notification(event.content, session_id, event.username or event.persona_name or event.name or "")
 
-            if event.type in {"image_generation.pending", "image_generation.finished"} and event.card_id and event.chat_id and event.message_id:
+            if event.type == "typing.update" and (event.participant_id or participant_id):
+                await connection_manager.broadcast(
+                    session_id,
+                    {
+                        "type": "typing.updated",
+                        "participant_id": event.participant_id or participant_id or "",
+                        "name": event.persona_name or event.name or "Player",
+                        "is_typing": bool(event.is_typing),
+                    },
+                )
+
+            if event.type == "turn.mode" and event.turn_mode:
+                session_service.set_turn_mode(session_id, event.turn_mode)
+                await _broadcast_presence(session_id)
+
+            if event.type == "turn.ready" and (event.participant_id or participant_id):
+                pid = event.participant_id or participant_id or ""
+                all_ready = session_service.mark_participant_ready(session_id, pid, ready=True if event.ready is None else bool(event.ready))
+                await _broadcast_presence(session_id)
+                if all_ready:
+                    sess = session_service.get_or_create_session(session_id)
+                    await connection_manager.broadcast(
+                        session_id,
+                        {"type": "round.all_ready", "card_id": event.card_id or sess.active_card_id, "chat_id": event.chat_id or sess.active_chat_id, "trigger_participant_id": pid},
+                    )
+
+            if event.type == "turn.pass" and (event.participant_id or participant_id):
+                pid = event.participant_id or participant_id or ""
+                all_ready = session_service.advance_turn(session_id, pid)
+                await _broadcast_presence(session_id)
+                if all_ready:
+                    sess = session_service.get_or_create_session(session_id)
+                    await connection_manager.broadcast(
+                        session_id,
+                        {"type": "round.all_ready", "card_id": event.card_id or sess.active_card_id, "chat_id": event.chat_id or sess.active_chat_id, "trigger_participant_id": pid},
+                    )
+
+            if event.type in {"image.pending", "image.done"}:
                 await connection_manager.broadcast(
                     session_id,
                     {
@@ -2275,7 +3023,6 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
                         "source_participant_id": event.source_participant_id or event.participant_id or "",
                     },
                 )
-
             if event.type == "message.send" and event.participant_id and event.content:
                 message = session_service.add_message(
                     session_id,
@@ -2285,14 +3032,24 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
                     session_id,
                     {"type": "session.updated", "session": session_service.snapshot(session_id), "message": message.model_dump(mode="json")},
                 )
-    except WebSocketDisconnect:
-        if participant_id:
-            session_service.disconnect_participant(session_id, participant_id)
-            await _broadcast_presence(session_id)
+    except (WebSocketDisconnect, Exception):
+        pass
     finally:
-        connection_manager.disconnect(session_id, websocket)
-
+        bound_pid = connection_manager.disconnect(session_id, websocket) or participant_id
+        if bound_pid and not connection_manager.has_other_connections(session_id, bound_pid, websocket):
+            session_service.disconnect_participant(session_id, bound_pid)
+            await _broadcast_presence(session_id)
 
 frontend_dist = PROJECT_ROOT / "frontend" / "dist"
 if frontend_dist.exists():
+    @app.get("/")
+    @app.get("/index.html")
+    async def serve_frontend_index(request: Request) -> Response:
+        resp = Response(
+            content=(frontend_dist / "index.html").read_bytes(),
+            media_type="text/html; charset=utf-8",
+        )
+        _apply_cache_bust_headers(request, resp)
+        return resp
+
     app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")

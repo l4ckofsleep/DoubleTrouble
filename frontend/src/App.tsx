@@ -1,18 +1,18 @@
-import { Fragment, useEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react';
+import { Fragment, memo, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { emitSillyTavernChatChanged, emitSillyTavernMessageRendered, emitSillyTavernMessageSwiped, formatExtensionMessageHtml, initSillyTavernExtensions, updateSillyTavernExtensionSettings, updateSillyTavernRuntime, type ExtensionMessageFormatOptions } from './sillyTavernExtensions';
-import { getRegexedString, getRegexScripts, regex_placement, setRegexContext, setRegexNames } from './regexEngine';
+import { emitSillyTavernChatChanged, emitSillyTavernGenerationEvent, emitSillyTavernMessageRendered, emitSillyTavernMessageSwiped, executeExtensionSlashCommand, formatExtensionMessageHtml, getActiveExtensionPrompts, initSillyTavernExtensions, syncServerExtensionSettings, syncSillyTavernExtensions, updateSillyTavernExtensionSettings, updateSillyTavernRuntime, type ExtensionMessageFormatOptions } from './sillyTavernExtensions';
+import { allowScopedScripts, getRegexedString, getRegexScripts, regex_placement, saveScriptsByType, SCRIPT_TYPES, setRegexContext, setRegexNames, type RegexScript } from './regexEngine';
 import { RegexSettingsPortal } from './RegexSettings';
 import { MagicTranslationSettingsPortal } from './MagicTranslationSettings';
 import { loadMagicTranslationSettings, translateText } from './magicTranslationEngine';
 import { useLocaleContext, type Language } from './localization';
 
 type MenuSection = 'presets' | 'connection' | 'visual' | 'personas' | 'security' | 'lorebooks' | 'cards' | 'extensions';
-type IconName = 'sliders' | 'plug' | 'palette' | 'user' | 'card' | 'book' | 'bot' | 'lock' | 'key' | 'menu' | 'send' | 'edit' | 'trash' | 'eye' | 'eyeOff' | 'check' | 'x';
+type IconName = 'sliders' | 'plug' | 'palette' | 'user' | 'card' | 'book' | 'bot' | 'lock' | 'key' | 'menu' | 'send' | 'edit' | 'trash' | 'eye' | 'eyeOff' | 'check' | 'x' | 'branch' | 'translate';
 type ThemeId = 'midnight' | 'parchment' | 'abyss' | 'forest' | 'ocean' | 'plum' | 'ember' | 'aurora' | 'rose' | 'slate' | 'noir' | 'cyberpunk' | 'dracula' | 'nord' | 'coffee' | 'porcelain' | 'mint' | 'lavender' | 'solar' | 'sand' | 'linen' | 'cloud' | 'buttercream' | 'seashell' | 'morning' | 'paper';
 type VisualSettings = {
   theme: ThemeId;
-  textScale: 'small' | 'normal' | 'large' | 'huge';
+  textScale: 'tiny' | 'small' | 'normal' | 'large' | 'huge';
   density: 'compact' | 'comfortable' | 'spacious';
   messageWidth: 'narrow' | 'standard' | 'wide';
   radius: 'sharp' | 'soft' | 'round';
@@ -77,10 +77,69 @@ type ChatMessage = {
   content: string;
   display_text: string;
   hidden: boolean;
+  is_ooc?: boolean;
+  is_secret?: boolean;
+  secret_revealed?: boolean;
+  is_dice_roll?: boolean;
+  dice_data?: {
+    formula?: string;
+    rolls?: number[];
+    modifier?: number;
+    total?: number;
+    label?: string;
+    dc?: number | null;
+    success?: boolean | null;
+  };
   swipes?: string[];
   active_swipe_index?: number;
+  swipe_votes?: Record<string, string[]>;
   created_at: string;
   updated_at: string;
+};
+
+type PartyHudPlayer = {
+  name: string;
+  hp: string;
+  status: string;
+  inventory: string;
+};
+
+type PartyHudState = {
+  enabled: boolean;
+  auto_update?: boolean;
+  ai_roll_prompts?: boolean;
+  location: string;
+  time_of_day: string;
+  quest: string;
+  notes: string;
+  players: PartyHudPlayer[];
+};
+
+type SummaryMemorySettings = {
+  enabled: boolean;
+  auto_summarize: boolean;
+  every_n_messages: number;
+  use_separate_api: boolean;
+  provider: string;
+  chat_completion_source: string;
+  base_url: string;
+  model: string;
+  api_key: string;
+  clear_api_key: boolean;
+  api_key_configured?: boolean;
+  temperature: number;
+  max_tokens: number;
+  prompt: string;
+};
+
+type RoomInfo = {
+  id: string;
+  title: string;
+  online_count: number;
+  online_players: string[];
+  active_card_id: string;
+  active_chat_id: string;
+  turn_mode: string;
 };
 
 type BotChatSummary = {
@@ -96,8 +155,13 @@ type BotChat = BotChatSummary & {
   card_id: string;
   character_name: string;
   messages: ChatMessage[];
+  party_hud?: PartyHudState;
+  memory_summary?: string;
+  memory_summarized_count?: number;
+  last_summarized_at?: string;
+  parent_chat_id?: string;
+  branched_from_message_id?: string;
 };
-
 type GenerationSettings = {
   provider: string;
   chat_completion_source: string;
@@ -227,7 +291,20 @@ type RealtimePayload = {
   card_id?: string;
   chat_id?: string;
   chat?: BotChat;
-  session?: { participants?: Record<string, Participant> };
+  switch_active?: boolean;
+  active_generations?: string[];
+  session?: {
+    participants?: Record<string, Participant>;
+    active_card_id?: string;
+    active_chat_id?: string;
+    turn?: { current_participant_id?: string | null; order?: string[]; mode?: string; ready_participant_ids?: string[] };
+  };
+  participant_id?: string;
+  trigger_participant_id?: string;
+  name?: string;
+  is_typing?: boolean;
+  turn_mode?: string;
+  ready?: boolean;
   message?: string;
   message_id?: string;
   replace_message_id?: string | null;
@@ -312,8 +389,8 @@ function getPermissionLabels(t: (key: string) => string): Record<string, string>
     view_chats: t('permissions.viewChats'),
     view_presets: t('permissions.viewPresets'),
     view_lorebooks: t('permissions.viewLorebooks'),
+    view_reasoning: t('permissions.viewReasoning'),
     edit_cards: t('permissions.editCards'),
-    delete_cards: t('permissions.deleteCards'),
     edit_personas: t('permissions.editPersonas'),
     delete_personas: t('permissions.deletePersonas'),
     manage_chats: t('permissions.manageChats'),
@@ -328,7 +405,7 @@ function getPermissionLabels(t: (key: string) => string): Record<string, string>
   };
 }
 
-const defaultSecurityPermissionKeys = ['view_cards', 'view_personas', 'view_chats', 'view_presets', 'view_lorebooks', 'edit_cards', 'delete_cards', 'edit_personas', 'delete_personas', 'manage_chats', 'edit_messages', 'delete_messages', 'generate', 'manage_presets', 'manage_lorebooks', 'manage_extensions', 'manage_keys', 'manage_security'];
+const defaultSecurityPermissionKeys = ['view_cards', 'view_personas', 'view_chats', 'view_presets', 'view_lorebooks', 'view_reasoning', 'edit_cards', 'delete_cards', 'edit_personas', 'delete_personas', 'manage_chats', 'edit_messages', 'delete_messages', 'generate', 'manage_presets', 'manage_lorebooks', 'manage_extensions', 'manage_keys', 'manage_security'];
 const defaultSecurityPermissions: SecurityPermissions = Object.fromEntries(defaultSecurityPermissionKeys.map((key) => [key, { mode: key === 'manage_security' || key === 'manage_keys' ? 'admins' : 'everyone', users: [] }])) as SecurityPermissions;
 const defaultDeletionLocks: DeletionLocks = { cards: [], personas: [], chats: [] };
 const defaultBuiltInExtensionSettings: BuiltInExtensionSettings = { noriMynInfoblock: true, magicTranslation: true };
@@ -493,7 +570,7 @@ const defaultVisualSettings: VisualSettings = {
 };
 
 const themes: Array<{ id: ThemeId; name: string; description: string; swatches: string[]; tone: 'dark' | 'light' }> = [
-  { id: 'midnight', name: 'Midnight', description: 'theme.midnight', swatches: ['#0f1418', '#1d2630', '#d8a75f', '#73b7a7'], tone: 'dark' },
+  { id: 'midnight', name: 'Midnight', description: 'theme.midnight', swatches: ['#090a0d', '#171a21', '#7c8aff', '#56d4b0'], tone: 'dark' },
   { id: 'abyss', name: 'Abyss', description: 'theme.abyss', swatches: ['#000000', '#0a0a0a', '#d6b46a', '#6fb5a5'], tone: 'dark' },
   { id: 'forest', name: 'Forest', description: 'theme.forest', swatches: ['#0f1712', '#1c2a20', '#c69a55', '#7fb069'], tone: 'dark' },
   { id: 'ocean', name: 'Ocean', description: 'theme.ocean', swatches: ['#0c1420', '#172638', '#7fb7ff', '#76d1cf'], tone: 'dark' },
@@ -526,6 +603,10 @@ const lightThemes = themes.filter((theme) => theme.tone === 'light');
 
 function getSlashCommands(t: (key: string) => string) {
   return [
+    { command: '/ooc', hint: '<текст>', description: 'Внеигровой комментарий (виден игрокам, скрыт от ИИ)' },
+    { command: '/secret', hint: '<действие>', description: 'Тайный ход / записка мастеру (скрыто от других игроков)' },
+    { command: '/roll', hint: '1d20+3 [Навык] DC 15', description: 'Бросок кубиков с проверкой сложности' },
+    { command: '/branch', hint: '[название]', description: 'Создать альтернативную ветку чата с этого момента' },
     { command: '/hide', hint: '0-3', description: t('commands.hideMessages') },
     { command: '/unhide', hint: '0-3', description: t('commands.unhideMessages') },
     { command: '/delete', hint: '4 7-9', description: t('commands.deleteMessages') },
@@ -546,10 +627,23 @@ function loadVisualSettings(): VisualSettings {
   }
 }
 
+let cachedBuiltInExtensionSettings: BuiltInExtensionSettings | null = null;
+
+function saveBuiltInExtensionSettings(nextSettings: BuiltInExtensionSettings): void {
+  cachedBuiltInExtensionSettings = nextSettings;
+  window.localStorage.setItem(BUILT_IN_EXTENSIONS_STORAGE_KEY, JSON.stringify(nextSettings));
+}
+
 function loadBuiltInExtensionSettings(): BuiltInExtensionSettings {
+  if (cachedBuiltInExtensionSettings) {
+    return cachedBuiltInExtensionSettings;
+  }
   try {
-    return { ...defaultBuiltInExtensionSettings, ...JSON.parse(window.localStorage.getItem(BUILT_IN_EXTENSIONS_STORAGE_KEY) || '{}') };
+    const next: BuiltInExtensionSettings = { ...defaultBuiltInExtensionSettings, ...JSON.parse(window.localStorage.getItem(BUILT_IN_EXTENSIONS_STORAGE_KEY) || '{}') };
+    cachedBuiltInExtensionSettings = next;
+    return next;
   } catch {
+    cachedBuiltInExtensionSettings = defaultBuiltInExtensionSettings;
     return defaultBuiltInExtensionSettings;
   }
 }
@@ -691,7 +785,13 @@ export default function App() {
   const [playersMenuOpen, setPlayersMenuOpen] = useState(false);
   const [extensionSettingsOpen, setExtensionSettingsOpen] = useState(false);
   const [extensionSettingsTarget, setExtensionSettingsTarget] = useState('');
-  const [mobileTopbarCollapsed, setMobileTopbarCollapsed] = useState(false);
+  const [mobileTopbarCollapsed, setMobileTopbarCollapsed] = useState(() => typeof window !== 'undefined' && window.innerWidth <= 640);
+  const [showScrollBottomButton, setShowScrollBottomButton] = useState(false);
+  const [regexRenderTick, setRegexRenderTick] = useState(0);
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const isNearBottomRef = useRef(true);
+  const lastScrolledChatIdRef = useRef('');
+  const lastMessageCountRef = useRef(0);
   const [selectedPersonaId, setSelectedPersonaId] = useState(() => window.localStorage.getItem(SELECTED_PERSONA_STORAGE_KEY) || '');
   const [generationSettings, setGenerationSettings] = useState<GenerationSettings>(defaultGenerationSettings);
   const [models, setModels] = useState<string[]>([]);
@@ -706,6 +806,7 @@ export default function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationStatus, setGenerationStatus] = useState('');
   const [generationStreamText, setGenerationStreamText] = useState('');
+  const [displayedStreamText, setDisplayedStreamText] = useState('');
   const [generationReplaceMessageId, setGenerationReplaceMessageId] = useState<string | null>(null);
   const [topbarVisible, setTopbarVisible] = useState(true);
   const [chatRenameDrafts, setChatRenameDrafts] = useState<Record<string, string>>({});
@@ -726,6 +827,65 @@ export default function App() {
   const [activePresets, setActivePresets] = useState<Record<string, string>>({});
   const [editingPromptId, setEditingPromptId] = useState('');
   const [participants, setParticipants] = useState<Participant[]>([]);
+  const [currentTurnParticipantId, setCurrentTurnParticipantId] = useState<string | null>(null);
+  const [turnMode, setTurnMode] = useState<'free' | 'round_ready'>('free');
+  const [readyParticipantIds, setReadyParticipantIds] = useState<string[]>([]);
+  const [currentRoomId, setCurrentRoomId] = useState<string>(() => {
+    const fromUrl = new URLSearchParams(window.location.search).get('room')?.trim();
+    if (fromUrl) {
+      window.localStorage.setItem('doubletrouble.roomId', fromUrl);
+      return fromUrl;
+    }
+    return window.localStorage.getItem('doubletrouble.roomId') || 'default';
+  });
+  const currentRoomIdRef = useRef(currentRoomId);
+  const [roomsList, setRoomsList] = useState<RoomInfo[]>([]);
+  const [roomInputDraft, setRoomInputDraft] = useState('');
+  const [composerMode, setComposerMode] = useState<'normal' | 'ooc' | 'secret'>('normal');
+  const [diceRollerOpen, setDiceRollerOpen] = useState(false);
+  const [diceDraft, setDiceDraft] = useState<{ formula: string; modifier: string; dc: string; label: string }>({
+    formula: '1d20',
+    modifier: '',
+    dc: '',
+    label: '',
+  });
+  const [partyHudExpanded, setPartyHudExpanded] = useState(false);
+  const [partyHudEditing, setPartyHudEditing] = useState(false);
+  const [partyHudDraft, setPartyHudDraft] = useState<PartyHudState>({
+    enabled: false,
+    auto_update: true,
+    ai_roll_prompts: true,
+    location: '',
+    time_of_day: '',
+    quest: '',
+    notes: '',
+    players: [],
+  });
+  const [memoryModalOpen, setMemoryModalOpen] = useState(false);
+  const [summaryMemorySettings, setSummaryMemorySettings] = useState<SummaryMemorySettings>({
+    enabled: false,
+    auto_summarize: true,
+    every_n_messages: 20,
+    use_separate_api: false,
+    provider: 'openai-compatible',
+    chat_completion_source: 'custom',
+    base_url: '',
+    model: '',
+    api_key: '',
+    clear_api_key: false,
+    api_key_configured: false,
+    temperature: 0.3,
+    max_tokens: 800,
+    prompt: 'Summarize the key events, character relationships, important decisions, inventory/state changes, and current situation from the roleplay conversation. Integrate with any existing chronicle seamlessly. Write a concise, well-structured chronicle in the same language as the chat.',
+  });
+  const [summaryModels, setSummaryModels] = useState<string[]>([]);
+  const [summaryStatusMessage, setSummaryStatusMessage] = useState('');
+  const [chatMemoryDraft, setChatMemoryDraft] = useState('');
+  const [isSummarizingMemory, setIsSummarizingMemory] = useState(false);
+  const [typingPlayers, setTypingPlayers] = useState<Record<string, string>>({});
+  const lastTypingSentAtRef = useRef(0);
+  const typingTimersRef = useRef<Record<string, number>>({});
+  const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [imagePreview, setImagePreview] = useState<{ src: string; title: string } | null>(null);
   const [imagePendingMessages, setImagePendingMessages] = useState<Record<string, boolean>>({});
@@ -739,7 +899,7 @@ export default function App() {
   const [registrationAllowed, setRegistrationAllowed] = useState(true);
   const [botReplyAllowed, setBotReplyAllowed] = useState(true);
   const [authChecked, setAuthChecked] = useState(false);
-  const [accessToken, setAccessToken] = useState('');
+  const [accessToken, setAccessToken] = useState(() => window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || '');
   const [accessPasswordRequired, setAccessPasswordRequired] = useState(false);
   const [accessPasswordConfigured, setAccessPasswordConfigured] = useState(false);
   const [accessUnlocked, setAccessUnlocked] = useState(false);
@@ -761,10 +921,41 @@ export default function App() {
   const [deletionLocks, setDeletionLocks] = useState<DeletionLocks>(defaultDeletionLocks);
   const [pendingDeleteKey, setPendingDeleteKey] = useState('');
   const activeMessages = activeChat?.messages ?? [];
-  const reasoningDisplay = reasoningSettingsFromPreset(parsePresetDraft(presetJsonDraft));
-  const selectedPersona = personas.find((persona) => persona.id === selectedPersonaId) ?? personas[0] ?? null;
-  const connectedPlayers = participants.filter((participant) => participant.connected && participant.role === 'player');
-  const activeReferencePersonas = (() => {
+  const reasoningDisplay = useMemo(() => reasoningSettingsFromPreset(parsePresetDraft(presetJsonDraft)), [presetJsonDraft]);
+  const canViewReasoning = useMemo(() => {
+    const rule = securityPermissions.view_reasoning || { mode: 'everyone', users: [] };
+    if (rule.mode === 'everyone') return true;
+    if (!authUser) return false;
+    if (authUser.is_admin) return true;
+    if (rule.mode === 'users') {
+      const allowed = new Set((rule.users || []).map((u) => u.trim().toLowerCase()).filter(Boolean));
+      return allowed.has(authUser.username.trim().toLowerCase());
+    }
+    return false;
+  }, [securityPermissions.view_reasoning, authUser]);
+  const canTriggerBotReply = useMemo(() => {
+    if (authUser?.is_admin) return true;
+    if (!botReplyAllowed) return false;
+    const rule = securityPermissions.generate || { mode: 'everyone', users: [] };
+    if (rule.mode === 'everyone') return true;
+    if (!authUser) return false;
+    if (rule.mode === 'users') {
+      const allowed = new Set((rule.users || []).map((u) => u.trim().toLowerCase()).filter(Boolean));
+      return allowed.has(authUser.username.trim().toLowerCase());
+    }
+    return false;
+  }, [botReplyAllowed, securityPermissions.generate, authUser]);
+  const selectedPersona = useMemo(() => personas.find((persona) => persona.id === selectedPersonaId) ?? personas[0] ?? null, [personas, selectedPersonaId]);
+  const connectedPlayers = useMemo(() => {
+    const byKey = new Map<string, Participant>();
+    for (const participant of participants) {
+      if (!participant.connected || participant.role !== 'player') continue;
+      const key = participant.username ? `user:${participant.username.toLowerCase()}` : participant.id;
+      byKey.set(key, participant);
+    }
+    return Array.from(byKey.values());
+  }, [participants]);
+  const activeReferencePersonas = useMemo(() => {
     const byKey = new Map<string, Persona>();
     const addPersona = (persona: Persona | null, participant?: Participant) => {
       const id = persona?.id || participant?.persona_id || participant?.id || '';
@@ -785,16 +976,28 @@ export default function App() {
     connectedPlayers.forEach((participant) => addPersona(participant.persona_id ? personas.find((persona) => persona.id === participant.persona_id) || null : null, participant));
     addPersona(selectedPersona);
     return Array.from(byKey.values());
-  })();
-  const connectedCount = participants.filter((participant) => participant.connected).length;
+  }, [connectedPlayers, personas, selectedPersona]);
+  const connectedCount = connectedPlayers.length;
+  const showScrollBottomRef = useRef(false);
   const websocketRef = useRef<WebSocket | null>(null);
   const pendingRealtimeEventsRef = useRef<Record<string, unknown>[]>([]);
+  const requestBotReplyRef = useRef<(replaceMessageId?: string, sourceChat?: BotChat, resetSwipes?: boolean) => Promise<void>>(() => Promise.resolve());
+  useEffect(() => {
+    if (activeChat?.party_hud) {
+      setPartyHudDraft(activeChat.party_hud);
+    } else {
+      setPartyHudDraft({ enabled: false, location: '', time_of_day: '', quest: '', notes: '', players: [] });
+    }
+    setChatMemoryDraft(activeChat?.memory_summary || '');
+  }, [activeChat?.id, activeChat?.updated_at]);
   const participantIdRef = useRef(participantId());
   const imageEventSourceIdRef = useRef(window.crypto?.randomUUID?.() || `image_source_${Date.now()}_${Math.random().toString(36).slice(2)}`);
   const authTokenRef = useRef(authToken);
   const authUserRef = useRef<AuthUser | null>(null);
   const activeCardRef = useRef<CharacterCard | null>(null);
   const activeChatRef = useRef<BotChat | null>(null);
+  const cardsRef = useRef<CharacterCard[]>([]);
+  const sessionActiveTargetRef = useRef<{ cardId: string; chatId: string }>({ cardId: '', chatId: '' });
   const personasRef = useRef<Persona[]>([]);
   const personasLoadedRef = useRef(false);
   const selectedPersonaIdRef = useRef(selectedPersonaId);
@@ -809,8 +1012,10 @@ export default function App() {
   const activePresetDraftSignatureRef = useRef('');
   const generationSettingsLoadedRef = useRef(false);
   const generationSettingsSaveSignatureRef = useRef('');
+  const lastLocalSettingsSaveRef = useRef<Record<string, number>>({});
   const renderedExtensionMessageSignaturesRef = useRef<Map<string, string>>(new Map());
   const activeGenerationRef = useRef(false);
+  const isLocalGeneratingRef = useRef(false);
   const extensionLeaderId = connectedPlayers.length
     ? [...connectedPlayers].sort((left, right) => {
         if (left.is_admin !== right.is_admin) return left.is_admin ? -1 : 1;
@@ -823,6 +1028,10 @@ export default function App() {
     activeCardRef.current = activeCard;
     activeChatRef.current = activeChat;
   }, [activeCard, activeChat]);
+
+  useEffect(() => {
+    cardsRef.current = cards;
+  }, [cards]);
 
   useEffect(() => {
     selectedPersonaIdRef.current = selectedPersonaId;
@@ -849,15 +1058,12 @@ export default function App() {
   }, [authToken]);
 
   useEffect(() => {
-    if (cookieAuth) {
-      return;
-    }
     if (authToken) {
       window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, authToken);
     } else {
       window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
     }
-  }, [authToken, cookieAuth]);
+  }, [authToken]);
 
   useEffect(() => {
     window.localStorage.setItem(VISUAL_STORAGE_KEY, JSON.stringify(visualSettings));
@@ -880,16 +1086,64 @@ export default function App() {
     void loadGenerationSettings();
     void loadConnectionPresets();
     void loadPresetTypes();
+    void loadActivePresetDraft();
     void loadLorebooks();
     void loadSecurityPermissions();
     void loadDeleteLocks();
   }, []);
 
   useEffect(() => {
+    if (!isGenerating || !generationStreamText) {
+      setDisplayedStreamText('');
+      return;
+    }
+    let rafId = 0;
+    let lastTime = performance.now();
+    const tick = (now: number) => {
+      let keepRunning = false;
+      setDisplayedStreamText((prev) => {
+        if (prev === generationStreamText) return prev;
+        if (!generationStreamText.startsWith(prev)) {
+          return generationStreamText;
+        }
+        const remaining = generationStreamText.length - prev.length;
+        if (remaining <= 0) return prev;
+        const dt = Math.max(8, now - lastTime);
+        lastTime = now;
+        const step = Math.max(1, Math.ceil(remaining * Math.min(0.32, dt / 85)));
+        const next = generationStreamText.slice(0, prev.length + step);
+        if (next.length < generationStreamText.length) {
+          keepRunning = true;
+        }
+        return next;
+      });
+      if (isNearBottomRef.current && chatScrollRef.current) {
+        chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+      }
+      if (keepRunning) {
+        rafId = window.requestAnimationFrame(tick);
+      }
+    };
+    rafId = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(rafId);
+  }, [generationStreamText, isGenerating]);
+
+  useEffect(() => {
+    if (window.location.search.includes('_v=')) {
+      window.history.replaceState(null, '', window.location.pathname);
+    }
     void (async () => {
       try {
-        const response = await fetch('/api/security/config');
-        const data = await response.json() as { cookie_auth?: boolean } | null;
+        const response = await fetch(`/api/security/config?_t=${Date.now()}`, { cache: 'no-store' });
+        const data = await response.json() as { cookie_auth?: boolean; build_id?: string } | null;
+        if (data?.build_id && data.build_id !== 'dev') {
+          const prevBuild = window.localStorage.getItem('doubletrouble.buildId');
+          window.localStorage.setItem('doubletrouble.buildId', data.build_id);
+          if (prevBuild && prevBuild !== data.build_id) {
+            window.location.replace(`${window.location.pathname}?_v=${encodeURIComponent(data.build_id)}`);
+            return;
+          }
+        }
         setCookieAuth(Boolean(data?.cookie_auth));
       } catch {
         setCookieAuth(false);
@@ -919,33 +1173,46 @@ export default function App() {
 
   useEffect(() => {
     if (accessToken) {
+      window.localStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, accessToken);
       void verifyAccessPasswordToken(accessToken);
     } else {
+      window.localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
       setAccessUnlocked(!accessPasswordRequired);
     }
   }, [accessToken, accessPasswordRequired]);
 
-  const updateTopbarForScroll = (currentY: number) => {
-    if (window.matchMedia('(max-width: 900px)').matches) {
-      setTopbarVisible(true);
-      topbarScrollYRef.current = currentY;
+  const scrollToChatBottom = (behavior: ScrollBehavior = 'auto') => {
+    const el = chatScrollRef.current;
+    if (!el) {
       return;
     }
-    const lastY = topbarScrollYRef.current;
-    if (currentY < 24) {
-      setTopbarVisible(true);
-    } else if (currentY < lastY - 8) {
-      setTopbarVisible(true);
-    } else if (currentY > lastY + 8) {
-      setTopbarVisible(false);
+    el.scrollTo({ top: el.scrollHeight, behavior });
+    isNearBottomRef.current = true;
+    if (showScrollBottomRef.current) {
+      showScrollBottomRef.current = false;
+      setShowScrollBottomButton(false);
     }
-    topbarScrollYRef.current = currentY;
+  };
+
+  const updateTopbarForScroll = (_currentY: number, scrollEl?: HTMLDivElement | null) => {
+    if (scrollEl) {
+      const distanceFromBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
+      const nearBottom = distanceFromBottom < 180;
+      isNearBottomRef.current = nearBottom;
+      const shouldShow = !nearBottom && scrollEl.scrollHeight - scrollEl.clientHeight > 240;
+      if (showScrollBottomRef.current !== shouldShow) {
+        showScrollBottomRef.current = shouldShow;
+        setShowScrollBottomButton(shouldShow);
+      }
+    }
   };
 
   useEffect(() => {
-    const onScroll = () => updateTopbarForScroll(window.scrollY);
-    window.addEventListener('scroll', onScroll, { passive: true });
-    return () => window.removeEventListener('scroll', onScroll);
+    const onRegexUpdated = () => setRegexRenderTick((tick) => tick + 1);
+    window.addEventListener('doubletrouble:regex-updated', onRegexUpdated);
+    return () => {
+      window.removeEventListener('doubletrouble:regex-updated', onRegexUpdated);
+    };
   }, []);
 
   useEffect(() => {
@@ -989,7 +1256,7 @@ export default function App() {
       return;
     }
     Array.from(settingsHost.children).forEach((child) => {
-      if (!(child instanceof HTMLElement)) {
+      if (!(child instanceof HTMLElement) || child.dataset.dtKeepVisible === 'true') {
         return;
       }
       child.hidden = !extensionSettingsOpen || child.dataset.dtExtensionOwner !== extensionSettingsTarget;
@@ -1012,6 +1279,7 @@ export default function App() {
       activePersonas: activeReferencePersonas.map((persona) => ({ ...persona, avatar_url: imageSrc(persona.avatar_url) })),
       selectedPersonaId,
       characterId: activeCard ? 0 : undefined,
+      chatId: activeChat?.id || 'default',
       name1: userName,
       name2: charName,
       getRequestHeaders: actorHeaders,
@@ -1023,10 +1291,32 @@ export default function App() {
   }, [activeMessages, activeCard?.id, activeCard?.name, activeCard?.image_url, personas, activeReferencePersonas, selectedPersonaId, selectedPersona?.name, authUser?.username, generationSettings.bot_name, authToken, accessToken, extensionLeader, presetJsonDraft, activeConnectionPresetName, generationSettings.chat_completion_source, generationSettings.provider]);
 
   useEffect(() => {
-    if (authChecked && (!authRequired || authUser)) {
+    if (authChecked && (!accessPasswordRequired || accessUnlocked) && (!authRequired || authUser)) {
       void initSillyTavernExtensions();
     }
-  }, [authChecked, authRequired, authUser]);
+  }, [authChecked, accessPasswordRequired, accessUnlocked, authRequired, authUser]);
+
+  useEffect(() => {
+    const chatId = activeChat?.id || '';
+    const msgCount = activeMessages.length;
+    if (chatId && lastScrolledChatIdRef.current !== chatId) {
+      lastScrolledChatIdRef.current = chatId;
+      lastMessageCountRef.current = msgCount;
+      isNearBottomRef.current = true;
+      window.requestAnimationFrame(() => scrollToChatBottom('auto'));
+    } else if (msgCount > lastMessageCountRef.current && isNearBottomRef.current) {
+      lastMessageCountRef.current = msgCount;
+      window.requestAnimationFrame(() => scrollToChatBottom('smooth'));
+    } else {
+      lastMessageCountRef.current = msgCount;
+    }
+  }, [activeChat?.id, activeMessages.length]);
+
+  useEffect(() => {
+    if ((isGenerating || generationStreamText) && isNearBottomRef.current) {
+      window.requestAnimationFrame(() => scrollToChatBottom('auto'));
+    }
+  }, [isGenerating, generationStreamText]);
 
   useEffect(() => {
     renderedExtensionMessageSignaturesRef.current = new Map(activeMessages.map((message) => [message.id, extensionMessageSignature(message)]));
@@ -1049,121 +1339,311 @@ export default function App() {
   }, [activeMessages]);
 
   useEffect(() => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const socket = new WebSocket(`${protocol}//${window.location.host}/ws/sessions/default`);
-    websocketRef.current = socket;
-    socket.onopen = () => {
-      const currentPersona = personasRef.current.find((p) => p.id === selectedPersonaIdRef.current) || personasRef.current[0] || null;
-      sendPresence(currentPersona);
-      while (pendingRealtimeEventsRef.current.length) {
-        const ev = pendingRealtimeEventsRef.current.shift();
-        if (ev) {
-          sendRealtimeEvent(ev);
-        }
+    let disposed = false;
+    let reconnectTimer: number | undefined;
+    let pingInterval: number | undefined;
+    let hasConnectedOnce = false;
+
+    const syncAfterReconnect = () => {
+      void refreshLibrary();
+      const card = activeCardRef.current;
+      const chat = activeChatRef.current;
+      if (card && chat) {
+        void openChatForCard(card, chat.id);
       }
     };
-    socket.onmessage = (event) => {
-      const payload = JSON.parse(event.data) as RealtimePayload;
-      if (payload.type === 'chat.updated' && payload.chat) {
-        if (activeChatRef.current?.id === payload.chat.id) {
-          setActiveChat(payload.chat);
-          setImagePendingMessages((current) => Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${payload.card_id || payload.chat?.card_id || ''}:${payload.chat?.id || ''}:`))));
-          document.querySelectorAll('#chat .iig-local-pending').forEach((element) => element.classList.remove('iig-local-pending'));
-        }
-        if (payload.card_id && activeCardRef.current?.id === payload.card_id) {
-          void refreshCardChats(payload.card_id);
-        }
+
+    const connect = () => {
+      if (disposed) {
+        return;
       }
-      if ((payload.type === 'image_generation.pending' || payload.type === 'image_generation.finished') && payload.card_id && payload.chat_id && payload.message_id && payload.source_participant_id !== imageEventSourceIdRef.current) {
-        if (payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
-          const key = imagePendingKey(payload.card_id, payload.chat_id, payload.message_id);
-          setImagePendingMessages((current) => {
-            if (payload.type === 'image_generation.pending') {
-              return { ...current, [key]: true };
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const params = new URLSearchParams();
+      if (authToken) params.set('auth', authToken);
+      if (accessToken) params.set('access_token', accessToken);
+      const qs = params.toString();
+      const roomSlug = encodeURIComponent(currentRoomIdRef.current || 'default');
+      const socket = new WebSocket(`${protocol}//${window.location.host}/ws/sessions/${roomSlug}${qs ? `?${qs}` : ''}`);
+      websocketRef.current = socket;
+      socket.onopen = () => {
+        const isReconnect = hasConnectedOnce;
+        hasConnectedOnce = true;
+        const currentPersona = personasRef.current.find((p) => p.id === selectedPersonaIdRef.current) || personasRef.current[0] || null;
+        sendPresence(currentPersona);
+        while (pendingRealtimeEventsRef.current.length) {
+          const ev = pendingRealtimeEventsRef.current.shift();
+          if (ev) {
+            sendRealtimeEvent(ev);
+          }
+        }
+        if (isReconnect) {
+          syncAfterReconnect();
+        }
+        window.clearInterval(pingInterval);
+        pingInterval = window.setInterval(() => {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: 'ping' }));
+          }
+        }, 25000);
+      };
+      socket.onmessage = (event) => {
+        const payload = JSON.parse(event.data) as RealtimePayload;
+        if (payload.type === 'pong') {
+          return;
+        }
+        if (payload.type === 'chat.updated' && payload.chat) {
+          const sameCard = Boolean(payload.card_id && activeCardRef.current?.id === payload.card_id);
+          if (activeChatRef.current?.id === payload.chat.id || (sameCard && (!activeChatRef.current || payload.switch_active))) {
+            setActiveChat(payload.chat);
+            if (Array.isArray(payload.active_generations)) {
+              const activeKey = `${payload.card_id || activeCardRef.current?.id || ''}:${payload.chat.id}`;
+              if (!payload.active_generations.includes(activeKey) && !isLocalGeneratingRef.current) {
+                activeGenerationRef.current = false;
+                setIsGenerating(false);
+                setGenerationStatus('');
+                setGenerationStreamText('');
+                setGenerationReplaceMessageId(null);
+              }
             }
-            const next = { ...current };
-            delete next[key];
-            return next;
-          });
+            if (payload.card_id) {
+              rememberChatSelection(payload.card_id, payload.chat.id);
+            }
+            setImagePendingMessages((current) => Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${payload.card_id || payload.chat?.card_id || ''}:${payload.chat?.id || ''}:`))));
+            document.querySelectorAll('#chat .iig-local-pending').forEach((element) => element.classList.remove('iig-local-pending'));
+          } else if (!activeCardRef.current && payload.card_id) {
+            const targetCard = cardsRef.current.find((c) => c.id === payload.card_id);
+            if (targetCard) {
+              setActiveCard(targetCard);
+              setActiveChat(payload.chat);
+              rememberChatSelection(targetCard.id, payload.chat.id);
+            }
+          }
+          if (sameCard && payload.chat) {
+            const updatedChat = payload.chat;
+            setBotChats((current) => {
+              const summary: BotChatSummary = {
+                id: updatedChat.id,
+                title: updatedChat.title,
+                filename: `${updatedChat.id}.json`,
+                message_count: updatedChat.messages?.length ?? 0,
+                created_at: updatedChat.created_at,
+                updated_at: updatedChat.updated_at,
+              };
+              const idx = current.findIndex((item) => item.id === updatedChat.id);
+              if (idx < 0) return [summary, ...current];
+              const next = [...current];
+              next[idx] = summary;
+              return next;
+            });
+          }
         }
-      }
-      if (payload.type === 'chat.deleted' && payload.chat_id === activeChatRef.current?.id) {
-        setActiveChat(null);
-      }
-      if (payload.type === 'card.deleted' && payload.card_id) {
-        setCards((current) => current.filter((card) => card.id !== payload.card_id));
-        if (activeCardRef.current?.id === payload.card_id) {
-          setActiveCard(null);
+        if (payload.type === 'card.select' && payload.card_id && payload.source_participant_id !== participantIdRef.current) {
+          const targetCard = cardsRef.current.find((c) => c.id === payload.card_id);
+          if (targetCard && (!activeCardRef.current || activeCardRef.current.id !== targetCard.id || (payload.chat_id && activeChatRef.current?.id !== payload.chat_id))) {
+            if (payload.chat_id) {
+              void openChatForCard(targetCard, payload.chat_id);
+            } else {
+              void selectBotCard(targetCard, false);
+            }
+          }
+        }
+        if ((payload.type === 'image_generation.pending' || payload.type === 'image_generation.finished') && payload.card_id && payload.chat_id && payload.message_id && payload.source_participant_id !== imageEventSourceIdRef.current) {
+          if (payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
+            const key = imagePendingKey(payload.card_id, payload.chat_id, payload.message_id);
+            setImagePendingMessages((current) => {
+              if (payload.type === 'image_generation.pending') {
+                return { ...current, [key]: true };
+              }
+              const next = { ...current };
+              delete next[key];
+              return next;
+            });
+          }
+        }
+        if (payload.type === 'chat.deleted' && payload.chat_id === activeChatRef.current?.id) {
           setActiveChat(null);
-          setBotChats([]);
+          const currentCard = activeCardRef.current;
+          if (currentCard) {
+            void (async () => {
+              const r = await authedFetch(`/api/cards/${encodeURIComponent(currentCard.id)}/chats`);
+              if (r.ok) {
+                const d = await r.json() as { chats: BotChatSummary[] };
+                setBotChats(d.chats);
+                if (d.chats[0]) {
+                  await openChatForCard(currentCard, d.chats[0].id);
+                }
+              }
+            })();
+          }
         }
-      }
-      if ((payload.type === 'presence.updated' || payload.type === 'session.snapshot' || payload.type === 'session.updated') && payload.session?.participants) {
-        sessionSnapshotReceivedRef.current = true;
-        const nextParticipants = Object.values(payload.session.participants);
-        const ownParticipant = nextParticipants.find((participant) => participant.id === participantIdRef.current);
-        if (ownParticipant?.persona_id) {
-          lastKnownParticipantPersonaIdRef.current = ownParticipant.persona_id;
-          restoreSelectedPersonaFromParticipant(ownParticipant.persona_id);
-        } else {
-          selectDefaultPersonaIfNeeded();
+        if (payload.type === 'card.deleted' && payload.card_id) {
+          setCards((current) => current.filter((card) => card.id !== payload.card_id));
+          if (activeCardRef.current?.id === payload.card_id) {
+            setActiveCard(null);
+            setActiveChat(null);
+            setBotChats([]);
+          }
         }
-        setParticipants(nextParticipants);
-      }
-      if (payload.type === 'notification' && payload.message) {
-        addToast(payload.message);
-      }
-      if (payload.type === 'generation.started' && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
-        activeGenerationRef.current = true;
-        setIsGenerating(true);
-        setGenerationStreamText('');
-        setGenerationReplaceMessageId(payload.replace_message_id || null);
-        setGenerationStatus(`${activeCardRef.current?.name || t('composer.bot')} ${t('composer.typing')}`);
-      }
-      if (payload.type === 'generation.stream' && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
-        activeGenerationRef.current = true;
-        setIsGenerating(true);
-        setGenerationStatus(`${activeCardRef.current?.name || t('composer.bot')} ${t('composer.typing')}`);
-        setGenerationReplaceMessageId(payload.replace_message_id || null);
-        setGenerationStreamText(payload.message || '');
-      }
-      if ((payload.type === 'generation.finished' || payload.type === 'generation.cancelled' || payload.type === 'generation.failed') && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
-        activeGenerationRef.current = false;
-        setIsGenerating(false);
-        setGenerationStatus('');
-        setGenerationStreamText('');
-        setGenerationReplaceMessageId(null);
-        if (payload.type === 'generation.failed' && payload.message) {
+        if ((payload.type === 'presence.updated' || payload.type === 'session.snapshot' || payload.type === 'session.updated') && payload.session?.participants) {
+          sessionSnapshotReceivedRef.current = true;
+          if (Array.isArray(payload.active_generations) && activeCardRef.current && activeChatRef.current) {
+            const activeKey = `${activeCardRef.current.id}:${activeChatRef.current.id}`;
+            if (payload.active_generations.includes(activeKey)) {
+              activeGenerationRef.current = true;
+              setIsGenerating(true);
+              setGenerationStatus(`${activeCardRef.current.name || t('composer.bot')} ${t('composer.typing')}`);
+            } else if (!isLocalGeneratingRef.current) {
+              activeGenerationRef.current = false;
+              setIsGenerating(false);
+              setGenerationStatus('');
+              setGenerationStreamText('');
+              setGenerationReplaceMessageId(null);
+            }
+          }
+          if (payload.session.active_card_id) {
+            sessionActiveTargetRef.current = { cardId: payload.session.active_card_id, chatId: payload.session.active_chat_id || '' };
+            const shouldSyncRoomTarget = !activeCardRef.current
+              || (payload.type === 'session.snapshot' && (
+                activeCardRef.current.id !== payload.session.active_card_id
+                || (payload.session.active_chat_id && activeChatRef.current?.id !== payload.session.active_chat_id)
+              ));
+            if (shouldSyncRoomTarget && cardsRef.current.length) {
+              const targetCard = cardsRef.current.find((c) => c.id === payload.session?.active_card_id);
+              if (targetCard) {
+                if (payload.session.active_chat_id) {
+                  void openChatForCard(targetCard, payload.session.active_chat_id);
+                } else {
+                  void selectBotCard(targetCard, false);
+                }
+              }
+            }
+          }
+          const nextParticipants = Object.values(payload.session.participants);
+          const ownParticipant = nextParticipants.find((participant) => participant.id === participantIdRef.current);
+          if (ownParticipant?.persona_id) {
+            lastKnownParticipantPersonaIdRef.current = ownParticipant.persona_id;
+            restoreSelectedPersonaFromParticipant(ownParticipant.persona_id);
+          } else {
+            selectDefaultPersonaIfNeeded();
+          }
+          setParticipants(nextParticipants);
+          if (payload.session.turn !== undefined) {
+            setCurrentTurnParticipantId(payload.session.turn?.current_participant_id || null);
+            setTurnMode(payload.session.turn?.mode === 'round_ready' ? 'round_ready' : 'free');
+            setReadyParticipantIds(payload.session.turn?.ready_participant_ids || []);
+          }
+        }
+        if (payload.type === 'round.all_ready') {
+          const shouldTrigger = (!botReplyAllowed || (securityPermissions.generate && securityPermissions.generate.mode !== 'everyone'))
+            ? extensionLeader
+            : (payload.trigger_participant_id ? payload.trigger_participant_id === participantIdRef.current : extensionLeader);
+          if (shouldTrigger && !activeGenerationRef.current && activeChatRef.current) {
+            addToast('⚡ Все игроки готовы — запускаем ответ бота!');
+            window.setTimeout(() => { void requestBotReplyRef.current(); }, 120);
+          }
+        }
+        if (payload.type === 'typing.updated' && payload.participant_id && payload.participant_id !== participantIdRef.current) {
+          const pid = payload.participant_id;
+          window.clearTimeout(typingTimersRef.current[pid]);
+          if (payload.is_typing) {
+            const displayName = payload.name || 'Player';
+            setTypingPlayers((current) => ({ ...current, [pid]: displayName }));
+            typingTimersRef.current[pid] = window.setTimeout(() => {
+              setTypingPlayers((current) => {
+                const next = { ...current };
+                delete next[pid];
+                return next;
+              });
+            }, 4200);
+          } else {
+            setTypingPlayers((current) => {
+              const next = { ...current };
+              delete next[pid];
+              return next;
+            });
+          }
+        }
+        if (payload.type === 'notification' && payload.message) {
           addToast(payload.message);
         }
-      }
-      if (payload.type === 'security.updated') {
-        setAuthRequired(Boolean(payload.auth_required));
-        setRegistrationAllowed(payload.registration_allowed !== false);
-        setBotReplyAllowed(payload.bot_reply_allowed !== false);
-        setAccessPasswordRequired(Boolean(payload.access_password_required));
-        setSecurityAccessPasswordRequiredDraft(Boolean(payload.access_password_required));
-        setAccessPasswordConfigured(Boolean(payload.access_password_configured));
-        if (!payload.access_password_required) {
-          setAccessUnlocked(true);
+        if (payload.type === 'generation.started' && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
+          activeGenerationRef.current = true;
+          setIsGenerating(true);
+          setGenerationStreamText('');
+          setGenerationReplaceMessageId(payload.replace_message_id || null);
+          setGenerationStatus(`${activeCardRef.current?.name || t('composer.bot')} ${t('composer.typing')}`);
         }
-        if (payload.permissions) {
-          setSecurityPermissions({ ...defaultSecurityPermissions, ...payload.permissions });
+        if (payload.type === 'generation.stream' && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
+          activeGenerationRef.current = true;
+          setIsGenerating(true);
+          setGenerationStatus(`${activeCardRef.current?.name || t('composer.bot')} ${t('composer.typing')}`);
+          setGenerationReplaceMessageId(payload.replace_message_id || null);
+          setGenerationStreamText(payload.message || '');
         }
-        void refreshAccessControlledData();
+        if ((payload.type === 'generation.finished' || payload.type === 'generation.cancelled' || payload.type === 'generation.failed') && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
+          activeGenerationRef.current = false;
+          setIsGenerating(false);
+          setGenerationStatus('');
+          setGenerationStreamText('');
+          setGenerationReplaceMessageId(null);
+          if (payload.type === 'generation.failed' && payload.message) {
+            addToast(payload.message);
+          }
+        }
+        if (payload.type === 'security.updated') {
+          setAuthRequired(Boolean(payload.auth_required));
+          setRegistrationAllowed(payload.registration_allowed !== false);
+          setBotReplyAllowed(payload.bot_reply_allowed !== false);
+          setAccessPasswordRequired(Boolean(payload.access_password_required));
+          setSecurityAccessPasswordRequiredDraft(Boolean(payload.access_password_required));
+          setAccessPasswordConfigured(Boolean(payload.access_password_configured));
+          if (!payload.access_password_required) {
+            setAccessUnlocked(true);
+          }
+          if (payload.permissions) {
+            setSecurityPermissions({ ...defaultSecurityPermissions, ...payload.permissions });
+          }
+          void refreshAccessControlledData();
+        }
+        if (payload.type === 'settings.updated') {
+          const section = payload.section || '';
+          void refreshSharedSettings(section);
+          window.dispatchEvent(new CustomEvent('doubletrouble:shared-settings-updated', { detail: { section } }));
+        }
+        if (payload.type === 'delete_locks.updated' && payload.delete_locks) {
+          setDeletionLocks({ ...defaultDeletionLocks, ...payload.delete_locks });
+          setPendingDeleteKey('');
+        }
+      };
+      socket.onclose = () => {
+        window.clearInterval(pingInterval);
+        if (!disposed) {
+          reconnectTimer = window.setTimeout(connect, 2000);
+        }
+      };
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== 'visible' || disposed) {
+        return;
       }
-      if (payload.type === 'settings.updated') {
-        const section = payload.section || '';
-        void refreshSharedSettings(section);
-        window.dispatchEvent(new CustomEvent('doubletrouble:shared-settings-updated', { detail: { section } }));
-      }
-      if (payload.type === 'delete_locks.updated' && payload.delete_locks) {
-        setDeletionLocks({ ...defaultDeletionLocks, ...payload.delete_locks });
-        setPendingDeleteKey('');
+      const ws = websocketRef.current;
+      if (!ws || (ws.readyState !== WebSocket.OPEN && ws.readyState !== WebSocket.CONNECTING)) {
+        window.clearTimeout(reconnectTimer);
+        connect();
+      } else {
+        syncAfterReconnect();
       }
     };
-    return () => socket.close();
-  }, []);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    connect();
+    return () => {
+      disposed = true;
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.clearTimeout(reconnectTimer);
+      window.clearInterval(pingInterval);
+      websocketRef.current?.close();
+    };
+  }, [authToken, accessToken, accessUnlocked, currentRoomId]);
 
   const addToast = (message: string) => {
     const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -1220,8 +1700,11 @@ export default function App() {
     }
   };
 
-  const actorHeaders = () => ({
-    'X-DoubleTrouble-Actor': authUserRef.current?.username || selectedPersona?.name || 'Player',
+  const actorHeaders = (token = authTokenRef.current || authToken) => ({
+    'X-DoubleTrouble-Actor': encodeURIComponent(authUserRef.current?.username || selectedPersona?.name || 'Player'),
+    'X-DoubleTrouble-Session': encodeURIComponent(currentRoomIdRef.current || 'default'),
+    ...(accessToken ? { 'X-DoubleTrouble-Access': accessToken } : {}),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
   });
 
   const sendPresence = (persona: Persona | null) => {
@@ -1390,9 +1873,16 @@ export default function App() {
     return Array.from(byKey.values());
   };
 
-  const authJsonHeaders = () => ({ 'Content-Type': 'application/json', ...actorHeaders() });
-  const authedFetch = (url: string, init: RequestInit = {}) => fetch(url, { ...init, headers: { ...(init.headers || {}), ...actorHeaders() } });
-  const imageSrc = (url: string) => url;
+  const authJsonHeaders = (token = authTokenRef.current || authToken) => ({ 'Content-Type': 'application/json', ...actorHeaders(token) });
+  const authedFetch = (url: string, init: RequestInit = {}, token = authTokenRef.current || authToken) => fetch(url, { ...init, headers: { ...(init.headers || {}), ...actorHeaders(token) } });
+  const imageSrc = (url: string) => {
+    if (!url || (!url.startsWith('/api/') && !url.startsWith('/User Avatars/'))) return url;
+    const params = new URLSearchParams();
+    if (authToken) params.set('auth', authToken);
+    if (accessToken) params.set('access_token', accessToken);
+    const qs = params.toString();
+    return qs ? `${url}${url.includes('?') ? '&' : '?'}${qs}` : url;
+  };
   const deniedResponse = (response: Response) => response.status === 401 || response.status === 403;
   const markAccessDenied = (section: keyof AccessDeniedState, denied: boolean) => setAccessDenied((current) => ({ ...current, [section]: denied }));
 
@@ -1406,15 +1896,20 @@ export default function App() {
     } catch {
       return;
     }
+    if (!Object.keys(parsed).length) {
+      return;
+    }
     const name = presetNameDraft.trim() || selectedPresetName || 'unsaved';
     const signature = `${selectedPresetType}:${name}:${draft}`;
     if (activePresetDraftSignatureRef.current === signature) {
       return;
     }
     activePresetDraftSignatureRef.current = signature;
+    lastLocalSettingsSaveRef.current.presets = Date.now();
+    lastLocalSettingsSaveRef.current.generation = Date.now();
     const response = await fetch(`/api/presets/${encodeURIComponent(selectedPresetType)}/active-draft`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json', ...actorHeaders() },
+      headers: { 'Content-Type': 'application/json', ...actorHeaders(token) },
       body: JSON.stringify({ name, preset: parsed }),
     });
     if (!response.ok) {
@@ -1423,12 +1918,13 @@ export default function App() {
       return;
     }
     const data = await response.json() as { active: Record<string, string>; settings: Partial<GenerationSettings> };
+    lastLocalSettingsSaveRef.current.presets = Date.now();
+    lastLocalSettingsSaveRef.current.generation = Date.now();
     setActivePresets(data.active);
-    setGenerationSettings((current) => ({ ...current, ...data.settings, api_key: '', clear_api_key: false, proxy_password: '', clear_proxy_password: false }));
   };
 
   useEffect(() => {
-    const timer = window.setTimeout(() => { void syncActivePresetDraft(); }, 450);
+    const timer = window.setTimeout(() => { void syncActivePresetDraft(); }, 550);
     return () => window.clearTimeout(timer);
   }, [presetJsonDraft, presetNameDraft, selectedPresetName, selectedPresetType, authToken, accessDenied.presets]);
 
@@ -1440,24 +1936,40 @@ export default function App() {
     if (generationSettingsSaveSignatureRef.current === signature) {
       return;
     }
+    const snapshot = generationSettings;
     const timer = window.setTimeout(async () => {
+      generationSettingsSaveSignatureRef.current = signature;
+      lastLocalSettingsSaveRef.current.generation = Date.now();
       const response = await fetch('/api/generation/settings', {
         method: 'PUT',
         headers: authJsonHeaders(),
-        body: JSON.stringify(generationSettings),
+        body: JSON.stringify(snapshot),
       });
       if (!response.ok) {
+        generationSettingsSaveSignatureRef.current = '';
         setConnectionMessage(t('connection.error.apply'));
         return;
       }
       const data = await response.json() as Partial<GenerationSettings>;
-      const nextSettings = { ...generationSettings, ...data, api_key: '', clear_api_key: false, proxy_password: '', clear_proxy_password: false };
-      generationSettingsSaveSignatureRef.current = JSON.stringify(nextSettings);
-      setGenerationSettings(nextSettings);
+      lastLocalSettingsSaveRef.current.generation = Date.now();
+      if (snapshot.api_key || snapshot.clear_api_key || snapshot.proxy_password || snapshot.clear_proxy_password) {
+        setGenerationSettings((current) => {
+          const updated = {
+            ...current,
+            api_key_configured: data.api_key_configured ?? current.api_key_configured,
+            proxy_password_configured: data.proxy_password_configured ?? current.proxy_password_configured,
+            api_key: '',
+            clear_api_key: false,
+            proxy_password: '',
+            clear_proxy_password: false,
+          };
+          generationSettingsSaveSignatureRef.current = JSON.stringify(updated);
+          return updated;
+        });
+      }
     }, 650);
     return () => window.clearTimeout(timer);
   }, [generationSettings]);
-
   const saveExtensionMessageByIndex = async (index: number, content: string, expectedMessageId?: string) => {
     const chat = activeChatRef.current;
     const card = activeCardRef.current;
@@ -1503,9 +2015,9 @@ export default function App() {
     setDeletionLocks({ ...defaultDeletionLocks, ...data.delete_locks });
   };
 
-  const loadCurrentUser = async () => {
+  const loadCurrentUser = async (token = authToken) => {
     const response = await fetch('/api/auth/me', {
-      headers: !cookieAuth && authToken ? { Authorization: `Bearer ${authToken}` } : {},
+      headers: actorHeaders(token),
     });
     if (!response.ok) {
       if (!cookieAuth) {
@@ -1528,9 +2040,8 @@ export default function App() {
       setAuthMessage(data?.detail || t('auth.error.login'));
       return;
     }
-    if (!cookieAuth) {
-      setAuthToken(data.token);
-    }
+    authTokenRef.current = data.token;
+    setAuthToken(data.token);
     setAuthUser(data.user || null);
     setAuthDraft({ ...authDraft, password: '' });
     window.localStorage.setItem(AUTH_USERNAME_STORAGE_KEY, authDraft.username);
@@ -1541,9 +2052,8 @@ export default function App() {
 
   const logout = async () => {
     await fetch('/api/auth/logout', { method: 'POST', headers: actorHeaders() });
-    if (!cookieAuth) {
-      setAuthToken('');
-    }
+    authTokenRef.current = '';
+    setAuthToken('');
     setAuthUser(null);
     setAuthMessage(t('auth.loggedOut'));
     await Promise.all([refreshLibrary(), loadGenerationSettings(), loadConnectionPresets(), loadPresetTypes(), loadLorebooks()]);
@@ -1705,7 +2215,7 @@ export default function App() {
       if (participantPersona && !participantPersonaRestoredRef.current) {
         participantPersonaRestoredRef.current = true;
         applySelectedPersonaId(participantPersona.id);
-      } else if (sessionSnapshotReceivedRef.current && !data.personas.some((persona) => persona.id === currentId)) {
+      } else if (!data.personas.some((persona) => persona.id === currentId)) {
         const nextPersona = data.personas.find((persona) => persona.active) || data.personas[0];
         if (nextPersona) {
           applySelectedPersonaId(nextPersona.id);
@@ -2000,7 +2510,88 @@ export default function App() {
     }
   };
 
+
+  const loadSummaryMemorySettings = async () => {
+    const response = await authedFetch('/api/settings/memory');
+    if (!response.ok) return;
+    const data = await response.json() as Partial<SummaryMemorySettings>;
+    setSummaryMemorySettings((current) => ({ ...current, ...data, api_key: '', clear_api_key: false }));
+  };
+
+  const saveSummaryMemorySettings = async (override?: Partial<SummaryMemorySettings>) => {
+    const payload = { ...summaryMemorySettings, ...override };
+    const response = await fetch('/api/settings/memory', {
+      method: 'PUT',
+      headers: authJsonHeaders(),
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      setSummaryStatusMessage('Ошибка сохранения настроек памяти');
+      return;
+    }
+    const data = await response.json() as Partial<SummaryMemorySettings>;
+    setSummaryMemorySettings((current) => ({ ...current, ...data, api_key: '', clear_api_key: false }));
+    setSummaryStatusMessage('Настройки памяти сохранены');
+  };
+
+  const fetchSummaryModels = async () => {
+    setSummaryStatusMessage('Загрузка списка моделей саммари…');
+    const response = await fetch('/api/settings/memory/models', {
+      method: 'POST',
+      headers: authJsonHeaders(),
+      body: JSON.stringify(summaryMemorySettings),
+    });
+    const data = await response.json().catch(() => null) as { ok?: boolean; models?: unknown; error?: string } | null;
+    if (!response.ok || !data?.ok) {
+      setSummaryStatusMessage(data?.error || 'Не удалось получить модели с API саммари');
+      return;
+    }
+    const modelNames = extractModelNames(data.models);
+    if (modelNames.length) {
+      setSummaryModels(modelNames);
+      if (!summaryMemorySettings.model) {
+        setSummaryMemorySettings((current) => ({ ...current, model: modelNames[0] || '' }));
+      }
+      setSummaryStatusMessage(`Найдено моделей: ${modelNames.length}`);
+    } else {
+      setSummaryStatusMessage(data.error || 'Модели не найдены');
+    }
+  };
+
+  const loadRooms = async () => {
+    const response = await authedFetch('/api/rooms');
+    if (!response.ok) return;
+    const data = await response.json() as { rooms: RoomInfo[] };
+    if (Array.isArray(data.rooms)) {
+      setRoomsList(data.rooms);
+    }
+  };
+
+  const switchRoom = (nextRoomId: string) => {
+    const clean = (nextRoomId || 'default').trim().replace(/[^a-zA-Z0-9_\-\u0400-\u04FF]/g, '-') || 'default';
+    currentRoomIdRef.current = clean;
+    window.localStorage.setItem('doubletrouble.roomId', clean);
+    const url = new URL(window.location.href);
+    if (clean === 'default') {
+      url.searchParams.delete('room');
+    } else {
+      url.searchParams.set('room', clean);
+    }
+    window.history.replaceState({}, '', url.toString());
+    setCurrentRoomId(clean);
+    setRoomInputDraft('');
+    addToast(`Комната переключена: ${clean}`);
+    void loadRooms();
+  };
   const refreshSharedSettings = async (section = '') => {
+    const now = Date.now();
+    if (section && now - (lastLocalSettingsSaveRef.current[section] || 0) < 3500) {
+      return;
+    }
+    if (section === 'cards' || section === 'personas' || section === 'library') {
+      await refreshLibrary();
+      return;
+    }
     if (section === 'generation') {
       await Promise.all([loadGenerationSettings(), loadConnectionPresets()]);
       return;
@@ -2020,9 +2611,18 @@ export default function App() {
       return;
     }
     if (section === 'extensions') {
+      void syncSillyTavernExtensions();
       return;
     }
-    await Promise.all([loadGenerationSettings(), loadConnectionPresets(), loadPresetTypes(), loadLorebooks()]);
+    if (section === 'extension_settings') {
+      void syncServerExtensionSettings();
+      return;
+    }
+    if (section === 'memory') {
+      await loadSummaryMemorySettings();
+      return;
+    }
+    await Promise.all([refreshLibrary(), loadGenerationSettings(), loadConnectionPresets(), loadPresetTypes(), loadLorebooks(), loadSummaryMemorySettings(), loadRooms()]);
     await reloadSelectedLorebook();
   };
 
@@ -2173,10 +2773,17 @@ export default function App() {
       }
       return false;
     }
-    const data = await response.json() as { chat: BotChat };
+    const data = await response.json() as { chat: BotChat; is_generating?: boolean };
     markAccessDenied('chats', false);
     setActiveCard(card);
     setActiveChat(data.chat);
+    if (data.is_generating === false && !isLocalGeneratingRef.current) {
+      activeGenerationRef.current = false;
+      setIsGenerating(false);
+      setGenerationStatus('');
+      setGenerationStreamText('');
+      setGenerationReplaceMessageId(null);
+    }
     setChatPickerOpen(false);
     rememberChatSelection(card.id, data.chat.id);
     await refreshCardChats(card.id);
@@ -2200,8 +2807,19 @@ export default function App() {
       return;
     }
     restoredSelectionRef.current = true;
+    const sessionTarget = sessionActiveTargetRef.current;
+    if (sessionTarget.cardId) {
+      const sessionCard = availableCards.find((item) => item.id === sessionTarget.cardId);
+      if (sessionCard) {
+        if (sessionTarget.chatId && await openChatForCard(sessionCard, sessionTarget.chatId)) {
+          return;
+        }
+        await selectBotCard(sessionCard, false);
+        return;
+      }
+    }
     const lastCardId = window.localStorage.getItem(LAST_CARD_STORAGE_KEY) || '';
-    const card = availableCards.find((item) => item.id === lastCardId);
+    const card = availableCards.find((item) => item.id === lastCardId) || availableCards[0];
     if (card) {
       await selectBotCard(card, false);
     }
@@ -2265,7 +2883,7 @@ export default function App() {
     setConnectionMessage(t('connection.checking'));
     const response = await fetch('/api/generation/models', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authJsonHeaders(),
       body: JSON.stringify(generationSettings),
     });
     const data = await response.json().catch(() => null) as { ok?: boolean; error?: string; models?: unknown } | null;
@@ -2308,10 +2926,15 @@ export default function App() {
       setLibraryMessage(error?.detail || t('cards.error.import'));
       return;
     }
+    const importedData = await response.json().catch(() => null) as { card?: CharacterCard; regex_scripts?: RegexScript[] } | null;
+    if (importedData?.card?.id && Array.isArray(importedData.regex_scripts) && importedData.regex_scripts.length) {
+      setRegexContext(importedData.card.id, activeConnectionPresetName, generationSettings.chat_completion_source || generationSettings.provider || 'openai');
+      saveScriptsByType(importedData.regex_scripts, SCRIPT_TYPES.SCOPED);
+      allowScopedScripts();
+    }
     setLibraryMessage(t('cards.imported'));
     await refreshLibrary();
   };
-
   const createCard = async () => {
     const name = cardDraft.name.trim();
     if (!name) {
@@ -2422,7 +3045,7 @@ export default function App() {
     if (rememberedChatId && await openChatForCard(card, rememberedChatId)) {
       setLibraryMessage(`${t('chat.openedLast')}: ${card.name}`);
       if (notify) {
-        sendRealtimeEvent({ type: 'card.select', name: card.name, persona_name: selectedPersona?.name || 'Player' });
+        sendRealtimeEvent({ type: 'card.select', card_id: card.id, chat_id: rememberedChatId, participant_id: participantIdRef.current, name: card.name, persona_name: selectedPersona?.name || 'Player' });
       }
       return;
     }
@@ -2443,7 +3066,7 @@ export default function App() {
     rememberChatSelection(card.id, chatData.chat.id);
     setLibraryMessage(`${t('chat.opened')}: ${chatData.chat.title}`);
     if (notify) {
-      sendRealtimeEvent({ type: 'card.select', name: card.name, persona_name: selectedPersona?.name || 'Player' });
+      sendRealtimeEvent({ type: 'card.select', card_id: card.id, chat_id: chatData.chat.id, participant_id: participantIdRef.current, name: card.name, persona_name: selectedPersona?.name || 'Player' });
     }
   };
 
@@ -2474,7 +3097,16 @@ export default function App() {
     const opened = await openChatForCard(activeCard, chatId);
     if (!opened) {
       setLibraryMessage(t('chat.error.open'));
+      return;
     }
+    sendRealtimeEvent({
+      type: 'card.select',
+      card_id: activeCard.id,
+      chat_id: chatId,
+      participant_id: participantIdRef.current,
+      name: activeCard.name,
+      persona_name: selectedPersona?.name || 'Player',
+    });
   };
 
   const copyChat = async (chatId: string) => {
@@ -2511,6 +3143,29 @@ export default function App() {
     link.remove();
     window.URL.revokeObjectURL(url);
     setLibraryMessage(t('chat.exportedST'));
+  };
+
+  const importBotChat = async (file: File | null) => {
+    if (!file || !activeCard) {
+      return;
+    }
+    const body = new FormData();
+    body.append('file', file);
+    const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/import`, {
+      method: 'POST',
+      headers: actorHeaders(),
+      body,
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => null) as { detail?: string } | null;
+      setLibraryMessage(error?.detail || t('chat.error.open'));
+      return;
+    }
+    const data = await response.json() as { chat: BotChat };
+    setActiveChat(data.chat);
+    rememberChatSelection(activeCard.id, data.chat.id);
+    await refreshCardChats(activeCard.id);
+    setChatPickerOpen(false);
   };
 
   const toggleDeletionLock = async (category: keyof DeletionLocks, itemId: string) => {
@@ -2584,20 +3239,155 @@ export default function App() {
     await refreshCardChats(activeCard.id);
   };
 
-  const sendChatMessage = async () => {
-    if (!chatInput.trim() || isGenerating) {
+  const savePartyHud = async (nextHud: PartyHudState) => {
+    if (!activeCard || !activeChat) return;
+    const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/hud`, {
+      method: 'PUT',
+      headers: authJsonHeaders(),
+      body: JSON.stringify(nextHud),
+    });
+    if (response.ok) {
+      const data = await response.json() as { chat: BotChat };
+      setActiveChat(data.chat);
+      setPartyHudDraft(data.chat.party_hud || nextHud);
+    }
+  };
+
+  const togglePartyHudEnabled = async (enabled: boolean) => {
+    const baseHud: PartyHudState = activeChat?.party_hud || partyHudDraft;
+    const updated: PartyHudState = {
+      ...baseHud,
+      enabled,
+      players: baseHud.players?.length
+        ? baseHud.players
+        : connectedPlayers.map((p) => ({ name: p.persona_name || p.name || 'Player', hp: '100/100', status: 'В норме', inventory: '' })),
+    };
+    setPartyHudDraft(updated);
+    if (enabled) setPartyHudExpanded(true);
+    await savePartyHud(updated);
+  };
+
+  const saveChatMemoryText = async (memorySummary: string) => {
+    if (!activeCard || !activeChat) return;
+    const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/memory`, {
+      method: 'PUT',
+      headers: authJsonHeaders(),
+      body: JSON.stringify({ memory_summary: memorySummary }),
+    });
+    if (response.ok) {
+      const data = await response.json() as { chat: BotChat };
+      setActiveChat(data.chat);
+      setChatMemoryDraft(data.chat.memory_summary || '');
+      setSummaryStatusMessage('Память чата сохранена');
+    }
+  };
+
+  const triggerManualSummarize = async () => {
+    if (!activeCard || !activeChat || isSummarizingMemory) return;
+    setIsSummarizingMemory(true);
+    setSummaryStatusMessage('Генерация саммари истории…');
+    try {
+      const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/memory/summarize`, {
+        method: 'POST',
+        headers: authJsonHeaders(),
+      });
+      if (!response.ok) {
+        const err = await response.json().catch(() => null) as { detail?: string } | null;
+        setSummaryStatusMessage(err?.detail || 'Ошибка генерации саммари');
+        return;
+      }
+      const data = await response.json() as { chat: BotChat };
+      setActiveChat(data.chat);
+      setChatMemoryDraft(data.chat.memory_summary || '');
+      setSummaryStatusMessage('Хроника памяти успешно обновлена!');
+    } finally {
+      setIsSummarizingMemory(false);
+    }
+  };
+
+  const branchChatFromMessage = async (upToMessageId?: string, customTitle = '') => {
+    if (!activeCard || !activeChat) return;
+    const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/branch`, {
+      method: 'POST',
+      headers: authJsonHeaders(),
+      body: JSON.stringify({ up_to_message_id: upToMessageId || null, title: customTitle }),
+    });
+    if (!response.ok) {
+      addToast('Не удалось создать ветку чата');
       return;
     }
-    if (chatInput.trimStart().startsWith('/')) {
-      await executeSlashCommand(chatInput);
+    const data = await response.json() as { chat: BotChat };
+    setActiveChat(data.chat);
+    rememberChatSelection(activeCard.id, data.chat.id);
+    await refreshCardChats(activeCard.id);
+    addToast(`⑂ Открыта новая ветка: ${data.chat.title}`);
+  };
+
+  const toggleSwipeVote = async (message: ChatMessage) => {
+    if (!activeCard || !activeChat) return;
+    const voter = selectedPersona?.name || authUser?.username || 'Player';
+    const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/messages/${encodeURIComponent(message.id)}/vote`, {
+      method: 'POST',
+      headers: authJsonHeaders(),
+      body: JSON.stringify({ voter, swipe_index: message.active_swipe_index ?? 0 }),
+    });
+    if (response.ok) {
+      const data = await response.json() as { chat: BotChat };
+      setActiveChat(data.chat);
+    }
+  };
+
+  const revealSecretMessage = async (message: ChatMessage) => {
+    if (!activeCard || !activeChat) return;
+    const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/messages/${encodeURIComponent(message.id)}`, {
+      method: 'PUT',
+      headers: authJsonHeaders(),
+      body: JSON.stringify({ secret_revealed: true }),
+    });
+    if (response.ok) {
+      const data = await response.json() as { chat: BotChat };
+      setActiveChat(data.chat);
+    }
+  };
+
+  const rollDiceInChat = async (formula = '1d20', label = '', dc?: number) => {
+    if (!activeCard || !activeChat) return;
+    const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/roll`, {
+      method: 'POST',
+      headers: authJsonHeaders(),
+      body: JSON.stringify({
+        author: selectedPersona?.name || 'Player',
+        participant_id: participantIdRef.current,
+        avatar_url: selectedPersona?.avatar_url || '',
+        username: authUser?.username || '',
+        is_admin: Boolean(authUser?.is_admin),
+        formula,
+        label,
+        dc: dc ?? null,
+      }),
+    });
+    if (response.ok) {
+      const data = await response.json() as { chat: BotChat };
+      setActiveChat(data.chat);
+    }
+  };
+
+  const sendChatMessage = async (overrideContent?: string, overrideMode?: 'normal' | 'ooc' | 'secret') => {
+    const rawText = overrideContent !== undefined ? overrideContent : chatInput;
+    if (!rawText.trim() || isGenerating) {
+      return;
+    }
+    if (overrideContent === undefined && rawText.trimStart().startsWith('/')) {
+      await executeSlashCommand(rawText);
       return;
     }
     if (!activeCard || !activeChat) {
       return;
     }
-    let content = getRegexedString(chatInput, regex_placement.USER_INPUT);
+    const effectiveMode = overrideMode || composerMode;
+    let content = getRegexedString(rawText, regex_placement.USER_INPUT);
     const mtSettings = loadMagicTranslationSettings();
-    if (mtSettings.autoMode === 'inputs' || mtSettings.autoMode === 'both') {
+    if ((mtSettings.autoMode === 'inputs' || mtSettings.autoMode === 'both') && effectiveMode !== 'ooc') {
       try {
         const translated = await translateText(content, mtSettings, activeMessages.map((m) => ({ name: m.author, mes: m.content })), selectedPersona?.name || 'Player');
         if (translated) {
@@ -2607,19 +3397,37 @@ export default function App() {
         // silently fall back to original content on translation failure
       }
     }
-    setChatInput('');
+    if (overrideContent === undefined) {
+      setChatInput('');
+      if (composerTextareaRef.current) {
+        composerTextareaRef.current.style.height = '';
+      }
+    }
     const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/messages`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ author: selectedPersona?.name || 'Player', participant_id: participantIdRef.current, avatar_url: selectedPersona?.avatar_url || '', username: authUser?.username || '', is_admin: Boolean(authUser?.is_admin), role: 'user', content }),
+      headers: authJsonHeaders(),
+      body: JSON.stringify({
+        author: selectedPersona?.name || 'Player',
+        participant_id: participantIdRef.current,
+        avatar_url: selectedPersona?.avatar_url || '',
+        username: authUser?.username || '',
+        is_admin: Boolean(authUser?.is_admin),
+        role: 'user',
+        content,
+        is_ooc: effectiveMode === 'ooc',
+        is_secret: effectiveMode === 'secret',
+      }),
     });
     if (!response.ok) {
-      setChatInput(content);
+      if (overrideContent === undefined) setChatInput(content);
       setLibraryMessage(t('message.error.send'));
       return;
     }
     const data = await response.json() as { chat: BotChat };
     setActiveChat(data.chat);
+    if (composerMode === 'secret') {
+      setComposerMode('normal');
+    }
   };
 
   const messageIndexesFromInput = (input: string) => {
@@ -2706,6 +3514,29 @@ export default function App() {
       setChatInput('');
       return;
     }
+    if (command === '/ooc') {
+      if (!argText.trim()) return;
+      setChatInput('');
+      await sendChatMessage(argText.trim(), 'ooc');
+      return;
+    }
+    if (command === '/secret' || command === '/whisper') {
+      if (!argText.trim()) return;
+      setChatInput('');
+      await sendChatMessage(argText.trim(), 'secret');
+      return;
+    }
+    if (command === '/roll' || command === '/r') {
+      setChatInput('');
+      await rollDiceInChat(argText.trim() || '1d20');
+      return;
+    }
+    if (command === '/branch') {
+      setChatInput('');
+      const lastMsg = activeMessages[activeMessages.length - 1];
+      await branchChatFromMessage(lastMsg?.id, argText.trim());
+      return;
+    }
     if (command === '/reroll') {
       setChatInput('');
       await rerollLastBotMessage();
@@ -2789,6 +3620,14 @@ export default function App() {
       }
       return;
     }
+    const extCmdResult = await executeExtensionSlashCommand(regexedCommand);
+    if (extCmdResult.handled) {
+      setChatInput('');
+      if (extCmdResult.output) {
+        setLibraryMessage(extCmdResult.output);
+      }
+      return;
+    }
     setLibraryMessage(t('commands.unknown'));
   };
 
@@ -2802,7 +3641,8 @@ export default function App() {
       return;
     }
     const rawContent = editingMessageText.trim();
-    const content = getRegexedString(rawContent, regex_placement.MD_DISPLAY, { isMarkdown: true, isEdit: true });
+    const editPlacement = message.role === 'user' ? regex_placement.USER_INPUT : regex_placement.AI_OUTPUT;
+    const content = getRegexedString(rawContent, editPlacement, { isEdit: true });
     if (!content || content === message.content) {
       setEditingMessageId('');
       setEditingMessageText('');
@@ -2914,7 +3754,7 @@ export default function App() {
     }
     const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/messages/${encodeURIComponent(message.id)}/swipe`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authJsonHeaders(),
       body: JSON.stringify({ direction }),
     });
     if (!response.ok) {
@@ -2926,52 +3766,61 @@ export default function App() {
   };
 
   const requestBotReply = async (replaceMessageId?: string, sourceChat?: BotChat, resetSwipes = false) => {
-    const chat = sourceChat || activeChat;
+    const card = activeCard || activeCardRef.current;
+    const chat = sourceChat || activeChat || activeChatRef.current;
     if (!replaceMessageId && !botReplyAllowed && !authUser?.is_admin) {
       setLibraryMessage(t('chat.error.botReplyDisabled'));
       return;
     }
-    if (!activeCard || !chat || isGenerating) {
+    if (!card || !chat || activeGenerationRef.current || isGenerating) {
       setLibraryMessage(t('chat.error.selectCardAndChat'));
       return;
     }
+    isLocalGeneratingRef.current = true;
     activeGenerationRef.current = true;
     setIsGenerating(true);
     setGenerationStreamText('');
     setGenerationReplaceMessageId(replaceMessageId || null);
-    setGenerationStatus(`${activeCard.name} ${t('composer.typing')}`);
+    setGenerationStatus(`${card.name} ${t('composer.typing')}`);
     setLibraryMessage(replaceMessageId ? t('message.reroll') : t('message.botAnswering'));
     try {
-      const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(chat.id)}/bot/reply`, {
+      void emitSillyTavernGenerationEvent('started');
+      const presetName = presetNameDraft.trim() || selectedPresetName || 'unsaved';
+      const currentPresetSig = `${selectedPresetTypeRef.current}:${presetName}:${presetJsonDraft}`;
+      const shouldSendInlinePreset = selectedPresetTypeRef.current === 'openai' && activePresetDraftSignatureRef.current !== currentPresetSig;
+      const response = await fetch(`/api/cards/${encodeURIComponent(card.id)}/chats/${encodeURIComponent(chat.id)}/bot/reply`, {
         method: 'POST',
         headers: authJsonHeaders(),
         body: JSON.stringify({
           replace_message_id: replaceMessageId || null,
           reset_swipes: resetSwipes,
-          openai_preset: selectedPresetTypeRef.current === 'openai' ? parsePresetDraft(presetJsonDraft) : null,
+          openai_preset: shouldSendInlinePreset ? parsePresetDraft(presetJsonDraft) : null,
           persona_id: selectedPersona?.id || '',
           persona_name: selectedPersona?.name || '',
           persona_description: selectedPersona?.description || '',
           participants: generationParticipants(),
           regex_scripts: getRegexScripts({ allowedOnly: true }),
+          extension_prompts: getActiveExtensionPrompts(),
         }),
       });
       if (!response.ok) {
         const error = await response.json().catch(() => null) as { detail?: string } | null;
         setLibraryMessage(response.status === 499 ? t('message.generationCancelled') : error?.detail || t('message.error.botReply'));
+        void emitSillyTavernGenerationEvent(response.status === 499 ? 'stopped' : 'ended');
         return;
       }
       const data = await response.json() as { chat: BotChat };
+      void emitSillyTavernGenerationEvent('ended');
       setActiveChat(data.chat);
       setLibraryMessage(replaceMessageId ? t('message.rerollAdded') : t('message.botReplyAdded'));
       const mtSettings = loadMagicTranslationSettings();
       if ((mtSettings.autoMode === 'responses' || mtSettings.autoMode === 'both') && data.chat) {
         const lastBotMessage = [...data.chat.messages].reverse().find((m) => m.role === 'assistant');
-        if (lastBotMessage && activeCard) {
+        if (lastBotMessage && card) {
           try {
             const translated = await translateText(lastBotMessage.content, mtSettings, data.chat.messages.map((m) => ({ name: m.author, mes: m.content })), lastBotMessage.author);
             if (translated) {
-              await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(data.chat.id)}/messages/${encodeURIComponent(lastBotMessage.id)}`, {
+              await fetch(`/api/cards/${encodeURIComponent(card.id)}/chats/${encodeURIComponent(data.chat.id)}/messages/${encodeURIComponent(lastBotMessage.id)}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json', ...actorHeaders() },
                 body: JSON.stringify({ display_text: translated }),
@@ -2990,6 +3839,7 @@ export default function App() {
         }
       }
     } finally {
+      isLocalGeneratingRef.current = false;
       activeGenerationRef.current = false;
       setIsGenerating(false);
       setGenerationStreamText('');
@@ -2997,6 +3847,7 @@ export default function App() {
       setGenerationStatus('');
     }
   };
+  requestBotReplyRef.current = requestBotReply;
 
   const rerollLastBotMessage = async () => {
     const lastBotMessage = [...activeMessages].reverse().find((message) => message.role === 'assistant');
@@ -3148,64 +3999,252 @@ export default function App() {
       data-background-vignette={String(visualSettings.backgroundVignette)}
       data-topbar-visible={String(topbarVisible)}
     >
-      <header className={`${topbarVisible ? 'topbar topbar-visible' : 'topbar topbar-hidden'}${mobileTopbarCollapsed ? ' topbar-collapsed' : ''}`} onClick={toggleMobileTopbar}>
-        <button className="menu-trigger" type="button" onClick={() => setMenuOpen(true)}>
-          <Icon name="menu" />
-          {t('topbar.menu')}
-        </button>
-        <div className="turn-strip app-status-strip">
-          <div>
-            <span>{t('topbar.persona')}</span>
-            <strong>{selectedPersona?.name || t('topbar.persona.none')}</strong>
-          </div>
-          <div>
-            <span>{t('topbar.activeChat')}</span>
-            <strong>{activeCard?.name || t('topbar.activeChat.noCard')} · {activeChat?.title || t('topbar.activeChat.noChat')}</strong>
-          </div>
-          <div>
-            <span>{t('topbar.connections')}</span>
-            <div className="connections-status">
+      <header className="topbar">
+        <nav className="topbar-quick-nav" aria-label={t('topbar.menu')}>
+          {getMenuItems(t).map((item) => {
+            const isActive = menuOpen && activeSection === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                className={isActive ? 'topbar-icon-btn active' : 'topbar-icon-btn'}
+                title={`${item.label} — ${item.description}`}
+                aria-label={item.label}
+                onClick={() => {
+                  if (isActive) {
+                    setMenuOpen(false);
+                  } else {
+                    setActiveSection(item.id);
+                    setMenuOpen(true);
+                  }
+                }}
+              >
+                <Icon name={item.icon} />
+                <span className="topbar-icon-label">{item.label}</span>
+              </button>
+            );
+          })}
+        </nav>
+
+        <div className="topbar-right">
+          <div className="connections-status">
+            <button
+              className={playersMenuOpen ? 'ghost-button topbar-room-btn active' : 'ghost-button topbar-room-btn'}
+              type="button"
+              title={`${t('topbar.players')} (#${currentRoomId})`}
+              aria-label={t('topbar.players')}
+              onClick={() => {
+                setPlayersMenuOpen((open) => !open);
+                void loadRooms();
+              }}
+            >
+              <span className="online-dot" />
               <strong>{connectedCount}</strong>
-              <button className="ghost-button" type="button" onClick={() => setPlayersMenuOpen((open) => !open)}>{t('topbar.players')}</button>
-              {playersMenuOpen ? (
-                <div className="players-popover">
+            </button>
+            {playersMenuOpen ? (
+              <div className="players-popover">
+                <div className="popover-section-title">Онлайн в комнате ({currentRoomId})</div>
+                <div className="players-pill-list">
                   {connectedPlayers.length ? connectedPlayers.map((player) => (
-                    <span className="player-pill" key={player.id} title={player.persona_name || player.name}>
-                      {player.avatar_url ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(player.avatar_url), title: player.persona_name || player.name })}><img src={imageSrc(player.avatar_url)} alt="" loading="lazy" /></button> : <i>{(player.persona_name || player.name).slice(0, 1) || '?'}</i>}
-                      <strong className="identity-name">{player.is_admin ? <span className="admin-crown">♛</span> : null}<span>{player.persona_name || player.name}</span></strong>
-                      {player.username ? <small className="hover-username">({player.username})</small> : null}
+                    <span className="player-pill" key={player.id} title={player.username ? `${player.persona_name || player.name} (@${player.username})` : (player.persona_name || player.name)}>
+                      <span className="online-dot" />
+                      <strong className="identity-name">{player.is_admin ? <span className="admin-crown">♛</span> : null}<span>{player.persona_name || player.username || player.name}</span></strong>
+                      {player.username && (player.persona_name || player.name) && player.username.toLowerCase() !== (player.persona_name || player.name).toLowerCase() ? <small className="hover-username">({player.username})</small> : null}
                     </span>
                   )) : <strong>{t('topbar.players.none')}</strong>}
                 </div>
-              ) : null}
-            </div>
+                <div className="popover-divider" />
+                <div className="popover-section-title">Режим очереди ходов</div>
+                <div className="popover-segmented">
+                  <button
+                    type="button"
+                    className={turnMode === 'free' ? 'ghost-button active' : 'ghost-button'}
+                    onClick={() => sendRealtimeEvent({ type: 'turn.mode', turn_mode: 'free' })}
+                  >
+                    Свободный
+                  </button>
+                  <button
+                    type="button"
+                    className={turnMode === 'round_ready' ? 'ghost-button active' : 'ghost-button'}
+                    onClick={() => sendRealtimeEvent({ type: 'turn.mode', turn_mode: 'round_ready' })}
+                  >
+                    Все готовы (Раунд)
+                  </button>
+                </div>
+                <div className="popover-divider" />
+                <label className="popover-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(activeChat?.party_hud?.enabled)}
+                    disabled={!activeChat}
+                    onChange={(event) => void togglePartyHudEnabled(event.target.checked)}
+                  />
+                  <span>Показывать Party HUD (панель группы)</span>
+                </label>
+                <button
+                  type="button"
+                  className="ghost-button popover-full-btn"
+                  onClick={() => { setMemoryModalOpen(true); setPlayersMenuOpen(false); void loadSummaryMemorySettings(); }}
+                >
+                  📜 Память и Авто-саммари ({summaryMemorySettings.enabled ? 'Вкл' : 'Выкл'})
+                </button>
+                <div className="popover-divider" />
+                <div className="popover-section-title">Комнаты (Multi-Room)</div>
+                <div className="rooms-list-mini">
+                  {roomsList.map((room) => (
+                    <button
+                      key={room.id}
+                      type="button"
+                      className={room.id === currentRoomId ? 'ghost-button active' : 'ghost-button'}
+                      onClick={() => switchRoom(room.id)}
+                    >
+                      {room.id} ({room.online_count})
+                    </button>
+                  ))}
+                </div>
+                <div className="room-switch-row">
+                  <input
+                    type="text"
+                    placeholder="Код новой комнаты…"
+                    value={roomInputDraft}
+                    onChange={(event) => setRoomInputDraft(event.target.value)}
+                  />
+                  <button type="button" className="ghost-button" onClick={() => roomInputDraft.trim() && switchRoom(roomInputDraft.trim())}>Войти</button>
+                </div>
+              </div>
+            ) : null}
           </div>
-        </div>
-        <div className="brand-block">
-          <div>
-            <strong>DoubleTrouble</strong>
-            <small>default session · 127.0.0.1:8017</small>
-          </div>
-          <img className="brand-mark" src="/favicon.png" alt="DT" />
         </div>
       </header>
 
       <section className="hybrid-layout">
         <section className="chat-stage">
-          <div className="chat-scroll" id="chat" onScroll={(event) => updateTopbarForScroll(event.currentTarget.scrollTop)}>
+          {activeChat?.party_hud?.enabled ? (
+            <div className="party-hud-bar">
+              <div className="party-hud-summary" onClick={() => setPartyHudExpanded((v) => !v)}>
+                <span className="party-hud-badge">🛡️ HUD группы</span>
+                {activeChat.party_hud.location ? <span>📍 {activeChat.party_hud.location}</span> : null}
+                {activeChat.party_hud.time_of_day ? <span>🕒 {activeChat.party_hud.time_of_day}</span> : null}
+                {activeChat.party_hud.quest ? <span>🎯 {activeChat.party_hud.quest}</span> : null}
+                {activeChat.party_hud.players?.map((pl, idx) => (
+                  <span key={idx} className="party-hud-player-chip">
+                    <strong>{pl.name}</strong>{pl.hp ? ` ❤️ ${pl.hp}` : ''}{pl.status ? ` · ${pl.status}` : ''}{pl.inventory ? ` · 🎒 ${pl.inventory}` : ''}
+                  </span>
+                ))}
+                <button type="button" className="ghost-button hud-expand-btn" onClick={(e) => { e.stopPropagation(); setPartyHudExpanded((v) => !v); }}>
+                  {partyHudExpanded ? 'Свернуть ▴' : 'Настроить ▾'}
+                </button>
+              </div>
+              {partyHudExpanded ? (
+                <div className="party-hud-editor">
+                  <div className="party-hud-grid">
+                    <label>
+                      <span>📍 Локация</span>
+                      <input value={partyHudDraft.location} placeholder="Таверна, Руины…" onChange={(e) => setPartyHudDraft({ ...partyHudDraft, location: e.target.value })} />
+                    </label>
+                    <label>
+                      <span>🕒 Время / Погода</span>
+                      <input value={partyHudDraft.time_of_day} placeholder="Полночь, гроза…" onChange={(e) => setPartyHudDraft({ ...partyHudDraft, time_of_day: e.target.value })} />
+                    </label>
+                    <label>
+                      <span>🎯 Текущий квест / Цель</span>
+                      <input value={partyHudDraft.quest} placeholder="Найти ключ…" onChange={(e) => setPartyHudDraft({ ...partyHudDraft, quest: e.target.value })} />
+                    </label>
+                    <label>
+                      <span>📝 Заметки сцены</span>
+                      <input value={partyHudDraft.notes} placeholder="Стража настороже…" onChange={(e) => setPartyHudDraft({ ...partyHudDraft, notes: e.target.value })} />
+                    </label>
+                  </div>
+                  <div className="party-hud-players-editor">
+                    {(partyHudDraft.players || []).map((pl, idx) => (
+                      <div key={idx} className="party-hud-player-row">
+                        <input placeholder="Имя" value={pl.name} onChange={(e) => {
+                          const next = [...partyHudDraft.players];
+                          next[idx] = { ...next[idx], name: e.target.value };
+                          setPartyHudDraft({ ...partyHudDraft, players: next });
+                        }} />
+                        <input placeholder="HP / Ресурсы" value={pl.hp} onChange={(e) => {
+                          const next = [...partyHudDraft.players];
+                          next[idx] = { ...next[idx], hp: e.target.value };
+                          setPartyHudDraft({ ...partyHudDraft, players: next });
+                        }} />
+                        <input placeholder="Статус" value={pl.status} onChange={(e) => {
+                          const next = [...partyHudDraft.players];
+                          next[idx] = { ...next[idx], status: e.target.value };
+                          setPartyHudDraft({ ...partyHudDraft, players: next });
+                        }} />
+                        <input placeholder="Инвентарь" value={pl.inventory} onChange={(e) => {
+                          const next = [...partyHudDraft.players];
+                          next[idx] = { ...next[idx], inventory: e.target.value };
+                          setPartyHudDraft({ ...partyHudDraft, players: next });
+                        }} />
+                        <button type="button" className="ghost-button danger-button" onClick={() => {
+                          setPartyHudDraft({ ...partyHudDraft, players: partyHudDraft.players.filter((_, i) => i !== idx) });
+                        }}>✕</button>
+                      </div>
+                    ))}
+                    <div className="party-hud-actions">
+                      <button type="button" className="ghost-button" onClick={() => setPartyHudDraft({ ...partyHudDraft, players: [...(partyHudDraft.players || []), { name: selectedPersona?.name || 'Player', hp: '100/100', status: '', inventory: '' }] })}>+ Игрок</button>
+                      <button type="button" className="ghost-button" onClick={() => {
+                        const existing = new Set((partyHudDraft.players || []).map((p) => p.name.trim().toLowerCase()).filter(Boolean));
+                        const roomNames = connectedPlayers.map((p) => (p.persona_name || p.name || '').trim()).filter(Boolean);
+                        if (selectedPersona?.name && !roomNames.includes(selectedPersona.name.trim())) {
+                          roomNames.unshift(selectedPersona.name.trim());
+                        }
+                        const added = roomNames
+                          .filter((n) => !existing.has(n.toLowerCase()))
+                          .map((name) => ({ name, hp: '100/100', status: '', inventory: '' }));
+                        if (added.length) {
+                          setPartyHudDraft({ ...partyHudDraft, players: [...(partyHudDraft.players || []), ...added] });
+                        }
+                      }}>👥 + Из комнаты</button>
+                      <button type="button" onClick={() => { void savePartyHud(partyHudDraft); setPartyHudExpanded(false); }}>Сохранить HUD</button>
+                      <label className="hud-disable-inline">
+                        <input type="checkbox" checked={partyHudDraft.auto_update !== false} onChange={(e) => setPartyHudDraft({ ...partyHudDraft, auto_update: e.target.checked })} />
+                        <span>🤖 Авто-HUD от бота</span>
+                      </label>
+                      <label className="hud-disable-inline">
+                        <input type="checkbox" checked={partyHudDraft.ai_roll_prompts !== false} onChange={(e) => setPartyHudDraft({ ...partyHudDraft, ai_roll_prompts: e.target.checked })} />
+                        <span>🎲 Проверки от ИИ</span>
+                      </label>
+                      <label className="hud-disable-inline">
+                        <input type="checkbox" checked={partyHudDraft.enabled} onChange={(e) => void togglePartyHudEnabled(e.target.checked)} />
+                        <span>HUD включён</span>
+                      </label>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          <div className="chat-scroll" id="chat" ref={chatScrollRef} onScroll={(event) => updateTopbarForScroll(event.currentTarget.scrollTop, event.currentTarget)}>
             {accessDenied.chats ? <AccessDeniedNotice /> : activeMessages.length ? activeMessages.map((message, messageIndex) => {
               const isOwnMessage = message.role === 'user' && (message.participant_id ? message.participant_id === participantIdRef.current : message.author === selectedPersona?.name);
-              const messageClass = `mes ${message.role === 'assistant' ? 'message bot-message' : 'message'}${message.hidden ? ' hidden-message' : ''}${isOwnMessage ? ' own-message' : ''}`;
+              const messageClass = `mes ${message.role === 'assistant' ? 'message bot-message' : 'message'}${message.hidden ? ' hidden-message' : ''}${isOwnMessage ? ' own-message' : ''}${message.is_ooc ? ' ooc-message' : ''}${message.is_secret ? ' secret-message' : ''}${message.is_dice_roll ? ' dice-message' : ''}`;
               const swipeCount = message.swipes?.length ?? 0;
               const canSwipe = message.role === 'assistant' && swipeCount > 1;
+              const activeSwipeKey = String(message.active_swipe_index ?? 0);
+              const currentSwipeVoters = message.swipe_votes?.[activeSwipeKey] || [];
+              const myVoterName = selectedPersona?.name || authUser?.username || 'Player';
+              const hasVotedSwipe = currentSwipeVoters.includes(myVoterName);
+              const isSecretHiddenForMe = Boolean(message.is_secret && !message.secret_revealed && !isOwnMessage);
               const isImagePending = Boolean(activeCard && activeChat && imagePendingMessages[imagePendingKey(activeCard.id, activeChat.id, message.id)]);
-              const displayContent = message.display_text || message.content;
-              const visibleMessageContent = generationReplaceMessageId === message.id && generationStreamText ? generationStreamText : displayContent;
+              const displayContent = isSecretHiddenForMe
+                ? `🕵️ *${message.author} совершает тайное действие (известно только мастеру ИИ)…*`
+                : (message.display_text || message.content);
+              const activeStreamSlice = displayedStreamText || generationStreamText;
+              const rawVisibleContent = generationReplaceMessageId === message.id && activeStreamSlice ? `${activeStreamSlice}▍` : displayContent;
+              const rollPrompts = message.role === 'assistant'
+                ? Array.from(rawVisibleContent.matchAll(/\[ROLL:\s*([^\]]+)\]/gi)).map((m) => m[1].trim())
+                : [];
+              const visibleMessageContent = message.role === 'assistant' && rollPrompts.length > 0
+                ? (rawVisibleContent.replace(/\[ROLL:\s*[^\]]+\]\s*/gi, '').trim() || rawVisibleContent)
+                : rawVisibleContent;
               return (
                <article
+                 key={message.id}
                  className={messageClass}
                  {...{ mesid: String(messageIndex) }}
-                 key={message.id}
                 tabIndex={canSwipe ? 0 : undefined}
                 onKeyDown={(event) => {
                   if (!canSwipe || (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight')) {
@@ -3236,17 +4275,26 @@ export default function App() {
               >
                 <div className="message-avatar-rail">
                   {message.avatar_url ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(message.avatar_url), title: message.author })}><img src={imageSrc(message.avatar_url)} alt="" loading="lazy" /></button> : <i>{message.author.slice(0, 1) || '?'}</i>}
-                  <small className="message-index">#{messageIndex}</small>
-                  <small className="message-token-count">{approxTokens(visibleMessageContent)} {t('message.tokens')}</small>
                 </div>
                 <div className="message-actions extraMesButtons" aria-label={t('message.actions')}>
                   {canSwipe ? <button className="mes_button" type="button" title={t('message.swipe.prev')} onClick={() => void swipeBotMessage(message, -1)}>‹</button> : null}
                   {canSwipe ? <button className="mes_button" type="button" title={t('message.swipe.next')} onClick={() => void swipeBotMessage(message, 1)}>›</button> : null}
                   {canSwipe ? <small className="swipe-counter">{(message.active_swipe_index ?? 0) + 1}/{swipeCount}</small> : null}
+                  {message.role === 'assistant' ? (
+                    <button
+                      className={hasVotedSwipe ? 'mes_button swipe-vote-btn voted' : 'mes_button swipe-vote-btn'}
+                      type="button"
+                      title={currentSwipeVoters.length ? `Голоса за этот вариант: ${currentSwipeVoters.join(', ')}` : 'Проголосовать за этот вариант ответа 👍'}
+                      onClick={() => void toggleSwipeVote(message)}
+                    >
+                      👍{currentSwipeVoters.length ? <small>{currentSwipeVoters.length}</small> : null}
+                    </button>
+                  ) : null}
                   {message.role === 'assistant' ? <button className="mes_button" type="button" title={t('message.swipe.new')} onClick={() => void requestBotReply(message.id)}>↻</button> : null}
+                  <button className="mes_button" type="button" title="Создать развилку сюжета (новую ветку чата) с этого сообщения" onClick={() => void branchChatFromMessage(message.id)}><Icon name="branch" /></button>
                   {isImagePending ? <button className="mes_button" type="button" title={t('message.cancelImage')} onClick={() => cancelImageGeneration(messageIndex, message)}><Icon name="x" /></button> : null}
-                  <button className="mes_button" type="button" title={t('message.translate')} onClick={() => void handleMagicTranslateMessage(message)}>🌐</button>
-                  <button className="mes_button" type="button" title={t('message.edit')} onClick={() => startEditMessage(message)}><Icon name="edit" /></button>
+                  <button className="mes_button" type="button" title={t('message.translate')} onClick={() => void handleMagicTranslateMessage(message)}><Icon name="translate" /></button>
+                  {!isSecretHiddenForMe ? <button className="mes_button" type="button" title={t('message.edit')} onClick={() => startEditMessage(message)}><Icon name="edit" /></button> : null}
                   <button className="mes_button" type="button" title={message.hidden ? t('common.show') : t('common.hide')} onClick={() => void toggleMessageHidden(message)}><Icon name={message.hidden ? 'eye' : 'eyeOff'} /></button>
                   <button className="mes_button" type="button" title={t('message.delete')} onClick={() => void deleteChatMessage(message)}><Icon name="trash" /></button>
                 </div>
@@ -3255,7 +4303,18 @@ export default function App() {
                     <span className="message-name-block">
                       <strong className="identity-name">{message.is_admin ? <span className="admin-crown">♛</span> : null}<span>{message.author}</span></strong>
                       <small className="message-time">{formatChatMessageTime(message.created_at)}</small>
+                      <small className="message-meta-inline">#{messageIndex}</small>
                       {message.username ? <small className="hover-username">({message.username})</small> : null}
+                      {message.is_ooc ? <span className="msg-mode-badge ooc-badge">💬 OOC</span> : null}
+                      {message.is_secret ? (
+                        <span className="msg-mode-badge secret-badge">
+                          🕵️ {message.secret_revealed ? 'Тайный ход (раскрыт)' : 'Тайный ход'}
+                          {!message.secret_revealed && isOwnMessage ? (
+                            <button type="button" className="ghost-button reveal-secret-btn" onClick={() => void revealSecretMessage(message)}>👁️ Раскрыть всем</button>
+                          ) : null}
+                        </span>
+                      ) : null}
+                      {message.is_dice_roll ? <span className="msg-mode-badge dice-badge">🎲 Бросок</span> : null}
                     </span>
                   </header>
                   {editingMessageId === message.id ? (
@@ -3266,7 +4325,33 @@ export default function App() {
                         <button type="button" title={t('common.cancel')} onClick={() => { setEditingMessageId(''); setEditingMessageText(''); }}><Icon name="x" /></button>
                       </div>
                     </div>
-                  ) : <MessageContent key={`${message.id}:${extensionMessageRenderVersions[message.id] || 0}`} content={visibleMessageContent} reasoning={reasoningDisplay} imagePending={isImagePending} renderPendingMarkersAsSpinner={!extensionLeader} isStreaming={generationReplaceMessageId === message.id && Boolean(generationStreamText)} />}
+                  ) : (
+                    <>
+                      <MessageContent key={`${message.id}:${extensionMessageRenderVersions[message.id] || 0}:${regexRenderTick}`} content={visibleMessageContent} role={message.role} reasoning={reasoningDisplay} showReasoning={canViewReasoning} imagePending={isImagePending} renderPendingMarkersAsSpinner={!extensionLeader} isStreaming={generationReplaceMessageId === message.id && Boolean(generationStreamText)} />
+                      {rollPrompts.length > 0 ? (
+                        <div className="bot-roll-prompts">
+                          {rollPrompts.map((rawSpec, rIdx) => {
+                            const parts = rawSpec.split('|').map((s) => s.trim());
+                            const formulaMatch = rawSpec.match(/\b(\d*d\d+(?:k[hl]\d+)?(?:[+-]\d+)?)\b/i);
+                            const dcMatch = rawSpec.match(/\bDC\s*(\d+)\b/i);
+                            const formula = formulaMatch ? formulaMatch[1] : '1d20';
+                            const dc = dcMatch ? Number(dcMatch[1]) : undefined;
+                            const label = parts.filter((p) => !/^\d*d\d+(?:k[hl]\d+)?(?:[+-]\d+)?$/i.test(p) && !/^DC\s*\d+$/i.test(p)).join(' · ');
+                            return (
+                              <button
+                                key={rIdx}
+                                type="button"
+                                className="ghost-button roll-prompt-btn"
+                                onClick={() => void rollDiceInChat(formula, label, dc)}
+                              >
+                                🎲 Бросить {formula}{label ? ` (${label})` : ''}{dc ? ` · DC ${dc}` : ''}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      ) : null}
+                    </>
+                  )}
                 </div>
               </article>
               );
@@ -3280,20 +4365,165 @@ export default function App() {
                   <header>
                     <span className="message-name-block"><strong className="identity-name"><span>{activeCard?.name || t('composer.bot')}</span></strong></span>
                   </header>
-                  {generationStreamText ? <MessageContent content={generationStreamText} reasoning={reasoningDisplay} isStreaming /> : <div className="message-content"><p><span className="thinking-dots"><i /> <i /> <i /></span>{generationStatus || `${activeCard?.name || t('composer.bot')} ${t('composer.typing')}`}</p></div>}
+                  {(displayedStreamText || generationStreamText) ? <MessageContent content={`${displayedStreamText || generationStreamText}▍`} role="assistant" reasoning={reasoningDisplay} showReasoning={canViewReasoning} isStreaming /> : <div className="message-content"><p><span className="thinking-dots"><i /> <i /> <i /></span>{generationStatus || `${activeCard?.name || t('composer.bot')} ${t('composer.typing')}`}</p></div>}
                 </div>
               </article>
             ) : null}
           </div>
+          {showScrollBottomButton ? (
+            <button
+              className="scroll-bottom-button"
+              type="button"
+              aria-label="Прокрутить вниз"
+              onClick={() => scrollToChatBottom('smooth')}
+            >
+              ↓
+            </button>
+          ) : null}
+          <div className="composer-dock">
+          {(composerMode !== 'normal' || Object.keys(typingPlayers).length > 0 || connectedPlayers.length > 1) ? (
+            <div className="multiplayer-status-bar">
+              {composerMode !== 'normal' ? (
+                <button
+                  type="button"
+                  className="mode-pill active"
+                  onClick={() => setComposerMode('normal')}
+                  title="Нажмите, чтобы вернуться в обычный режим"
+                >
+                  {composerMode === 'ooc' ? '💬 Режим OOC (вне игры) ✕' : '🕵️ Тайный ход (скрыто от других) ✕'}
+                </button>
+              ) : null}
+              {Object.keys(typingPlayers).length > 0 ? (
+                <span className="typing-indicator-pill">
+                  <span className="thinking-dots"><i /><i /><i /></span>
+                  <strong>{Object.values(typingPlayers).join(', ')}</strong> печатает…
+                </span>
+              ) : null}
+              {connectedPlayers.length > 1 ? (() => {
+                const turnPlayer = connectedPlayers.find((p) => p.id === currentTurnParticipantId) || connectedPlayers[0];
+                const isMyTurn = turnPlayer?.id === participantIdRef.current;
+                const amIReady = readyParticipantIds.includes(participantIdRef.current);
+                const waitingNames = connectedPlayers
+                  .filter((p) => !readyParticipantIds.includes(p.id))
+                  .map((p) => p.persona_name || p.name || 'Player');
+                return (
+                  <span className={isMyTurn ? 'turn-indicator-pill my-turn' : 'turn-indicator-pill'}>
+                    <span>{isMyTurn ? 'Ваш ход:' : 'Ход:'}</span>
+                    <strong>{turnPlayer?.persona_name || turnPlayer?.name || 'Player'}</strong>
+                    {isMyTurn ? (
+                      <button
+                        type="button"
+                        className="ghost-button pass-turn-button"
+                        onClick={() => sendRealtimeEvent({ type: 'turn.pass', participant_id: participantIdRef.current, card_id: activeCard?.id, chat_id: activeChat?.id })}
+                      >
+                        Передать →
+                      </button>
+                    ) : null}
+                    {turnMode === 'round_ready' ? (
+                      <>
+                        {waitingNames.length > 0 && readyParticipantIds.length > 0 ? (
+                          <small className="round-waiting-hint">ждём: {waitingNames.join(', ')}</small>
+                        ) : null}
+                        <button
+                          type="button"
+                          className={amIReady ? 'ghost-button pass-turn-button ready-active' : 'ghost-button pass-turn-button'}
+                          title="Общайтесь между собой и бросайте кубики свободно; нажмите, когда готовы к ответу бота"
+                          onClick={() => sendRealtimeEvent({ type: 'turn.ready', participant_id: participantIdRef.current, ready: !amIReady, card_id: activeCard?.id, chat_id: activeChat?.id })}
+                        >
+                          {amIReady ? `✓ Готов (${readyParticipantIds.length}/${connectedPlayers.length})` : `✓ Завершить ход (${readyParticipantIds.length}/${connectedPlayers.length})`}
+                        </button>
+                      </>
+                    ) : null}
+                  </span>
+                );
+              })() : null}
+            </div>
+          ) : null}
+          {diceRollerOpen ? (
+            <div className="dice-roller-popover">
+              <div className="dice-roller-header">
+                <strong>🎲 Бросок кубика</strong>
+                <button type="button" className="ghost-button" onClick={() => setDiceRollerOpen(false)}>✕</button>
+              </div>
+              <div className="dice-preset-chips">
+                {[
+                  { label: '1d20', formula: '1d20' },
+                  { label: '🔥 Преимущество', formula: '2d20kh1' },
+                  { label: '💀 Помеха', formula: '2d20kl1' },
+                  { label: '1d6', formula: '1d6' },
+                  { label: '2d6', formula: '2d6' },
+                  { label: '1d100', formula: '1d100' },
+                ].map((preset) => (
+                  <button
+                    key={preset.formula}
+                    type="button"
+                    className={diceDraft.formula === preset.formula ? 'ghost-button active' : 'ghost-button'}
+                    onClick={() => setDiceDraft({ ...diceDraft, formula: preset.formula })}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+              <div className="dice-skill-chips">
+                {['Атака', 'Скрытность', 'Убеждение', 'Внимательность', 'Взлом', 'Уклонение'].map((skill) => (
+                  <button
+                    key={skill}
+                    type="button"
+                    className={diceDraft.label === skill ? 'ghost-button active' : 'ghost-button'}
+                    onClick={() => setDiceDraft({ ...diceDraft, label: diceDraft.label === skill ? '' : skill })}
+                  >
+                    {skill}
+                  </button>
+                ))}
+              </div>
+              <div className="dice-roller-inputs">
+                <label>
+                  <span>Кость</span>
+                  <input value={diceDraft.formula} placeholder="1d20" onChange={(e) => setDiceDraft({ ...diceDraft, formula: e.target.value })} />
+                </label>
+                <label>
+                  <span>Бонус</span>
+                  <input value={diceDraft.modifier} placeholder="+3 / -1" onChange={(e) => setDiceDraft({ ...diceDraft, modifier: e.target.value })} />
+                </label>
+                <label>
+                  <span>DC</span>
+                  <input type="number" value={diceDraft.dc} placeholder="15" onChange={(e) => setDiceDraft({ ...diceDraft, dc: e.target.value })} />
+                </label>
+                <label className="dice-label-field">
+                  <span>Проверка / Навык</span>
+                  <input value={diceDraft.label} placeholder="Взлом замка…" onChange={(e) => setDiceDraft({ ...diceDraft, label: e.target.value })} />
+                </label>
+              </div>
+              <div className="dice-roller-footer">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const base = (diceDraft.formula || '1d20').trim().replace(/[+-]\d+$/, '');
+                    const modNum = parseInt(diceDraft.modifier.trim(), 10);
+                    const modPart = !Number.isNaN(modNum) && modNum !== 0 ? (modNum > 0 ? `+${modNum}` : `${modNum}`) : '';
+                    const dcNum = parseInt(diceDraft.dc.trim(), 10);
+                    void rollDiceInChat(`${base}${modPart}`, diceDraft.label.trim(), !Number.isNaN(dcNum) && dcNum > 0 ? dcNum : undefined);
+                    setDiceRollerOpen(false);
+                  }}
+                >
+                  🎲 Бросить в чат
+                </button>
+              </div>
+            </div>
+          ) : null}
 
           <form id="send_form" className="composer" onSubmit={(event) => { event.preventDefault(); void sendChatMessage(); }}>
-            <button className="composer-menu-button" type="button" aria-label={t('composer.actions')} onClick={() => setComposerMenuOpen(!composerMenuOpen)}>+</button>
+            <button className="composer-menu-button" type="button" aria-label={t('composer.actions')} title="Действия чата, бросок кубика, режимы OOC/Тайно" onClick={() => setComposerMenuOpen(!composerMenuOpen)}>+</button>
             {composerMenuOpen ? (
               <ComposerActionMenu
                 activeChat={activeChat}
                 isGenerating={isGenerating}
+                composerMode={composerMode}
+                setComposerMode={(m) => { setComposerMode(m); setComposerMenuOpen(false); }}
+                rollDice={() => { setComposerMenuOpen(false); setDiceRollerOpen((v) => !v); }}
+                openMemory={() => { setComposerMenuOpen(false); setMemoryModalOpen(true); void loadSummaryMemorySettings(); }}
                 openChats={() => { setChatPickerOpen((open) => !open); setComposerMenuOpen(false); }}
-                rerollLastBotMessage={rerollLastBotMessage}
+                rerollLastBotMessage={() => { setComposerMenuOpen(false); return rerollLastBotMessage(); }}
               />
             ) : null}
             {chatPickerOpen ? (
@@ -3301,6 +4531,7 @@ export default function App() {
                 activeChat={activeChat}
                 botChats={botChats}
                 createBotChat={createBotChat}
+                importChat={importBotChat}
                 copyChat={copyChat}
                 exportChat={exportChat}
                 deleteChat={deleteChat}
@@ -3328,19 +4559,56 @@ export default function App() {
                 ))}
               </div>
             ) : null}
-            <textarea value={chatInput} placeholder={t('composer.placeholder')} onChange={(event) => setChatInput(event.target.value)} />
+            <textarea
+              ref={composerTextareaRef}
+              value={chatInput}
+              rows={1}
+              placeholder={
+                composerMode === 'ooc'
+                  ? '💬 Внеигровое сообщение (OOC)…'
+                  : composerMode === 'secret'
+                    ? '🕵️ Тайное действие для ИИ…'
+                    : t('composer.placeholder')
+              }
+              onChange={(event) => {
+                const val = event.target.value;
+                setChatInput(val);
+                const el = event.currentTarget;
+                el.style.height = 'auto';
+                el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+                const now = Date.now();
+                if (!val.trim()) {
+                  lastTypingSentAtRef.current = 0;
+                  sendRealtimeEvent({ type: 'typing.update', participant_id: participantIdRef.current, persona_name: selectedPersona?.name || 'Player', is_typing: false });
+                } else if (now - lastTypingSentAtRef.current > 1800) {
+                  lastTypingSentAtRef.current = now;
+                  sendRealtimeEvent({ type: 'typing.update', participant_id: participantIdRef.current, persona_name: selectedPersona?.name || 'Player', is_typing: true });
+                }
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && (event.ctrlKey || event.metaKey || (!event.shiftKey && window.innerWidth > 900))) {
+                  event.preventDefault();
+                  event.currentTarget.style.height = '';
+                  void sendChatMessage();
+                }
+              }}
+            />
             <div className="composer-actions">
-              <button className="send-button" type="submit" aria-label={t('composer.send')} disabled={!activeChat || isGenerating || accessDenied.chats}>
-                <span>{isGenerating ? t('composer.thinking') : t('composer.send')}</span>
+              {isGenerating ? (
+                <button className="ghost-button bot-reply-button icon-only-btn" type="button" title={t('composer.cancel')} aria-label={t('composer.cancel')} onClick={() => void cancelGeneration()}>
+                  <Icon name="x" />
+                </button>
+              ) : (
+                <button className="ghost-button bot-reply-button icon-only-btn" type="button" disabled={!activeChat || accessDenied.chats || !canTriggerBotReply} title={!canTriggerBotReply ? t('composer.botReply.disabled') : t('composer.botReply')} aria-label={t('composer.botReply')} onClick={() => void requestBotReply()}>
+                  <Icon name="bot" />
+                </button>
+              )}
+              <button className="send-button icon-only-btn" type="submit" title={t('composer.send')} aria-label={t('composer.send')} disabled={!activeChat || isGenerating || accessDenied.chats}>
                 <Icon name="send" />
               </button>
-              {isGenerating ? (
-                <button className="ghost-button bot-reply-button" type="button" onClick={() => void cancelGeneration()}>{t('composer.cancel')}</button>
-              ) : (
-                <button className="ghost-button bot-reply-button" type="button" disabled={!activeChat || accessDenied.chats || (!botReplyAllowed && !authUser?.is_admin)} title={(!botReplyAllowed && !authUser?.is_admin) ? t('composer.botReply.disabled') : undefined} onClick={() => void requestBotReply()}>{t('composer.botReply')}</button>
-              )}
             </div>
           </form>
+          </div>
         </section>
 
       </section>
@@ -3359,13 +4627,171 @@ export default function App() {
         </div>
       ) : null}
 
+      {memoryModalOpen ? (
+        <div className="image-preview-overlay memory-modal-overlay" role="dialog" aria-modal="true" onClick={() => setMemoryModalOpen(false)}>
+          <div className="memory-modal-card" onClick={(event) => event.stopPropagation()}>
+            <header className="memory-modal-header">
+              <strong>📜 Память чата и Авто-саммари</strong>
+              <button type="button" className="ghost-button" onClick={() => setMemoryModalOpen(false)}>✕ Закрыть</button>
+            </header>
+            <div className="memory-modal-body">
+              <label className="popover-checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={summaryMemorySettings.enabled}
+                  onChange={(e) => {
+                    const next = { ...summaryMemorySettings, enabled: e.target.checked };
+                    setSummaryMemorySettings(next);
+                    void saveSummaryMemorySettings(next);
+                  }}
+                />
+                <span><strong>Включить встроенную память чата</strong> (отключите, если используете внешнее расширение памяти)</span>
+              </label>
+              <div className="memory-settings-grid">
+                <label className="popover-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={summaryMemorySettings.auto_summarize}
+                    onChange={(e) => setSummaryMemorySettings({ ...summaryMemorySettings, auto_summarize: e.target.checked })}
+                  />
+                  <span>Автоматически сжимать историю в саммари</span>
+                </label>
+                <label className="field-preview">
+                  <span>Через сколько сообщений делать саммари</span>
+                  <input
+                    type="number"
+                    min={2}
+                    max={500}
+                    value={summaryMemorySettings.every_n_messages}
+                    onChange={(e) => setSummaryMemorySettings({ ...summaryMemorySettings, every_n_messages: Math.max(2, Number(e.target.value) || 20) })}
+                  />
+                </label>
+              </div>
+              <label className="popover-checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={summaryMemorySettings.use_separate_api}
+                  onChange={(e) => setSummaryMemorySettings({ ...summaryMemorySettings, use_separate_api: e.target.checked })}
+                />
+                <span><strong>Использовать отдельный внешний API для саммари</strong> (чтобы игра шла на одном API, а саммари делал другой)</span>
+              </label>
+              {summaryMemorySettings.use_separate_api ? (
+                <div className="memory-external-api-box">
+                  <div className="memory-settings-grid">
+                    <label className="field-preview">
+                      <span>Источник API саммари</span>
+                      <select
+                        value={summaryMemorySettings.chat_completion_source || 'custom'}
+                        onChange={(e) => setSummaryMemorySettings({ ...summaryMemorySettings, chat_completion_source: e.target.value, provider: e.target.value === 'custom' ? 'openai-compatible' : e.target.value })}
+                      >
+                        <option value="custom">Custom (OpenAI-compatible)</option>
+                        <option value="openrouter">OpenRouter</option>
+                        <option value="makersuite">Google AI Studio (Gemini)</option>
+                        <option value="claude">Anthropic Claude</option>
+                        <option value="deepseek">DeepSeek</option>
+                      </select>
+                    </label>
+                    <label className="field-preview">
+                      <span>Base URL внешнего API саммари</span>
+                      <input
+                        type="text"
+                        placeholder="https://api.example.com/v1"
+                        value={summaryMemorySettings.base_url}
+                        onChange={(e) => setSummaryMemorySettings({ ...summaryMemorySettings, base_url: e.target.value })}
+                      />
+                    </label>
+                  </div>
+                  <div className="memory-settings-grid">
+                    <label className="field-preview">
+                      <span>API-ключ для саммари {summaryMemorySettings.api_key_configured ? '(сохранён ✓)' : ''}</span>
+                      <input
+                        type="password"
+                        placeholder={summaryMemorySettings.api_key_configured ? 'Оставьте пустым, чтобы не менять' : 'sk-...'}
+                        value={summaryMemorySettings.api_key}
+                        onChange={(e) => setSummaryMemorySettings({ ...summaryMemorySettings, api_key: e.target.value, clear_api_key: false })}
+                      />
+                    </label>
+                    <div className="memory-model-picker-col">
+                      <button type="button" className="ghost-button" onClick={() => void fetchSummaryModels()}>Проверить и загрузить модели</button>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+              <div className="memory-settings-grid">
+                <label className="field-preview">
+                  <span>Модель для саммари (пусто = основная модель чата)</span>
+                  <input
+                    type="text"
+                    list="summary-models-datalist"
+                    placeholder={generationSettings.model || 'gpt-4o-mini / gemini-2.5-flash'}
+                    value={summaryMemorySettings.model}
+                    onChange={(e) => setSummaryMemorySettings({ ...summaryMemorySettings, model: e.target.value })}
+                  />
+                  <datalist id="summary-models-datalist">
+                    {(summaryModels.length ? summaryModels : models).map((m) => <option key={m} value={m} />)}
+                  </datalist>
+                </label>
+                <label className="field-preview">
+                  <span>Макс. токенов саммари</span>
+                  <input
+                    type="number"
+                    min={100}
+                    max={8000}
+                    value={summaryMemorySettings.max_tokens}
+                    onChange={(e) => setSummaryMemorySettings({ ...summaryMemorySettings, max_tokens: Math.max(100, Number(e.target.value) || 800) })}
+                  />
+                </label>
+              </div>
+              <label className="field-preview">
+                <span>Системный промпт для генерации саммари</span>
+                <textarea
+                  rows={2}
+                  value={summaryMemorySettings.prompt}
+                  onChange={(e) => setSummaryMemorySettings({ ...summaryMemorySettings, prompt: e.target.value })}
+                />
+              </label>
+              <div className="memory-modal-actions">
+                <button type="button" onClick={() => void saveSummaryMemorySettings()}>Сохранить настройки саммари</button>
+                {summaryStatusMessage ? <small className="helper-text">{summaryStatusMessage}</small> : null}
+              </div>
+              <div className="popover-divider" />
+              <div className="memory-current-chat-box">
+                <div className="memory-chat-header">
+                  <strong>Хроника текущего чата ({activeChat?.title || 'нет чата'})</strong>
+                  <small>Сжато сообщений: {activeChat?.memory_summarized_count ?? 0} из {activeMessages.filter((m) => !m.hidden && !m.is_ooc).length}</small>
+                </div>
+                <textarea
+                  rows={6}
+                  placeholder="Здесь хранится накопленная память (хроника событий) текущего чата…"
+                  value={chatMemoryDraft}
+                  disabled={!activeChat}
+                  onChange={(e) => setChatMemoryDraft(e.target.value)}
+                />
+                <div className="memory-modal-actions">
+                  <button type="button" disabled={!activeChat || isSummarizingMemory} onClick={() => void triggerManualSummarize()}>
+                    {isSummarizingMemory ? 'Генерация саммари…' : '⚡ Сжать историю в саммари сейчас'}
+                  </button>
+                  <button type="button" className="ghost-button" disabled={!activeChat} onClick={() => void saveChatMemoryText(chatMemoryDraft)}>
+                    Сохранить текст памяти
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <section
         id="extensions_settings"
         className={`extension-settings-host ${menuOpen && activeSection === 'extensions' && extensionSettingsOpen ? 'extension-settings-host-visible' : ''}`}
         aria-hidden={menuOpen && activeSection === 'extensions' && extensionSettingsOpen ? 'false' : 'true'}
         data-active-extension={extensionSettingsTarget}
-      />
-
+      >
+        <div className="extension-host-header" data-dt-keep-visible="true">
+          <strong>Настройки: {extensionSettingsTarget}</strong>
+          <button type="button" className="ghost-button" onClick={() => { setExtensionSettingsOpen(false); setExtensionSettingsTarget(''); }}>✕ Закрыть</button>
+        </div>
+      </section>
       {menuOpen ? (
         <MenuOverlay
           activeSection={activeSection}
@@ -3774,7 +5200,10 @@ function MenuOverlay({
             <span className="eyebrow">{t('menu.title')}</span>
             <h2>{activeItem.label}</h2>
           </div>
-          <button className="close-button" type="button" onClick={close}>{t('menu.close')}</button>
+          <div className="drawer-header-actions">
+            <LanguageSelector language={language} setLanguage={setLanguage} />
+            <button className="close-button" type="button" onClick={close}>{t('menu.close')}</button>
+          </div>
         </header>
 
         <div className="drawer-body">
@@ -3785,12 +5214,10 @@ function MenuOverlay({
                 key={item.id}
                 type="button"
                 onClick={() => setActiveSection(item.id)}
+                title={item.description}
               >
                 <Icon name={item.icon} />
-                <span>
-                  <strong>{item.label}</strong>
-                  <small>{item.description}</small>
-                </span>
+                <strong>{item.label}</strong>
               </button>
             ))}
             <LanguageSelector language={language} setLanguage={setLanguage} />
@@ -3993,6 +5420,7 @@ function KeyManager({ mode = 'panel' }: { mode?: 'panel' | 'popover' }) {
     const token = window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '';
     const accessToken = window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || '';
     return {
+      'X-DoubleTrouble-Actor': 'Player',
       ...(json ? { 'Content-Type': 'application/json' } : {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(accessToken ? { 'X-DoubleTrouble-Access': accessToken } : {}),
@@ -4314,9 +5742,14 @@ function ImageExtensionSettingsPortal({ extension, imageSettings, setImageSettin
     try {
       const existingSettings = loadRawImageExtensionSettings();
       const token = window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '';
+      const accessToken = window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || '';
       const response = await fetch('/api/image-generation/models', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(accessToken ? { 'X-DoubleTrouble-Access': accessToken } : {}),
+        },
         body: JSON.stringify({
           api_type: imageSettings.apiType,
           endpoint: imageSettings.endpoint,
@@ -4393,14 +5826,18 @@ function ExtensionsManager() {
   const [imageEndpointPresets, setImageEndpointPresets] = useState(loadImageEndpointPresets);
   const [selectedImageEndpointName, setSelectedImageEndpointName] = useState('');
   const [imageEndpointName, setImageEndpointName] = useState('');
+  const [installUrl, setInstallUrl] = useState('');
+  const [installBranch, setInstallBranch] = useState('');
+  const [installOverwrite, setInstallOverwrite] = useState(true);
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
-
   const headers = (json = false) => {
     const token = window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '';
+    const accessToken = window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || '';
     return {
       ...(json ? { 'Content-Type': 'application/json' } : {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(accessToken ? { 'X-DoubleTrouble-Access': accessToken } : {}),
     };
   };
 
@@ -4420,7 +5857,7 @@ function ExtensionsManager() {
       if (noriMynExtension) {
         setBuiltInSettings((current) => {
           const nextSettings = { ...current, noriMynInfoblock: noriMynExtension.enabled };
-          window.localStorage.setItem(BUILT_IN_EXTENSIONS_STORAGE_KEY, JSON.stringify(nextSettings));
+          saveBuiltInExtensionSettings(nextSettings);
           return nextSettings;
         });
       }
@@ -4428,7 +5865,7 @@ function ExtensionsManager() {
       if (magicTranslationExtension) {
         setBuiltInSettings((current) => {
           const nextSettings = { ...current, magicTranslation: magicTranslationExtension.enabled };
-          window.localStorage.setItem(BUILT_IN_EXTENSIONS_STORAGE_KEY, JSON.stringify(nextSettings));
+          saveBuiltInExtensionSettings(nextSettings);
           return nextSettings;
         });
       }
@@ -4463,6 +5900,9 @@ function ExtensionsManager() {
         return false;
       }
       setExtensions((current) => current.map((item) => item.name === extension.name ? { ...item, enabled } : item));
+      if (enabled) {
+        void syncSillyTavernExtensions();
+      }
       setMessage(`${enabled ? t('common.enabled') : t('common.disabled')}. ${t('extensions.oldMessagesNotRerendered')}`);
       return true;
     } finally {
@@ -4476,7 +5916,7 @@ function ExtensionsManager() {
     }
     const nextSettings = { ...builtInSettings, noriMynInfoblock: enabled };
     setBuiltInSettings(nextSettings);
-    window.localStorage.setItem(BUILT_IN_EXTENSIONS_STORAGE_KEY, JSON.stringify(nextSettings));
+    saveBuiltInExtensionSettings(nextSettings);
     setMessage(`${enabled ? t('common.enabled') : t('common.disabled')}. ${t('extensions.newMessagesApply')}`);
   };
 
@@ -4486,7 +5926,7 @@ function ExtensionsManager() {
     }
     const nextSettings = { ...builtInSettings, magicTranslation: enabled };
     setBuiltInSettings(nextSettings);
-    window.localStorage.setItem(BUILT_IN_EXTENSIONS_STORAGE_KEY, JSON.stringify(nextSettings));
+    saveBuiltInExtensionSettings(nextSettings);
     setMessage(`${enabled ? t('common.enabled') : t('common.disabled')}. ${t('extensions.newMessagesApply')}`);
   };
 
@@ -4548,6 +5988,85 @@ function ExtensionsManager() {
     setMessage(t('extensions.endpointSaved'));
   };
 
+  const installFromGit = async () => {
+    const source = installUrl.trim();
+    if (!source) {
+      return;
+    }
+    setLoading(true);
+    try {
+      const response = await fetch('/api/extensions/install', {
+        method: 'POST',
+        headers: headers(true),
+        body: JSON.stringify({
+          source,
+          branch: installBranch.trim(),
+          enabled: true,
+          overwrite: installOverwrite,
+        }),
+      });
+      const data = await response.json().catch(() => null) as { extension?: ExtensionSummary; detail?: string } | null;
+      if (!response.ok || !data?.extension) {
+        setMessage(data?.detail || t('extensions.error.install'));
+        return;
+      }
+      setInstallUrl('');
+      setInstallBranch('');
+      await loadExtensions();
+      await syncSillyTavernExtensions();
+      setMessage(`${t('extensions.installedOk')} (${data.extension.manifest?.display_name || data.extension.name})`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const uploadExtensionZip = async (file: File | null) => {
+    if (!file) {
+      return;
+    }
+    setLoading(true);
+    try {
+      const body = new FormData();
+      body.append('file', file);
+      body.append('overwrite', String(installOverwrite));
+      const response = await fetch('/api/extensions/upload', {
+        method: 'POST',
+        headers: headers(false),
+        body,
+      });
+      const data = await response.json().catch(() => null) as { extension?: ExtensionSummary; detail?: string } | null;
+      if (!response.ok || !data?.extension) {
+        setMessage(data?.detail || t('extensions.error.install'));
+        return;
+      }
+      await loadExtensions();
+      await syncSillyTavernExtensions();
+      setMessage(`${t('extensions.installedOk')} (${data.extension.manifest?.display_name || data.extension.name})`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const updateExtension = async (extension: ExtensionSummary) => {
+    setLoading(true);
+    try {
+      const response = await fetch(`/api/extensions/${encodeURIComponent(extension.name)}/update`, {
+        method: 'POST',
+        headers: headers(false),
+      });
+      const data = await response.json().catch(() => null) as { extension?: ExtensionSummary; detail?: string } | null;
+      if (!response.ok || !data?.extension) {
+        setMessage(data?.detail || t('extensions.error.update'));
+        return;
+      }
+      await loadExtensions();
+      await syncSillyTavernExtensions();
+      setMessage(`${t('extensions.updatedOk')} (${data.extension.manifest?.display_name || data.extension.name})`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const deleteExtension = async (extension: ExtensionSummary) => {
     setLoading(true);
     try {
@@ -4575,8 +6094,42 @@ function ExtensionsManager() {
       <div className="extension-install-card">
         <span className="extension-warning">{t('extensions.unstable')}</span>
         <p className="helper-text">{t('extensions.installDisabledHelp')}</p>
-        <div className="preset-actions">
-          <button type="button" disabled>{t('extensions.installDisabled')}</button>
+        <div className="key-manager-edit" style={{ display: 'grid', gap: '8px', marginTop: '8px' }}>
+          <input
+            value={installUrl}
+            placeholder={t('extensions.installPlaceholder')}
+            onChange={(event) => setInstallUrl(event.target.value)}
+            onKeyDown={(event) => { if (event.key === 'Enter' && installUrl.trim()) void installFromGit(); }}
+          />
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+            <input
+              style={{ flex: '1 1 200px' }}
+              value={installBranch}
+              placeholder={t('extensions.branchPlaceholder')}
+              onChange={(event) => setInstallBranch(event.target.value)}
+            />
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '0.88rem' }}>
+              <input type="checkbox" checked={installOverwrite} onChange={(event) => setInstallOverwrite(event.target.checked)} />
+              <span>{t('extensions.overwrite')}</span>
+            </label>
+          </div>
+        </div>
+        <div className="preset-actions" style={{ marginTop: '10px' }}>
+          <button type="button" disabled={loading || !installUrl.trim()} onClick={() => void installFromGit()}>{t('extensions.installDisabled')}</button>
+          <label className="ghost-button" style={{ cursor: loading ? 'not-allowed' : 'pointer', display: 'inline-flex', alignItems: 'center' }}>
+            <span>{t('extensions.uploadZip')}</span>
+            <input
+              type="file"
+              accept=".zip,application/zip"
+              style={{ display: 'none' }}
+              disabled={loading}
+              onChange={(event) => {
+                const file = event.target.files?.[0] || null;
+                event.target.value = '';
+                void uploadExtensionZip(file);
+              }}
+            />
+          </label>
           <button className="ghost-button" type="button" disabled={loading} onClick={() => void loadExtensions()}>{t('extensions.refreshList')}</button>
         </div>
       </div>
@@ -4592,6 +6145,7 @@ function ExtensionsManager() {
         </div>
         {thirdPartyExtensions.length ? thirdPartyExtensions.map((extension) => {
           const manifest = extension.manifest || {};
+          const canUpdateGit = Boolean(extension.source && /^(https?:|git@)/i.test(extension.source));
           return (
             <article className={extension.enabled ? 'extension-row enabled' : 'extension-row'} key={extension.name}>
               <div className="extension-row-main">
@@ -4600,8 +6154,9 @@ function ExtensionsManager() {
                 <small>{extension.source || t('extensions.localInstall')}</small>
               </div>
               <div className="extension-row-actions">
-                <span className="extension-status">{t('extensions.unstable')}</span>
+                <span className={extension.enabled ? 'extension-status enabled' : 'extension-status'}>{extension.enabled ? t('common.enabled') : t('common.disabled')}</span>
                 <button className="ghost-button" type="button" disabled={loading || !extension.enabled} onClick={() => openExtensionSettingsPanel(extension)}>{t('common.settings')}</button>
+                {canUpdateGit ? <button className="ghost-button" type="button" disabled={loading} onClick={() => void updateExtension(extension)}>{t('extensions.update')}</button> : null}
                 <button type="button" disabled={loading} onClick={() => void setEnabled(extension, !extension.enabled)}>{extension.enabled ? t('common.disable') : t('common.enable')}</button>
                 <button className="ghost-button danger-button" type="button" disabled={loading} onClick={() => void deleteExtension(extension)}>{t('common.delete')}</button>
               </div>
@@ -5191,19 +6746,21 @@ function SettingsSection({
               <SliderField label="Top P" value={presetObject.top_p} fallback={1} min={0} max={1} step={0.01} onChange={(value) => updatePresetField('top_p', value)} />
             </section>
 
-            <section className="preset-card-section">
-              <h3>{t('presets.systemPrompts')}</h3>
-              <NumberInputField label={t('presets.seed')} value={presetObject.seed} fallback={-1} step={1} onChange={(value) => updatePresetField('seed', value)} />
-              <NumberInputField label={t('presets.nameInsertion')} value={presetObject.names_behavior} fallback={0} min={0} step={1} onChange={(value) => updatePresetField('names_behavior', value)} />
-              <EditableField label={t('presets.continueNudge')} value={String(presetObject.continue_nudge_prompt ?? '')} onChange={(value) => updatePresetField('continue_nudge_prompt', value)} />
-              <ToggleRow label={t('presets.continuePrefill')} checked={Boolean(presetObject.continue_prefill)} onChange={(checked) => updatePresetField('continue_prefill', checked)} />
-              <ToggleRow label={t('presets.squashSystemMessages')} checked={Boolean(presetObject.squash_system_messages)} onChange={(checked) => updatePresetField('squash_system_messages', checked)} />
-              <ToggleRow label={t('presets.functionCalling')} checked={Boolean(presetObject.function_calling)} onChange={(checked) => updatePresetField('function_calling', checked)} />
-              <ToggleRow label={t('presets.sendInlineMedia')} checked={Boolean(presetObject.send_inline_images)} onChange={(checked) => updatePresetField('send_inline_images', checked)} />
-              <ToggleRow label={t('presets.requestReasoning')} checked={presetObject.show_thoughts !== false} onChange={(checked) => updatePresetField('show_thoughts', checked)} />
-              <SelectField label={t('presets.reasoning')} value={String(presetObject.reasoning_effort ?? 'auto')} options={['auto', 'minimal', 'low', 'medium', 'high']} onChange={(value) => updatePresetField('reasoning_effort', value)} />
-              <SelectField label="Verbosity" value={String(presetObject.verbosity ?? 'auto')} options={['auto', 'low', 'medium', 'high']} onChange={(value) => updatePresetField('verbosity', value)} />
-            </section>
+            <details className="preset-card-section collapsible-preset-section">
+              <summary>{t('presets.systemPrompts')}</summary>
+              <div className="collapsible-section-body">
+                <NumberInputField label={t('presets.seed')} value={presetObject.seed} fallback={-1} step={1} onChange={(value) => updatePresetField('seed', value)} />
+                <NumberInputField label={t('presets.nameInsertion')} value={presetObject.names_behavior} fallback={0} min={0} step={1} onChange={(value) => updatePresetField('names_behavior', value)} />
+                <EditableField label={t('presets.continueNudge')} value={String(presetObject.continue_nudge_prompt ?? '')} onChange={(value) => updatePresetField('continue_nudge_prompt', value)} />
+                <ToggleRow label={t('presets.continuePrefill')} checked={Boolean(presetObject.continue_prefill)} onChange={(checked) => updatePresetField('continue_prefill', checked)} />
+                <ToggleRow label={t('presets.squashSystemMessages')} checked={Boolean(presetObject.squash_system_messages)} onChange={(checked) => updatePresetField('squash_system_messages', checked)} />
+                <ToggleRow label={t('presets.functionCalling')} checked={Boolean(presetObject.function_calling)} onChange={(checked) => updatePresetField('function_calling', checked)} />
+                <ToggleRow label={t('presets.sendInlineMedia')} checked={Boolean(presetObject.send_inline_images)} onChange={(checked) => updatePresetField('send_inline_images', checked)} />
+                <ToggleRow label={t('presets.requestReasoning')} checked={presetObject.show_thoughts !== false} onChange={(checked) => updatePresetField('show_thoughts', checked)} />
+                <SelectField label={t('presets.reasoning')} value={String(presetObject.reasoning_effort ?? 'auto')} options={['auto', 'minimal', 'low', 'medium', 'high']} onChange={(value) => updatePresetField('reasoning_effort', value)} />
+                <SelectField label="Verbosity" value={String(presetObject.verbosity ?? 'auto')} options={['auto', 'low', 'medium', 'high']} onChange={(value) => updatePresetField('verbosity', value)} />
+              </div>
+            </details>
 
             <section className="preset-card-section">
               <div className="preset-title-row">
@@ -5293,32 +6850,18 @@ function SettingsSection({
     return (
       <div className="form-stack connection-settings-panel">
         {accessDenied.presets ? <AccessDeniedNotice /> : null}
-        <TwoColumns
-          left={(
-            <label className="field-preview">
-              <span>{t('connection.preset')}</span>
-              <select value={activeConnectionPresetName} onChange={(event) => void applyConnectionPreset(event.target.value)}>
-                <option value="">{t('connection.preset.select')}</option>
-                {connectionPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}{activeConnectionPresetName === preset.name ? ' · active' : ''}</option>)}
-              </select>
-            </label>
-          )}
-          right={(
-            <div className="field-preview delete-preset-field">
-              <span>{t('connection.preset.delete')}</span>
-              <div className="delete-preset-row">
-                <select value={presetToDelete} onChange={(event) => setPresetToDelete(event.target.value)}>
-                  <option value="">{t('connection.preset.select')}</option>
-                  {connectionPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}</option>)}
-                </select>
-                <button type="button" onClick={() => void deleteConnectionPreset(presetToDelete)}>{t('common.delete')}</button>
-              </div>
-            </div>
-          )}
-        />
-        <div className="connection-save-row">
-          <EditableField label={t('connection.preset.saveName')} value={connectionPresetName} onChange={setConnectionPresetName} />
-          <button type="button" onClick={() => void saveGenerationSettings()}>{t('connection.preset.save')}</button>
+        <div className="connection-preset-bar">
+          <label className="field-preview">
+            <span>{t('connection.preset')}</span>
+            <select value={activeConnectionPresetName} onChange={(event) => void applyConnectionPreset(event.target.value)}>
+              <option value="">{t('connection.preset.select')}</option>
+              {connectionPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}{activeConnectionPresetName === preset.name ? ' · active' : ''}</option>)}
+            </select>
+          </label>
+          <div className="connection-save-row">
+            <EditableField label={t('connection.preset.saveName')} value={connectionPresetName} onChange={setConnectionPresetName} />
+            <button type="button" onClick={() => void saveGenerationSettings()}>{t('connection.preset.save')}</button>
+          </div>
         </div>
         {(() => {
           const sourceId = generationSettings.chat_completion_source && generationSettings.chat_completion_source !== 'disabled' ? generationSettings.chat_completion_source : (generationSettings.provider === 'disabled' ? '' : generationSettings.chat_completion_source);
@@ -5372,39 +6915,6 @@ function SettingsSection({
               ) : (
                 <p className="helper-text">{t('connection.baseUrl')}: <code>{sourceMeta.default_base_url}</code></p>
               )}
-              {sourceMeta && sourceMeta.extra_field_keys.length > 0 ? (
-                <div className="connection-source-extras">
-                  {sourceMeta.extra_field_keys.map((key) => {
-                    const label = getExtraFieldLabels(t)[key] || key;
-                    const raw = sourceExtras[key];
-                    if (booleanExtraFields.has(key)) {
-                      return (
-                        <label className="field-preview" key={key}>
-                          <span>{label}</span>
-                          <input type="checkbox" checked={Boolean(raw)} onChange={(event) => updateExtras({ [key]: event.target.checked })} />
-                        </label>
-                      );
-                    }
-                    if (longTextExtraFields.has(key)) {
-                      return (
-                        <label className="field-preview" key={key}>
-                          <span>{label}</span>
-                          <textarea value={typeof raw === 'string' ? raw : ''} onChange={(event) => updateExtras({ [key]: event.target.value })} />
-                        </label>
-                      );
-                    }
-                    return (
-                      <EditableField
-                        key={key}
-                        label={label}
-                        value={typeof raw === 'string' || typeof raw === 'number' ? String(raw) : ''}
-                        onChange={(value) => updateExtras({ [key]: value })}
-                      />
-                    );
-                  })}
-                </div>
-              ) : null}
-              <p className="helper-text">{t('connection.help.botName')}</p>
               <TwoColumns
                 left={(
                   <label className="field-preview model-field">
@@ -5420,6 +6930,41 @@ function SettingsSection({
                 )}
                 right={<KeyManager mode="popover" />}
               />
+              {sourceMeta && sourceMeta.extra_field_keys.length > 0 ? (
+                <details className="connection-params-section">
+                  <summary>Дополнительные параметры запроса и заголовки</summary>
+                  <div className="connection-source-extras">
+                    {sourceMeta.extra_field_keys.map((key) => {
+                      const label = getExtraFieldLabels(t)[key] || key;
+                      const raw = sourceExtras[key];
+                      if (booleanExtraFields.has(key)) {
+                        return (
+                          <label className="field-preview checkbox-inline-field" key={key}>
+                            <input type="checkbox" checked={Boolean(raw)} onChange={(event) => updateExtras({ [key]: event.target.checked })} />
+                            <span>{label}</span>
+                          </label>
+                        );
+                      }
+                      if (longTextExtraFields.has(key)) {
+                        return (
+                          <label className="field-preview" key={key}>
+                            <span>{label}</span>
+                            <textarea value={typeof raw === 'string' ? raw : ''} onChange={(event) => updateExtras({ [key]: event.target.value })} />
+                          </label>
+                        );
+                      }
+                      return (
+                        <EditableField
+                          key={key}
+                          label={label}
+                          value={typeof raw === 'string' || typeof raw === 'number' ? String(raw) : ''}
+                          onChange={(value) => updateExtras({ [key]: value })}
+                        />
+                      );
+                    })}
+                  </div>
+                </details>
+              ) : null}
               {sourceMeta && sourceMeta.supports_reverse_proxy ? (
                 <details className="connection-proxy-section">
                   <summary>{t('connection.reverseProxy')}</summary>
@@ -5476,11 +7021,27 @@ function SettingsSection({
             </>
           );
         })()}
-        <EditableTextArea label={t('connection.systemPrompt')} value={generationSettings.system_prompt} onChange={(system_prompt) => setGenerationSettings({ ...generationSettings, system_prompt })} />
-        <TwoColumns
-          left={<EditableField label={t('connection.temperature')} value={String(generationSettings.temperature)} onChange={(temperature) => setGenerationSettings({ ...generationSettings, temperature: Number(temperature) || 0 })} />}
-          right={<EditableField label={t('connection.maxTokens')} value={String(generationSettings.max_tokens)} onChange={(maxTokens) => setGenerationSettings({ ...generationSettings, max_tokens: Number(maxTokens) || 1 })} />}
-        />
+        <details className="connection-params-section">
+          <summary>Прочие настройки профиля (удаление, лимиты по умолчанию)</summary>
+          <div className="connection-source-extras">
+            <TwoColumns
+              left={<NumberInputField label={t('connection.temperature')} value={generationSettings.temperature} fallback={0.8} min={0} max={2} step={0.05} onChange={(temperature) => setGenerationSettings({ ...generationSettings, temperature: Number(temperature) || 0 })} />}
+              right={<NumberInputField label={t('connection.maxTokens')} value={generationSettings.max_tokens} fallback={350} min={1} max={128000} step={50} onChange={(maxTokens) => setGenerationSettings({ ...generationSettings, max_tokens: Number(maxTokens) || 1 })} />}
+            />
+            {connectionPresets.length > 0 ? (
+              <div className="field-preview delete-preset-field">
+                <span>{t('connection.preset.delete')}</span>
+                <div className="delete-preset-row">
+                  <select value={presetToDelete} onChange={(event) => setPresetToDelete(event.target.value)}>
+                    <option value="">{t('connection.preset.select')}</option>
+                    {connectionPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}</option>)}
+                  </select>
+                  <button type="button" onClick={() => void deleteConnectionPreset(presetToDelete)}>{t('common.delete')}</button>
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </details>
       </div>
     );
   }
@@ -5543,6 +7104,7 @@ function SettingsSection({
             label={t('visual.textSize')}
             value={visualSettings.textScale}
             options={[
+              ['tiny', t('visual.textSize.tiny')],
               ['small', t('visual.textSize.small')],
               ['normal', t('visual.textSize.normal')],
               ['large', t('visual.textSize.large')],
@@ -6079,6 +7641,7 @@ function ChatPicker({
   activeChat,
   botChats,
   createBotChat,
+  importChat,
   copyChat,
   exportChat,
   deleteChat,
@@ -6097,6 +7660,7 @@ function ChatPicker({
   activeChat: BotChat | null;
   botChats: BotChatSummary[];
   createBotChat: () => Promise<void>;
+  importChat?: (file: File | null) => Promise<void>;
   copyChat: (chatId: string) => Promise<void>;
   exportChat: (chatId: string) => Promise<void>;
   deleteChat: (chatId: string) => Promise<void>;
@@ -6119,6 +7683,21 @@ function ChatPicker({
         <strong>{t('chat.cardChats')}</strong>
         <div className="chat-picker-header-actions">
           <button type="button" onClick={() => void createBotChat()}>{t('common.new')}</button>
+          {importChat ? (
+            <label className="ghost-button" style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', padding: '0.45rem 0.55rem', fontSize: '0.84rem' }}>
+              <span>+ .jsonl</span>
+              <input
+                type="file"
+                accept=".jsonl,.json,application/jsonl,application/json"
+                style={{ display: 'none' }}
+                onChange={(event) => {
+                  const file = event.target.files?.[0] || null;
+                  event.target.value = '';
+                  void importChat(file);
+                }}
+              />
+            </label>
+          ) : null}
           <button className="ghost-button" type="button" onClick={close}>{t('common.close')}</button>
         </div>
       </header>
@@ -6141,12 +7720,34 @@ function ChatPicker({
   );
 }
 
-function ComposerActionMenu({ activeChat, isGenerating, openChats, rerollLastBotMessage }: { activeChat: BotChat | null; isGenerating: boolean; openChats: () => void; rerollLastBotMessage: () => Promise<void> }) {
+function ComposerActionMenu({
+  activeChat,
+  isGenerating,
+  composerMode,
+  setComposerMode,
+  rollDice,
+  openMemory,
+  openChats,
+  rerollLastBotMessage,
+}: {
+  activeChat: BotChat | null;
+  isGenerating: boolean;
+  composerMode: 'normal' | 'ooc' | 'secret';
+  setComposerMode: (mode: 'normal' | 'ooc' | 'secret') => void;
+  rollDice: () => void;
+  openMemory: () => void;
+  openChats: () => void;
+  rerollLastBotMessage: () => Promise<void>;
+}) {
   const { t } = useLocaleContext();
   return (
     <div className="composer-action-menu">
-      <button type="button" onClick={openChats}>{t('composer.chats')}</button>
-      <button type="button" disabled={!activeChat || isGenerating} onClick={() => void rerollLastBotMessage()}>{t('message.reroll')}</button>
+      <button type="button" onClick={openChats}>🗂️ {t('composer.chats')}</button>
+      <button type="button" disabled={!activeChat || isGenerating} onClick={() => void rerollLastBotMessage()}>↻ {t('message.reroll')}</button>
+      <button type="button" disabled={!activeChat || isGenerating} onClick={rollDice}>🎲 Бросить кубик…</button>
+      <button type="button" className={composerMode === 'ooc' ? 'active' : ''} onClick={() => setComposerMode(composerMode === 'ooc' ? 'normal' : 'ooc')}>💬 Режим OOC (вне игры)</button>
+      <button type="button" className={composerMode === 'secret' ? 'active' : ''} onClick={() => setComposerMode(composerMode === 'secret' ? 'normal' : 'secret')}>🕵️ Тайный ход (скрыто)</button>
+      <button type="button" onClick={openMemory}>📜 Память чата (Саммари)</button>
     </div>
   );
 }
@@ -6163,56 +7764,59 @@ function ReasoningPresetPanel({ settings, assistantPrefill, update, updateAssist
   };
 
   return (
-    <section className="preset-card-section reasoning-settings-panel">
-      <h3>{t('reasoning.title')}</h3>
-      <div className="reasoning-toggle-grid">
-        <label><input type="checkbox" checked={settings.autoParse} onChange={(event) => update({ autoParse: event.target.checked })} />{t('reasoning.autoParse')}</label>
-        <label><input type="checkbox" checked={settings.autoExpand} onChange={(event) => update({ autoExpand: event.target.checked })} />{t('reasoning.autoExpand')}</label>
-        <label><input type="checkbox" checked={settings.showHidden} onChange={(event) => update({ showHidden: event.target.checked })} />{t('reasoning.showHidden')}</label>
-        <label><input type="checkbox" checked={settings.addToPrompts} onChange={(event) => update({ addToPrompts: event.target.checked })} />{t('reasoning.addToPrompts')}</label>
-        <NumberInputField label={t('common.max')} value={settings.maxAdditions} fallback={1} min={0} max={99} step={1} onChange={(value) => typeof value === 'number' && update({ maxAdditions: value })} />
+    <details className="preset-card-section reasoning-settings-panel collapsible-preset-section">
+      <summary>{t('reasoning.title')}</summary>
+      <div className="collapsible-section-body">
+        <div className="reasoning-toggle-grid">
+          <label><input type="checkbox" checked={settings.autoParse} onChange={(event) => update({ autoParse: event.target.checked })} />{t('reasoning.autoParse')}</label>
+          <label><input type="checkbox" checked={settings.autoExpand} onChange={(event) => update({ autoExpand: event.target.checked })} />{t('reasoning.autoExpand')}</label>
+          <label><input type="checkbox" checked={settings.showHidden} onChange={(event) => update({ showHidden: event.target.checked })} />{t('reasoning.showHidden')}</label>
+          <label><input type="checkbox" checked={settings.addToPrompts} onChange={(event) => update({ addToPrompts: event.target.checked })} />{t('reasoning.addToPrompts')}</label>
+          <NumberInputField label={t('common.max')} value={settings.maxAdditions} fallback={1} min={0} max={99} step={1} onChange={(value) => typeof value === 'number' && update({ maxAdditions: value })} />
+        </div>
+        <div className="reasoning-format-row">
+          <label className="field-preview">
+            <span>{t('reasoning.formatting')}</span>
+            <select value={reasoningTemplateName(settings)} onChange={(event) => applyTemplate(event.target.value)}>
+              <option value="Custom">Custom</option>
+              <option value="DeepSeek">DeepSeek</option>
+              <option value="Think XML">Think XML</option>
+              <option value="Blank">Blank</option>
+            </select>
+          </label>
+        </div>
+        <div className="reasoning-text-grid">
+          <EditableTextArea label={t('reasoning.prefix')} value={settings.prefix} onChange={(prefix) => update({ prefix })} />
+          <EditableTextArea label={t('reasoning.suffix')} value={settings.suffix} onChange={(suffix) => update({ suffix })} />
+          <EditableTextArea label={t('reasoning.separator')} value={settings.separator} onChange={(separator) => update({ separator })} />
+        </div>
+        <EditableTextArea label={t('reasoning.assistantPrefill')} value={assistantPrefill} onChange={updateAssistantPrefill} />
       </div>
-      <div className="reasoning-format-row">
-        <label className="field-preview">
-          <span>{t('reasoning.formatting')}</span>
-          <select value={reasoningTemplateName(settings)} onChange={(event) => applyTemplate(event.target.value)}>
-            <option value="Custom">Custom</option>
-            <option value="DeepSeek">DeepSeek</option>
-            <option value="Think XML">Think XML</option>
-            <option value="Blank">Blank</option>
-          </select>
-        </label>
-      </div>
-      <div className="reasoning-text-grid">
-        <EditableTextArea label={t('reasoning.prefix')} value={settings.prefix} onChange={(prefix) => update({ prefix })} />
-        <EditableTextArea label={t('reasoning.suffix')} value={settings.suffix} onChange={(suffix) => update({ suffix })} />
-        <EditableTextArea label={t('reasoning.separator')} value={settings.separator} onChange={(separator) => update({ separator })} />
-      </div>
-      <EditableTextArea label={t('reasoning.assistantPrefill')} value={assistantPrefill} onChange={updateAssistantPrefill} />
-    </section>
+    </details>
   );
 }
 
-function MessageContent({ content, reasoning, imagePending = false, renderPendingMarkersAsSpinner = false, isStreaming = false }: { content: string; reasoning: ReasoningDisplaySettings; imagePending?: boolean; renderPendingMarkersAsSpinner?: boolean; isStreaming?: boolean }) {
+const MessageContent = memo(function MessageContent({ content, role = 'assistant', reasoning, showReasoning = true, imagePending = false, renderPendingMarkersAsSpinner = false, isStreaming = false }: { content: string; role?: string; reasoning: ReasoningDisplaySettings; showReasoning?: boolean; imagePending?: boolean; renderPendingMarkersAsSpinner?: boolean; isStreaming?: boolean }) {
   const { t } = useLocaleContext();
-  const regexedContent = getRegexedString(content, regex_placement.MD_DISPLAY, { isMarkdown: true });
-  const parsed = reasoning.autoParse ? splitReasoning(regexedContent, reasoning) : { reasoning: '', visible: regexedContent, complete: false };
-  const reasoningText = parsed.reasoning ? getRegexedString(parsed.reasoning, regex_placement.REASONING, { isMarkdown: true }) : '';
+  const displayPlacement = role === 'user' ? regex_placement.USER_INPUT : regex_placement.AI_OUTPUT;
+  const regexedContent = getRegexedString(content, displayPlacement, { isMarkdown: true });
+  const parsed = reasoning.autoParse || !showReasoning ? splitReasoning(regexedContent, reasoning) : { reasoning: '', visible: regexedContent, complete: false };
+  const reasoningText = showReasoning && parsed.reasoning ? getRegexedString(parsed.reasoning, regex_placement.REASONING, { isMarkdown: true }) : '';
   const formatOptions: ExtensionMessageFormatOptions = { forceImagePending: imagePending, renderPendingMarkersAsSpinner, reasoning, t };
   const reasoningOpen = isStreaming ? Boolean(reasoningText && !parsed.complete) : reasoning.autoExpand;
   return (
     <div className="message-content mes_text">
-      {reasoningText && !reasoning.showHidden ? (
+      {showReasoning && reasoningText && !reasoning.showHidden ? (
         <details className="reasoning-block" open={reasoningOpen}>
           <summary>{t('reasoning.thinking')}</summary>
           <pre>{reasoningText}</pre>
         </details>
       ) : null}
-      {reasoningText && reasoning.showHidden ? <pre className="reasoning-visible">{reasoningText}</pre> : null}
-      {formatMessageText(parsed.visible, formatOptions)}
+      {showReasoning && reasoningText && reasoning.showHidden ? <pre className="reasoning-visible">{reasoningText}</pre> : null}
+      {formatMessageText(parsed.visible, formatOptions, true)}
     </div>
   );
-}
+});
 
 function formatChatMessageTime(value: string) {
   const date = new Date(value);
@@ -6249,16 +7853,19 @@ function reasoningTemplateName(settings: ReasoningDisplaySettings): string {
 }
 
 function splitReasoning(content: string, settings: ReasoningDisplaySettings): { reasoning: string; visible: string; complete: boolean } {
-  if (!settings.prefix || !settings.suffix) {
-    return { reasoning: '', visible: content, complete: false };
-  }
-  const prefix = findReasoningMarker(content, [settings.prefix, settings.prefix.trim()], 0);
+  const prefixes = settings.prefix && settings.suffix
+    ? [settings.prefix, settings.prefix.trim()]
+    : ['<think>\n', '<think>', '<thinking>\n', '<thinking>'];
+  const suffixes = settings.prefix && settings.suffix
+    ? [settings.suffix, settings.suffix.trim()]
+    : ['\n</think>', '</think>', '\n</thinking>', '</thinking>'];
+  const prefix = findReasoningMarker(content, prefixes, 0);
   const start = prefix.index;
   if (start < 0) {
     return { reasoning: '', visible: content, complete: false };
   }
   const bodyStart = start + prefix.marker.length;
-  const suffix = findReasoningMarker(content, [settings.suffix, settings.suffix.trim()], bodyStart);
+  const suffix = findReasoningMarker(content, suffixes, bodyStart);
   const end = suffix.index;
   if (end < 0) {
     return { reasoning: content.slice(bodyStart), visible: content.slice(0, start).trim(), complete: false };
@@ -6278,8 +7885,8 @@ function findReasoningMarker(content: string, markers: string[], fromIndex: numb
   }, { index: -1, marker: '' });
 }
 
-function formatMessageText(content: string, options: ExtensionMessageFormatOptions = {}): ReactNode {
-  const regexedContent = getRegexedString(content, regex_placement.MD_DISPLAY, { isMarkdown: true });
+function formatMessageText(content: string, options: ExtensionMessageFormatOptions = {}, alreadyRegexed = false): ReactNode {
+  const regexedContent = alreadyRegexed ? content : getRegexedString(content, regex_placement.MD_DISPLAY, { isMarkdown: true });
   if (loadBuiltInExtensionSettings().noriMynInfoblock && /◈NORICORE◈/i.test(regexedContent)) {
     return formatNoricoreMessageText(regexedContent, options);
   }
@@ -6620,8 +8227,9 @@ function csvToArray(value: string): string[] {
 }
 
 function lorebookEntriesFromBook(book: RawPreset): RawPreset[] {
-  const entries = isObjectRecord(book.entries) ? book.entries : {};
-  return Object.values(entries)
+  const raw = book.entries;
+  const list = Array.isArray(raw) ? raw : isObjectRecord(raw) ? Object.values(raw) : [];
+  return list
     .filter(isObjectRecord)
     .sort((left, right) => numberField(left.displayIndex, numberField(left.uid, 0)) - numberField(right.displayIndex, numberField(right.uid, 0)));
 }
@@ -6994,6 +8602,25 @@ function Icon({ name }: { name: IconName }) {
       <>
         <path d="M18 6 6 18" />
         <path d="M6 6l12 12" />
+      </>
+    ),
+    branch: (
+      <>
+        <circle cx="6" cy="6" r="2.5" />
+        <circle cx="18" cy="8" r="2.5" />
+        <circle cx="6" cy="18" r="2.5" />
+        <path d="M6 8.5v7" />
+        <path d="M18 10.5c0 4-3 5-12 5" />
+      </>
+    ),
+    translate: (
+      <>
+        <path d="m5 8 6 6" />
+        <path d="m4 14 6-6 2-3" />
+        <path d="M2 5h12" />
+        <path d="M7 2h1" />
+        <path d="m22 22-5-10-5 10" />
+        <path d="M14 18h6" />
       </>
     ),
   };

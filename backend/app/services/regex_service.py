@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import re
 from typing import Any
-
 
 class RegexService:
     PLACEMENT_MD_DISPLAY = 0
@@ -17,9 +17,11 @@ class RegexService:
     SUBSTITUTE_ESCAPED = 2
 
     @staticmethod
+    @lru_cache(maxsize=1024)
     def regex_from_string(pattern: str) -> re.Pattern[str]:
-        match = re.match(r"^/(.*)/([gimuy]*)$", pattern)
+        match = re.match(r"^/(.*)/([gimsuyx]*)$", pattern, flags=re.DOTALL)
         if match:
+            body = match.group(1)
             flags_str = match.group(2) or ""
             flags = 0
             flag_map = {
@@ -32,10 +34,9 @@ class RegexService:
             for ch in flags_str:
                 if ch in flag_map:
                     flags |= flag_map[ch]
-                # g and y are JS-only and ignored in Python re
-            return re.compile(match.group(1), flags)
-        return re.compile(pattern)
-
+            body = body.replace("[^]", r"[\s\S]").replace(r"\/", "/")
+            return re.compile(body, flags)
+        return re.compile(pattern.replace("[^]", r"[\s\S]").replace(r"\/", "/"))
     @staticmethod
     def _substitute_params(text: str, user_name: str = "Player", char_name: str = "Bot") -> str:
         return (
@@ -70,14 +71,13 @@ class RegexService:
         if substitute == RegexService.SUBSTITUTE_RAW:
             return RegexService._substitute_params(find_regex, user_name, char_name)
         if substitute == RegexService.SUBSTITUTE_ESCAPED:
-            return RegexService._substitute_params(
-                find_regex, user_name, char_name
-            ).replace("{{user}}", RegexService._sanitize_regex_macro(user_name)).replace(
-                "{{char}}", RegexService._sanitize_regex_macro(char_name)
-            ).replace(
-                "{user}", RegexService._sanitize_regex_macro(user_name)
-            ).replace(
-                "{char}", RegexService._sanitize_regex_macro(char_name)
+            escaped_user = RegexService._sanitize_regex_macro(user_name)
+            escaped_char = RegexService._sanitize_regex_macro(char_name)
+            return (
+                find_regex.replace("{{user}}", escaped_user)
+                .replace("{{char}}", escaped_char)
+                .replace("{user}", escaped_user)
+                .replace("{char}", escaped_char)
             )
         return find_regex
 
